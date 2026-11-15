@@ -102,3 +102,17 @@ Typical loop: `nsh check` → `nsh test` → `nsh run` to see the UI. Rust edits
 
 - Fix every error and warning from `cargo check`/`nsh check`, `nsh build`, clippy, or the test runner as soon as it appears — **never commit code that still emits warnings**.
 - `nsh build` findings (undocumented exports, unknown classes, unused declarations) count as warnings.
+
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked as GitHub Issues on `dlivxpr/kanon`, driven via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Five canonical roles mapped to label strings of the same name. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `GLOSSARY.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
