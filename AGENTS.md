@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Overview
-`kanon` is a Native Shell (NSH) app in **Rust mode**: the UI is Rust in `src/lib.rs`, mounted on every platform (including web via wasm) with no bundled JS VM. Fresh `nsh init --template rust` scaffold — the current `App` is still the template's counter demo (`Tap` button increments `Count: N`), **placeholder for the real product: a three-in-one notes + project management + todo app** (note editing, project organization, task tracking). Build features toward that domain. App id `com.example.kanon`, crate `nsh-app-kanon` (Rust import: `nsh_app_kanon`), NSH `0.5.0`.
+Kanon is a pure-Rust Native Shell app for Windows and macOS only, with no bundled JS VM. Follow [GLOSSARY.md](GLOSSARY.md) for Knowledge Base, Document, Project, and Task terminology.
 
 ## Architecture & Data Flow
 
@@ -26,19 +26,17 @@ view()
 | `.nsh/` | Generated: `.nsh/rust/` per-platform runner crates + workspace, `.nsh/types/` TS declarations (incl. `kanon/native.d.ts` from `#[native_module]`) |
 | `target/` | Cargo build output |
 
-No `tests/`, `src/ui/`, `docs/`, scripts, or CI exist yet.
-
 ## Development Commands
 
 | Command | Does |
 |---|---|
 | `nsh check` | `cargo check` on the crate, then type-checks `*.test.tsx` |
 | `nsh test` | `cargo test`, then every `*.test.tsx` headless |
-| `nsh run` | Run on this machine's backend; `--target ios\|android\|web\|macos\|linux\|windows` |
+| `nsh run` | Run on this machine's Windows or macOS backend |
 | `nsh test nsh.json --trace` | Headless: what the root mounts + time per commit |
-| `nsh package --target web` | Package for a platform |
+| `nsh package --target windows` | Package on Windows; use `--target macos` on macOS |
 | `cargo check --all-targets` | Fastest edit loop for pure-Rust changes |
-| `cargo run` | Direct native desktop run via `src/main.rs` (AppKit/GTK4/Win32; needs the backend's dev libs) |
+| `cargo run` | Direct native desktop run via `src/main.rs` (Win32 or AppKit) |
 | `nsh test --target macos` | Run `*.test.tsx` on a real platform |
 
 Typical loop: `nsh check` → `nsh test` → `nsh run` to see the UI. Rust edits under `nsh run` rebuild and restart; there is no hot reload for Rust.
@@ -60,17 +58,16 @@ Typical loop: `nsh check` → `nsh test` → `nsh run` to see the UI. Rust edits
 | File | Role |
 |---|---|
 | `nsh.json` | App identity (`id`, `version`, `build`), `"rust": "."`, `"root": "App"` |
-| `Cargo.toml` | `nsh-core`/`nsh-base` `0.5.0`; per-OS `nsh-platform-{linux,macos,windows}` with `default-features = false` + features `["shader","editor","emoji-picker","highlight","math","plot","rich-editor","term"]` (keep the three lists identical) |
+| `Cargo.toml` | NSH crate versions and native feature flags; keep the Windows and macOS feature lists in sync |
 | `src/lib.rs` | `#[native_module("kanon/native")]` + root component |
-| `src/main.rs` | Desktop binary; `compile_error!` on non-desktop targets |
+| `src/main.rs` | Native Windows/macOS launcher; rejects other targets |
 | `App.test.tsx` | Only test file (see below) |
 | `tsconfig.json` | Extends generated `.nsh/tsconfig.json`; `include: ["**/*.ts","**/*.tsx"]` |
 | `.nsh/types/nsh/test.d.ts` | Test API reference (`open`, `expect`, `App` driver methods) |
 
 ## Runtime/Tooling Preferences
 
-- **`nsh` CLI 0.5.0 is installed** — keep every `nsh-*` dependency at the CLI's version; version mismatch is a build error, not something to pin around.
-- No Node/npm/`package.json` — TSX runs on NSH's QuickJS; TypeScript exists only for `*.test.tsx` (and an optional future `App.tsx` entry via `import { mount } from "nsh"; mount(App)`).
+- Use the NSH CLI version pinned in `Cargo.toml`. TypeScript is only used for `*.test.tsx`; keep the application itself in Rust.
 - Standard cargo applies (`cargo fmt`/`clippy` usable but unconfigured). README optionally recommends the `huacnlee/cargo` fork.
 - Don't edit or commit `.nsh/` or `target/` (both gitignored); regenerate via `nsh check`/`build`.
 
@@ -80,7 +77,7 @@ Typical loop: `nsh check` → `nsh test` → `nsh run` to see the UI. Rust edits
 - Driver: `app.press(sel)`, `app.texts()`, `app.type(sel, text)`, `app.waitFor(sel)`, `app.back()`; `open` options: `platform`, `width`/`height`, `colorScheme`, `storage`, `network`, `clock`.
 - Selectors: bare string resolves test-id → label → text; prefixes `id:`, `label:`, `text:`, `role:`, `view:`; `a >> b` nesting; `nth=N`.
 - Existing coverage: one test asserting `Count: 0` → `Count: 2` after two presses.
-- **No Rust-side tests or `[dev-dependencies]` yet.** To add: `tests/app.rs` with `nsh-engine` + `nsh-testing` at `0.5.0` (`default-features = false`), driving `Headless::start(EngineConfig::new(Root::of::<nsh_app_kanon::App>()))` with the same selectors (`wait_for`, `press`, `shows`).
+- For new Rust-side UI tests, use `nsh-engine` and `nsh-testing` at the app's NSH version (`default-features = false`). Start `Headless` with `EngineConfig::new(Root::of::<nsh_app_kanon::App>())` and drive it with semantic selectors.
 - Headless proves behavior, not appearance — visuals need `app.screenshot(path)` under `nsh test --target <graphical>` or a manual `nsh run`, checked in light + dark.
 - New behavior should come with a `*.test.tsx` (or `Headless`) test; name tests for behavior (`counts_taps`), one flow per test.
 

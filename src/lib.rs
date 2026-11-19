@@ -4,8 +4,7 @@
 use nsh_core::prelude::*;
 use nsh_base::theme;
 
-/// The app's UI set (`nsh.json` `"rust"`): what a TSX entry may import from
-/// `kanon/native` (`README.md`, "Adding a TSX entry").
+/// The NSH UI set that registers the application's Rust root.
 #[native_module("kanon/native")]
 fn native(registry: &mut Registry) {
     registry.register::<App>();
