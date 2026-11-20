@@ -1316,6 +1316,7 @@ pub fn document_view(store: Store, tab_id: u64, doc_id: i64) -> impl IntoElement
 /// Trash milestone polishes this screen further.
 pub fn trash_view(store: Store) -> impl IntoElement {
     let rows = move || store.trashed_knowledge_bases();
+    let task_rows = move || store.trashed_tasks();
     view().flex_1().min_h(px(0.0)).child(
         scroll().flex_1().child(
             view()
@@ -1332,8 +1333,8 @@ pub fn trash_view(store: Store) -> impl IntoElement {
                         .text_color(tokens::fg_primary()),
                 )
                 .child(when(
-                    move || rows().is_empty(),
-                    move || empty_state("回收站是空的", "移入回收站的知识库会在这里出现"),
+                    move || rows().is_empty() && task_rows().is_empty(),
+                    move || empty_state("回收站是空的", "移入回收站的知识库和任务会在这里出现"),
                 ))
                 .child(dynamic(move || {
                     view().flex_col().gap_2().children(
@@ -1370,6 +1371,55 @@ pub fn trash_view(store: Store) -> impl IntoElement {
                                             store.delete_knowledge_base_permanent(id);
                                         })
                                         .test_id(&format!("kb-delete-{id}")),
+                                    )
+                                    .into_element()
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                }))
+                .child(when(
+                    move || !task_rows().is_empty(),
+                    move || section_heading("任务"),
+                ))
+                .child(dynamic(move || {
+                    view().flex_col().gap_2().children(
+                        task_rows()
+                            .into_iter()
+                            .map(|aggregate| {
+                                let id = aggregate.task.id;
+                                let title = aggregate.task.title.clone();
+                                view()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_3()
+                                    .px_3()
+                                    .py_2()
+                                    .rounded(tokens::radius_row())
+                                    .border_1()
+                                    .border_color(tokens::border_subtle())
+                                    .child(
+                                        text("☑".to_owned())
+                                            .text_size(px(16.0))
+                                            .text_color(tokens::fg_muted()),
+                                    )
+                                    .child(
+                                        text(title)
+                                            .text_size(px(14.0))
+                                            .text_color(tokens::fg_primary())
+                                            .flex_1()
+                                            .number_of_lines(1),
+                                    )
+                                    .child(
+                                        app_button(ButtonKind::Soft, "恢复", move || {
+                                            store.restore_task(id);
+                                        })
+                                        .test_id(&format!("task-restore-{id}")),
+                                    )
+                                    .child(
+                                        app_button(ButtonKind::Danger, "彻底删除", move || {
+                                            store.delete_task_permanent(id);
+                                        })
+                                        .test_id(&format!("task-delete-{id}")),
                                     )
                                     .into_element()
                             })

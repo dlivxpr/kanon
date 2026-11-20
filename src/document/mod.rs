@@ -8,13 +8,15 @@
 
 mod editing;
 mod history;
+pub(crate) mod kanon;
 mod reading;
+mod task_card;
 
 use nsh_base::rich_editor::{
     extensions::{
         extension::{Extension, ExtensionManager},
         kit::{starter_kit, table_kit},
-        suggestion::{SuggestionOptions, suggestion},
+        suggestion::{SuggestionOptions, mention_node, suggestion},
     },
     formats::{DocFormat, MarkdownFormat},
     model::{Fragment, Node},
@@ -26,6 +28,9 @@ use nsh_core::prelude::*;
 use crate::shell::Store;
 
 pub(crate) const SLASH_KEY: &str = "slash";
+/// The `@` inline-mention suggestion's plugin key.
+pub(crate) const MENTION_KEY: &str = "mention";
+pub(crate) use kanon::CARD_NODE;
 
 /// One Document tab: reading chrome or editing chrome, by lock ownership.
 pub fn document_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoElement {
@@ -51,12 +56,15 @@ pub fn document_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEl
 }
 
 /// Kanon's editor kernel: the starter kit (headings, lists, local
-/// Checklist Items, marks, history, Markdown shortcuts) plus tables and
-/// the `/` block-insertion suggestion.
+/// Checklist Items, marks, history, Markdown shortcuts) plus tables, the
+/// `/` block-insertion suggestion, the Linked Task Card node and the `@`
+/// inline-mention suggestion.
 fn build_extensions() -> ExtensionManager {
     ExtensionManager::with_core(vec![
         starter_kit(),
         table_kit(),
+        Extension::node(kanon::CARD_NODE, |_| kanon::card_spec()),
+        Extension::node(kanon::MENTION_NODE, |_| mention_node(kanon::MENTION_NODE, "@").1),
         Extension::new("kanonSlash").with_priority(1000).add_plugins(|_| {
             let mut slash = SuggestionOptions::default();
             slash.key = SLASH_KEY.into();
@@ -64,13 +72,21 @@ fn build_extensions() -> ExtensionManager {
             slash.trigger.allowed_prefixes = None;
             vec![suggestion(slash)]
         }),
+        Extension::new("kanonMention").with_priority(1000).add_plugins(|_| {
+            let mut mention = SuggestionOptions::default();
+            mention.key = MENTION_KEY.into();
+            mention.trigger.char = "@".into();
+            mention.trigger.allowed_prefixes = None;
+            vec![suggestion(mention)]
+        }),
     ])
     .expect("the kanon editor extensions build")
 }
 
 /// A session over the committed markdown body. `node_views` lets the
 /// caller take over the rendering of chosen node types (the reading tab
-/// renders Checklist Item checkboxes itself).
+/// renders Checklist Item checkboxes itself; both tabs render Linked
+/// Task Cards).
 pub(crate) fn build_session(body: &str, node_views: NodeViews) -> EditorSession {
     let manager = build_extensions();
     let schema = manager.schema().clone();
@@ -78,15 +94,20 @@ pub(crate) fn build_session(body: &str, node_views: NodeViews) -> EditorSession 
     let doc = format
         .parse(&schema, body)
         .unwrap_or_else(|_| schema.top_node_type().create(None, Fragment::empty(), Vec::new()).expect("empty doc"));
+    let doc = kanon::materialize_markers(&schema, &doc);
     let state =
         EditorState::create(EditorStateConfig::new(schema).doc(doc).plugins(manager.plugins()))
             .expect("the editor state builds");
     EditorSession::new(state, node_views)
 }
 
-/// The markdown a session's document serializes to (the auto-save payload).
+/// The markdown a session's document serializes to (the auto-save
+/// payload): editor-only nodes become their archive markers first, so
+/// the committed body round-trips through [`build_session`].
 pub(crate) fn doc_markdown(session: &EditorSession) -> String {
-    MarkdownFormat::default().serialize_fragment(session.state().doc().content())
+    let state = session.state();
+    let doc = kanon::dematerialize_markers(state.schema(), state.doc());
+    MarkdownFormat::default().serialize_fragment(doc.content())
 }
 
 /// Where the `ordinal`-th heading starts in `doc` (ProseMirror position),

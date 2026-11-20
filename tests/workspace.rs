@@ -951,3 +951,269 @@ fn book_stats_count_live_documents_and_words() {
     assert_eq!(stats.documents, 1);
     assert_eq!(stats.words, 4, "two latin words + two CJK characters");
 }
+
+// ---------------------------------------------------------------------
+// Issue #7: Checklist-to-Task promotion, Linked Task Cards, `@` mentions
+// ---------------------------------------------------------------------
+
+#[test]
+fn promote_checklist_item_creates_task_replaces_body_and_indexes_reference_atomically() {
+    let (mut ws, path, _clock) = workspace_at("promote", "2026-11-20 09:00");
+    let book = ws.create_knowledge_base("手册").expect("kb");
+    let doc = ws.create_document(book.id, None, "周报").expect("doc");
+    ws.update_document_body(doc.id, "周报", "- [ ] 写周报\n\n尾部段落", None).expect("seed body");
+
+    // The editor replaced the item with a placeholder card and serialized.
+    let editor_body = "@task(0)\n\n尾部段落".to_owned();
+    let project = ws.create_project("Kanon", "#ff4f4f", "🚀", None, None).expect("project");
+    let base = ws.document(doc.id).expect("load").expect("present").version;
+    let promotion = ws
+        .promote_checklist_item(doc.id, Some(base), &editor_body, "写周报", Some(project.id))
+        .expect("promotion commits");
+
+    // All three landed: the Task (bound to its Project)…
+    let task = ws.task(promotion.task_id).expect("load").expect("present").task;
+    assert_eq!(task.title, "写周报");
+    assert_eq!(task.status, TaskStatus::Todo);
+    assert_eq!(task.project_id, Some(project.id));
+
+    // …the Document body with the real card marker (version bumped once)…
+    let committed = ws.document(doc.id).expect("load").expect("present");
+    assert_eq!(promotion.document, committed);
+    assert_eq!(committed.body, format!("@task({})\n\n尾部段落", promotion.task_id));
+    assert_eq!(committed.version, base + 1, "the promotion advances the lock once");
+    assert_eq!(committed.word_count, count_words(&committed.body));
+
+    // …and the reference index row, anchored at the marker.
+    let reference = &promotion.reference;
+    assert_eq!(reference.ref_type, "task_card");
+    assert_eq!(reference.target_kind, "task");
+    assert_eq!(reference.target_id, Some(promotion.task_id));
+    assert_eq!(reference.target_label, "写周报");
+    assert_eq!(reference.position, 0);
+    assert_eq!(ws.document_references(doc.id).expect("refs"), vec![reference.clone()]);
+
+    // Inbox promotion (no Project) is the other target choice; the
+    // editor body still carries the first document's card.
+    let editor_body = format!("{}\n\n开头\n\n@task(0)", nsh_app_kanon::domain::task_card_marker(promotion.task_id));
+    let second = ws
+        .promote_checklist_item(doc.id, Some(committed.version), &editor_body, "回邮件", None)
+        .expect("inbox promotion");
+    let inbox_task = ws.task(second.task_id).expect("load").expect("present").task;
+    assert!(inbox_task.is_inbox_shape(), "no Project and no dates lands in the Inbox");
+
+    // The whole promotion survives a restart.
+    drop(ws);
+    let ws = Workspace::open(&path, at("2026-11-20 09:30")).expect("reopen");
+    let committed = ws.document(doc.id).expect("load").expect("present");
+    assert_eq!(
+        committed.body,
+        format!("{}\n\n开头\n\n@task({})", nsh_app_kanon::domain::task_card_marker(promotion.task_id), second.task_id)
+    );
+    assert_eq!(ws.document_references(doc.id).expect("refs").len(), 2);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn promotion_rolls_back_everything_on_stale_base_or_missing_placeholder() {
+    let (mut ws, _path, _clock) = workspace_at("promote-rollback", "2026-11-20 09:00");
+    let book = ws.create_knowledge_base("手册").expect("kb");
+    let doc = ws.create_document(book.id, None, "周报").expect("doc");
+    ws.update_document_body(doc.id, "周报", "- [ ] 写周报", None).expect("seed body");
+
+    // A stale optimistic base: the version moved on (another writer
+    // committed first). Nothing — not even the Task — may survive.
+    ws.update_document_body(doc.id, "周报", "- [ ] 写周报（改）", None).expect("concurrent write");
+    let editor_body = "@task(0)".to_owned();
+    let err = ws
+        .promote_checklist_item(doc.id, Some(0), &editor_body, "写周报", None)
+        .expect_err("stale base refuses");
+    assert!(matches!(err, WorkspaceError::StaleDocument));
+    assert_eq!(ws.task(1).expect("query"), None, "the rolled-back Task left no row");
+    assert_eq!(
+        ws.document(doc.id).expect("load").expect("present").body,
+        "- [ ] 写周报（改）",
+        "the Document is untouched"
+    );
+    assert!(ws.document_references(doc.id).expect("refs").is_empty());
+
+    // A body without the placeholder is rejected before anything writes.
+    let err = ws
+        .promote_checklist_item(doc.id, Some(2), "没有占位符", "写周报", None)
+        .expect_err("missing placeholder refuses");
+    assert!(matches!(err, WorkspaceError::InvalidPromotion(_)));
+    assert!(ws.inbox_tasks().expect("inbox").is_empty(), "no Task was created");
+
+    // An empty title never promotes either.
+    let err = ws
+        .promote_checklist_item(doc.id, Some(2), "@task(0)", "  ", None)
+        .expect_err("empty title refuses");
+    assert!(matches!(err, WorkspaceError::InvalidPromotion(_)));
+}
+
+#[test]
+fn editor_save_reconciles_card_and_mention_references() {
+    let (mut ws, _path, _clock) = workspace_at("reconcile", "2026-11-20 09:00");
+    let book = ws.create_knowledge_base("手册").expect("kb");
+    let target = ws.create_document(book.id, None, "手册正文").expect("target doc");
+    let task = ws
+        .create_task(&NewTask { title: "被引用的任务".to_owned(), ..Default::default() })
+        .expect("task")
+        .task;
+    let doc = ws.create_document(book.id, None, "计划").expect("doc");
+
+    // A body with every marker kind saves with a fully-built index.
+    let body = format!(
+        "{}\n\n前文{}后文\n\n{}",
+        nsh_app_kanon::domain::task_card_marker(task.id),
+        nsh_app_kanon::domain::mention_marker("document", &target.id.to_string(), "手册正文"),
+        nsh_app_kanon::domain::mention_marker("date", "2026-11-21", "2026-11-21"),
+    );
+    ws.update_document_body_and_references(doc.id, "计划", &body, None).expect("save with markers");
+    let refs = ws.document_references(doc.id).expect("refs");
+    assert_eq!(refs.len(), 3);
+    let card = refs.iter().find(|r| r.ref_type == "task_card").expect("card row");
+    assert_eq!(card.target_id, Some(task.id));
+    assert_eq!(card.target_label, "被引用的任务", "the label denormalizes the live title");
+    assert_eq!(card.position, 0);
+    let mention = refs.iter().find(|r| r.ref_type == "mention" && r.target_kind == "document").expect("mention row");
+    assert_eq!(mention.target_id, Some(target.id));
+    assert_eq!(mention.position, 12, "the 8-unit card marker, two newlines and 前文 precede it");
+    let date = refs.iter().find(|r| r.target_kind == "date").expect("date row");
+    assert_eq!(date.target_id, None);
+    assert_eq!(date.target_label, "2026-11-21");
+
+    // Re-saving the same body is idempotent (no duplicate rows).
+    ws.update_document_body_and_references(doc.id, "计划", &body, None).expect("resave");
+    assert_eq!(ws.document_references(doc.id).expect("refs").len(), 3);
+
+    // A body whose markers were removed (editor Undo) drops the rows in
+    // the same commit — the Tasks and Documents they pointed at survive.
+    ws.update_document_body_and_references(doc.id, "计划", "干净的正文", None).expect("save without markers");
+    assert!(ws.document_references(doc.id).expect("refs").is_empty());
+    assert!(ws.task(task.id).expect("task").is_some());
+    assert!(ws.document(target.id).expect("doc").is_some());
+
+    // Moving a marker re-anchors its position, keeping the row.
+    let moved = format!("挪走\n\n{}", nsh_app_kanon::domain::task_card_marker(task.id));
+    ws.update_document_body_and_references(doc.id, "计划", &moved, None).expect("resave moved");
+    let refs = ws.document_references(doc.id).expect("refs");
+    assert_eq!(refs.len(), 1);
+    assert_eq!(refs[0].position, 4, "挪走 and two newlines precede the marker");
+}
+
+#[test]
+fn undoing_a_promotion_keeps_the_task_and_its_later_edits() {
+    let (mut ws, _path, _clock) = workspace_at("undo-boundary", "2026-11-20 09:00");
+    let book = ws.create_knowledge_base("手册").expect("kb");
+    let doc = ws.create_document(book.id, None, "周报").expect("doc");
+    ws.update_document_body(doc.id, "周报", "- [ ] 写周报", None).expect("seed body");
+
+    let base = ws.document(doc.id).expect("load").expect("present").version;
+    let promotion = ws
+        .promote_checklist_item(doc.id, Some(base), "@task(0)", "写周报", None)
+        .expect("promote");
+
+    // The Task earns edits after the promotion…
+    ws.update_task(
+        promotion.task_id,
+        &TaskPatch { status: Some(TaskStatus::Doing), priority: Some(Priority::High), ..Default::default() },
+    )
+    .expect("edit the task");
+
+    // …editor Undo then reverts only the Document (card → checklist item)
+    // and the reference index: the body no longer holds the marker.
+    ws.update_document_body_and_references(doc.id, "周报", "- [ ] 写周报", None).expect("undo save");
+    assert!(ws.document_references(doc.id).expect("refs").is_empty(), "the index row went with the undo");
+
+    // The Task and its edits are intact.
+    let task = ws.task(promotion.task_id).expect("load").expect("present").task;
+    assert_eq!(task.title, "写周报");
+    assert_eq!(task.status, TaskStatus::Doing);
+    assert_eq!(task.priority, Priority::High);
+}
+
+#[test]
+fn task_trash_lifecycle_keeps_the_card_reference_and_backlinks_degrade() {
+    let (mut ws, _path, _clock) = workspace_at("trash-lifecycle", "2026-11-20 09:00");
+    let book = ws.create_knowledge_base("手册").expect("kb");
+    let doc = ws.create_document(book.id, None, "周报").expect("doc");
+    let promotion = ws
+        .promote_checklist_item(doc.id, Some(0), "@task(0)", "写周报", None)
+        .expect("promote");
+
+    // Trash: the reference stays (the card renders the removed-task
+    // placeholder from it); the Task row is excluded from live queries
+    // but still loads.
+    ws.move_task_to_trash(promotion.task_id).expect("trash");
+    assert_eq!(ws.trashed_tasks().expect("trashed").len(), 1);
+    assert_eq!(ws.inbox_tasks().expect("inbox"), vec![]);
+    let trashed = ws.task(promotion.task_id).expect("load").expect("present").task;
+    assert!(trashed.trashed_at.is_some(), "the row carries its trash stamp");
+    assert_eq!(ws.document_references(doc.id).expect("refs").len(), 1, "the index row survives Trash");
+
+    // A mention of this Task from another Document back-links; both the
+    // original card and the mention report while the target is trashed.
+    let other = ws.create_document(book.id, None, "计划").expect("other doc");
+    let body = format!("看 {}", nsh_app_kanon::domain::mention_marker("task", &promotion.task_id.to_string(), "写周报"));
+    ws.update_document_body_and_references(other.id, "计划", &body, None).expect("mention save");
+    let backlinks = ws.documents_referencing("task", promotion.task_id).expect("backlinks");
+    assert_eq!(backlinks.len(), 2, "the card reference and the inline mention both target the Task");
+    let from_other = backlinks.iter().find(|b| b.source_document_id == other.id).expect("the mention row");
+    assert_eq!(from_other.source_title, "计划");
+    assert!(!from_other.source_trashed);
+
+    // Restore: live behavior recovers wholesale.
+    ws.restore_task(promotion.task_id).expect("restore");
+    assert!(ws.task(promotion.task_id).expect("load").expect("present").task.trashed_at.is_none());
+    assert_eq!(ws.inbox_tasks().expect("inbox").len(), 1);
+
+    // Permanent deletion: the Task row is gone, the invalid placeholder
+    // stays — both the card reference in the body and its index row.
+    ws.move_task_to_trash(promotion.task_id).expect("trash again");
+    ws.delete_task_permanent(promotion.task_id).expect("delete");
+    assert_eq!(ws.task(promotion.task_id).expect("load"), None);
+    let refs = ws.document_references(doc.id).expect("refs");
+    assert_eq!(refs.len(), 1, "the card reference is preserved as invalid");
+    assert_eq!(refs[0].target_label, "写周报", "its last known label survives");
+
+    // The backlinks of the other Document degrade (source still live,
+    // target gone): they still report so the panel can render the state.
+    let backlinks = ws.documents_referencing("task", promotion.task_id).expect("backlinks");
+    assert_eq!(backlinks.len(), 2);
+}
+
+#[test]
+fn document_backlinks_track_source_trash_and_recover_on_restore() {
+    let (mut ws, _path, _clock) = workspace_at("doc-backlinks", "2026-11-20 09:00");
+    let book = ws.create_knowledge_base("手册").expect("kb");
+    let source = ws.create_document(book.id, None, "计划").expect("source");
+    let target = ws.create_document(book.id, None, "手册正文").expect("target");
+    let body = format!("前文{}后文", nsh_app_kanon::domain::mention_marker("document", &target.id.to_string(), "手册正文"));
+    ws.update_document_body_and_references(source.id, "计划", &body, None).expect("save");
+
+    let backlinks = ws.documents_referencing("document", target.id).expect("backlinks");
+    assert_eq!(backlinks.len(), 1);
+    assert_eq!(backlinks[0].source_title, "计划");
+    assert!(!backlinks[0].source_trashed);
+
+    // Trashing the source degrades the backlink; it still reports.
+    ws.trash_catalog_node(ws.catalog_node_of_document(source.id).expect("node").expect("present").id)
+        .expect("trash the source");
+    let backlinks = ws.documents_referencing("document", target.id).expect("backlinks");
+    assert_eq!(backlinks.len(), 1);
+    assert!(backlinks[0].source_trashed, "the panel renders the degraded state");
+
+    // Restoring the source recovers the live backlink.
+    let node = ws.catalog_node_of_document(source.id).expect("node").expect("present");
+    ws.restore_catalog_node(node.id).expect("restore the source");
+    let backlinks = ws.documents_referencing("document", target.id).expect("backlinks");
+    assert_eq!(backlinks.len(), 1);
+    assert!(!backlinks[0].source_trashed);
+
+    // Permanently deleting the source removes its reference rows with it.
+    let book_id = book.id;
+    ws.trash_knowledge_base(book_id).expect("trash the book");
+    ws.delete_knowledge_base_permanent(book_id).expect("delete the book");
+    assert!(ws.documents_referencing("document", target.id).expect("backlinks").is_empty());
+}

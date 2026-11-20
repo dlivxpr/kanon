@@ -140,6 +140,9 @@ pub struct Task {
     pub created_at: String,
     pub updated_at: String,
     pub completed_at: Option<String>,
+    /// Set when the Task sits in Trash (GLOSSARY); views listing live
+    /// tasks exclude it, Linked Task Cards render the removed placeholder.
+    pub trashed_at: Option<String>,
 }
 
 /// What a Task creation must provide.
@@ -237,6 +240,7 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             completed_at: None,
+            trashed_at: None,
         }
     }
 

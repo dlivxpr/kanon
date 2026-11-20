@@ -181,6 +181,48 @@ impl Store {
             .with(|ws| ws.catalog_node_of_document(document_id).unwrap_or_default())
     }
 
+    /// The Document's indexed references (Linked Task Cards and `@`
+    /// mentions), anchor order.
+    pub fn document_references(&self, document_id: i64) -> Vec<crate::domain::DocumentReference> {
+        self.bump.get();
+        self.workspace
+            .with(|ws| ws.document_references(document_id).unwrap_or_default())
+    }
+
+    /// References from any Document targeting this Document or Task (the
+    /// right panel's backlinks section).
+    pub fn document_backlinks(&self, document_id: i64) -> Vec<crate::domain::DocumentBacklink> {
+        self.bump.get();
+        self.workspace
+            .with(|ws| ws.documents_referencing("document", document_id).unwrap_or_default())
+    }
+
+    /// Documents whose title matches `query` (the `@` mention menu).
+    pub fn document_titles_matching(&self, query: &str, limit: usize) -> Vec<(i64, String)> {
+        self.bump.get();
+        self.workspace
+            .with(|ws| ws.document_titles_matching(query, limit).unwrap_or_default())
+    }
+
+    /// The Trash screen's task section.
+    pub fn trashed_tasks(&self) -> Vec<TaskAggregate> {
+        self.bump.get();
+        self.workspace
+            .with(|ws| ws.trashed_tasks().unwrap_or_default())
+    }
+
+    /// Every live (non-trashed) Task, whatever its group — the Linked
+    /// Task Card picker's candidate list.
+    pub fn live_tasks(&self) -> Vec<TaskAggregate> {
+        self.bump.get();
+        let groups = self.workspace.with(|ws| ws.task_groups().unwrap_or_default());
+        let mut all = Vec::new();
+        for list in groups.lists() {
+            all.extend(list.iter().cloned());
+        }
+        all
+    }
+
     /// The tab/sidebar label for a route: book and document routes take
     /// their live names, everything else its static title.
     pub fn route_title(&self, route: &Route) -> String {
@@ -268,10 +310,32 @@ impl Store {
         self.bump();
     }
 
-    /// Moves a Task to Trash (with its detail panel closed).
+    /// Moves a Task to Trash (with its detail panel closed). Documents
+    /// referencing it keep their Linked Task Cards; the cards render the
+    /// removed-task placeholder until a restore (ADR-0002).
     pub fn trash_task(&self, id: i64) {
         if let Err(err) = self.workspace.with(|ws| ws.move_task_to_trash(id)) {
             log::warn!("trash task {id} failed: {err}");
+        }
+        if self.selected_task.get_untracked() == Some(id) {
+            self.selected_task.set(None);
+        }
+        self.bump();
+    }
+
+    /// Restores a Task from Trash: its Linked Task Cards go live again.
+    pub fn restore_task(&self, id: i64) {
+        if let Err(err) = self.workspace.with(|ws| ws.restore_task(id)) {
+            log::warn!("restore task {id} failed: {err}");
+        }
+        self.bump();
+    }
+
+    /// Permanently deletes a Task (from the Trash screen). Reference
+    /// rows survive as invalid placeholders.
+    pub fn delete_task_permanent(&self, id: i64) {
+        if let Err(err) = self.workspace.with(|ws| ws.delete_task_permanent(id)) {
+            log::warn!("delete task {id} failed: {err}");
         }
         if self.selected_task.get_untracked() == Some(id) {
             self.selected_task.set(None);
@@ -778,11 +842,12 @@ impl Store {
         }
     }
 
-    /// The editing tab's auto-save: optimistic commit of title+body.
-    /// `Ok` carries the committed document (its `version` becomes the
-    /// next save's base); `Err(StaleDocument)` means another writer
-    /// committed first and the caller must keep the draft and offer a
-    /// retry against a fresh base.
+    /// The editing tab's auto-save: optimistic commit of title+body plus
+    /// reconciliation of the reference index (Linked Task Cards and `@`
+    /// mentions) in the same transaction. `Ok` carries the committed
+    /// document (its `version` becomes the next save's base);
+    /// `Err(StaleDocument)` means another writer committed first and the
+    /// caller must keep the draft and offer a retry against a fresh base.
     pub fn save_document_body(
         &self,
         document_id: i64,
@@ -790,9 +855,31 @@ impl Store {
         body: &str,
         base_version: i64,
     ) -> Result<Document, WorkspaceError> {
-        let result = self
-            .workspace
-            .with(|ws| ws.update_document_body(document_id, title, body, Some(base_version)));
+        let result = self.workspace.with(|ws| {
+            ws.update_document_body_and_references(document_id, title, body, Some(base_version))
+        });
+        if result.is_ok() {
+            self.bump();
+        }
+        result
+    }
+
+    /// Promotes the editing tab's selected Checklist Item into a Task:
+    /// Task creation, Document card replacement and the reference index
+    /// commit atomically. `editor_body` is the session's serialization
+    /// holding the `@task(0)` placeholder; the domain substitutes the
+    /// real id. `project_id = None` lands the Task in the Inbox.
+    pub fn promote_checklist_item(
+        &self,
+        document_id: i64,
+        base_version: i64,
+        editor_body: &str,
+        title: &str,
+        project_id: Option<i64>,
+    ) -> Result<crate::domain::Promotion, WorkspaceError> {
+        let result = self.workspace.with(|ws| {
+            ws.promote_checklist_item(document_id, Some(base_version), editor_body, title, project_id)
+        });
         if result.is_ok() {
             self.bump();
         }

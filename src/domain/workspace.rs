@@ -30,6 +30,9 @@ pub enum WorkspaceError {
     /// A catalog move that would create a cycle, cross books, or attach
     /// to a trashed parent.
     InvalidMove(String),
+    /// A Checklist Item promotion whose editor body holds no Linked Task
+    /// Card placeholder (or otherwise cannot commit).
+    InvalidPromotion(String),
 }
 
 impl fmt::Display for WorkspaceError {
@@ -39,6 +42,7 @@ impl fmt::Display for WorkspaceError {
             Self::InvalidDateTime(value) => write!(f, "invalid date/time value: {value}"),
             Self::StaleDocument => write!(f, "the document changed since this edit began"),
             Self::InvalidMove(value) => write!(f, "invalid catalog move: {value}"),
+            Self::InvalidPromotion(value) => write!(f, "invalid checklist promotion: {value}"),
         }
     }
 }
@@ -149,6 +153,29 @@ pub struct DocumentReference {
     pub position: i64,
 }
 
+/// The atomic outcome of promoting a Document's Checklist Item into a
+/// Task (ADR-0002): the created Task, the committed Document whose body
+/// now holds the Linked Task Card, and the new reference index row — all
+/// inside the one SQLite transaction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Promotion {
+    pub task_id: i64,
+    pub document: Document,
+    pub reference: DocumentReference,
+}
+
+/// A backlink: a reference in another Document pointing at a target
+/// (Document or Task), for the right panel's Links & Tasks section.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocumentBacklink {
+    pub reference: DocumentReference,
+    pub source_document_id: i64,
+    pub source_title: String,
+    /// Whether the source Document sits in Trash: the backlink degrades
+    /// (renders inactive) and recovers on restore.
+    pub source_trashed: bool,
+}
+
 /// A Project with its optional `(linked_book_id, linked_group_node_id)`
 /// binding (ADR-0001).
 #[derive(Debug, Clone, PartialEq)]
@@ -252,6 +279,19 @@ impl TaskGroups {
             &mut self.unscheduled,
             &mut self.done,
             &mut self.cancelled,
+        ]
+    }
+
+    /// Every group in display order (the task picker's candidate list).
+    pub fn lists(&self) -> [&Vec<TaskAggregate>; 7] {
+        [
+            &self.overdue,
+            &self.today,
+            &self.upcoming,
+            &self.inbox,
+            &self.unscheduled,
+            &self.done,
+            &self.cancelled,
         ]
     }
 }
@@ -1427,6 +1467,194 @@ impl Workspace {
     }
 
     // ------------------------------------------------------------------
+    // Checklist promotion, Linked Task Cards, `@` mentions (ADR-0002)
+    // ------------------------------------------------------------------
+
+    /// Promotes one of a Document's Checklist Items into a real Task:
+    /// the Task row, the Document body holding the Linked Task Card
+    /// (the editor committed `@task(0)`, substituted here with the real
+    /// id), and the `document_references` index row commit inside ONE
+    /// SQLite transaction — they never split. `base_version` drives the
+    /// single editor's optimistic locking (see
+    /// [`Self::update_document_body`]); `project_id = None` lands the
+    /// Task in the Inbox.
+    pub fn promote_checklist_item(
+        &mut self,
+        document_id: i64,
+        base_version: Option<i64>,
+        editor_body: &str,
+        title: &str,
+        project_id: Option<i64>,
+    ) -> Result<Promotion> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(WorkspaceError::InvalidPromotion("empty title".to_owned()));
+        }
+        if !editor_body.contains(super::document::TASK_CARD_PLACEHOLDER_MARKER) {
+            return Err(WorkspaceError::InvalidPromotion(
+                "the editor body holds no Linked Task Card placeholder".to_owned(),
+            ));
+        }
+        let now = self.stamp();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO tasks (title, status, priority, project_id, milestone_id, \
+                                scheduled_date, scheduled_time, due_date, due_time, \
+                                created_at, updated_at) \
+             VALUES (?, 'todo', 'none', ?, NULL, NULL, NULL, NULL, NULL, ?, ?)",
+            params![title, project_id, now, now],
+        )?;
+        let task_id = tx.last_insert_rowid();
+        // The placeholder becomes the real card marker in the committed
+        // body; nothing else in the body may change.
+        let final_body = editor_body.replacen(
+            super::document::TASK_CARD_PLACEHOLDER_MARKER,
+            &super::document::task_card_marker(task_id),
+            1,
+        );
+        let words = super::document::count_words(&final_body) as i64;
+        let changed = match base_version {
+            Some(base) => tx.execute(
+                "UPDATE documents SET body = ?, word_count = ?, updated_at = ?, \
+                 version = version + 1 WHERE id = ? AND version = ?",
+                params![final_body, words, now, document_id, base],
+            )?,
+            None => tx.execute(
+                "UPDATE documents SET body = ?, word_count = ?, updated_at = ?, \
+                 version = version + 1 WHERE id = ?",
+                params![final_body, words, now, document_id],
+            )?,
+        };
+        if changed == 0 {
+            if base_version.is_some() && document_exists(&tx, document_id)? {
+                return Err(WorkspaceError::StaleDocument);
+            }
+            return Err(WorkspaceError::InvalidDateTime(format!("no document {document_id}")));
+        }
+        reconcile_references(&tx, document_id, &final_body, &now)?;
+        tx.commit()?;
+
+        let document = self.document(document_id)?.expect("document exists after promotion");
+        let reference = self
+            .conn
+            .query_row(
+                "SELECT id, document_id, ref_type, target_kind, target_id, target_label, position \
+                 FROM document_references \
+                 WHERE document_id = ? AND ref_type = 'task_card' AND target_id = ?",
+                params![document_id, task_id],
+                reference_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| {
+                WorkspaceError::InvalidPromotion(format!("reference for task {task_id} missing"))
+            })?;
+        Ok(Promotion { task_id, document, reference })
+    }
+
+    /// The editing tab's auto-save: like [`Self::update_document_body`],
+    /// plus reconciliation of the `document_references` index against the
+    /// committed body's Linked Task Card and `@` mention markers, in the
+    /// same transaction. Editor Undo after a promotion therefore reverts
+    /// the Document content AND the reference index while the created
+    /// Task survives (ADR-0002).
+    pub fn update_document_body_and_references(
+        &mut self,
+        id: i64,
+        title: &str,
+        body: &str,
+        base_version: Option<i64>,
+    ) -> Result<Document> {
+        let now = self.stamp();
+        let words = super::document::count_words(body) as i64;
+        let tx = self.conn.transaction()?;
+        let changed = match base_version {
+            Some(base) => tx.execute(
+                "UPDATE documents SET title = ?, body = ?, word_count = ?, updated_at = ?, \
+                 version = version + 1 WHERE id = ? AND version = ?",
+                params![title, body, words, now, id, base],
+            )?,
+            None => tx.execute(
+                "UPDATE documents SET title = ?, body = ?, word_count = ?, updated_at = ?, \
+                 version = version + 1 WHERE id = ?",
+                params![title, body, words, now, id],
+            )?,
+        };
+        if changed == 0 {
+            if base_version.is_some() && document_exists(&tx, id)? {
+                return Err(WorkspaceError::StaleDocument);
+            }
+            return Err(WorkspaceError::InvalidDateTime(format!("no document {id}")));
+        }
+        reconcile_references(&tx, id, body, &now)?;
+        tx.commit()?;
+        Ok(self.document(id)?.expect("document exists after update"))
+    }
+
+    /// Every reference across the workspace pointing at
+    /// (`target_kind`, `target_id`) — the backlinks of a Document or a
+    /// Task. Trashed source Documents still report (degraded), so the
+    /// panel can render the invalid state and recover on restore.
+    pub fn documents_referencing(
+        &self,
+        target_kind: &str,
+        target_id: i64,
+    ) -> Result<Vec<DocumentBacklink>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id, r.document_id, r.ref_type, r.target_kind, r.target_id, r.target_label, \
+                    r.position, d.title, \
+                    (d.trashed_at IS NOT NULL OR NOT EXISTS ( \
+                        SELECT 1 FROM catalog_nodes cn \
+                        WHERE cn.document_id = d.id AND cn.trashed_at IS NULL \
+                    )) \
+             FROM document_references r JOIN documents d ON d.id = r.document_id \
+             WHERE r.target_kind = ? AND r.target_id = ? \
+             ORDER BY d.updated_at DESC, r.id",
+        )?;
+        Ok(stmt
+            .query_map(params![target_kind, target_id], |row| {
+                Ok(DocumentBacklink {
+                    reference: DocumentReference {
+                        id: row.get(0)?,
+                        document_id: row.get(1)?,
+                        ref_type: row.get(2)?,
+                        target_kind: row.get(3)?,
+                        target_id: row.get(4)?,
+                        target_label: row.get(5)?,
+                        position: row.get(6)?,
+                    },
+                    source_document_id: row.get(1)?,
+                    source_title: row.get(7)?,
+                    source_trashed: row.get::<_, i64>(8)? != 0,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Documents whose title matches `query` (the `@` mention menu);
+    /// trashed documents never surface as mention candidates.
+    pub fn document_titles_matching(&self, query: &str, limit: usize) -> Result<Vec<(i64, String)>> {
+        let needle = format!("%{}%", query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title FROM documents WHERE trashed_at IS NULL AND title LIKE ? ESCAPE '\\' \
+             ORDER BY updated_at DESC, id LIMIT ?",
+        )?;
+        Ok(stmt
+            .query_map(params![needle, limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The Trash screen's task section: every trashed Task, newest first.
+    pub fn trashed_tasks(&self) -> Result<Vec<TaskAggregate>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM tasks WHERE trashed_at IS NOT NULL ORDER BY updated_at DESC, id",
+        )?;
+        let tasks = stmt
+            .query_map([], task_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        tasks.into_iter().map(|task| self.with_details(task)).collect()
+    }
+
+    // ------------------------------------------------------------------
     // Projects and Milestones
     // ------------------------------------------------------------------
 
@@ -1646,11 +1874,146 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool
     Ok(columns.iter().any(|name| name == column))
 }
 
-/// Where `label` first occurs in `body`, counted in UTF-16 code units as
+/// Whether `label` first occurs in `body`, counted in UTF-16 code units as
 /// the editor counts positions; `None` when absent.
 fn utf16_position_of(body: &str, label: &str) -> Option<usize> {
     let byte = body.find(label)?;
     Some(body[..byte].chars().map(char::len_utf16).sum())
+}
+
+/// Whether a Document row exists (any Trash state).
+fn document_exists(conn: &Connection, document_id: i64) -> Result<bool> {
+    Ok(conn
+        .query_row("SELECT 1 FROM documents WHERE id = ?", params![document_id], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
+fn reference_from_row(row: &Row<'_>) -> std::result::Result<DocumentReference, rusqlite::Error> {
+    Ok(DocumentReference {
+        id: row.get(0)?,
+        document_id: row.get(1)?,
+        ref_type: row.get(2)?,
+        target_kind: row.get(3)?,
+        target_id: row.get(4)?,
+        target_label: row.get(5)?,
+        position: row.get(6)?,
+    })
+}
+
+/// Reconciles a Document's `task_card` and `mention` reference rows with
+/// the markers actually anchored in `body`: rows whose target vanished
+/// from the body are deleted, new markers are inserted, survivors move
+/// to their fresh position and label. Runs on `conn` so the caller
+/// commits it inside the same transaction as the body write.
+fn reconcile_references(conn: &Connection, document_id: i64, body: &str, now: &str) -> Result<()> {
+    use super::document::{scan_mention_markers, scan_task_card_markers};
+    let cards = scan_task_card_markers(body);
+    let mentions = scan_mention_markers(body);
+
+    let mut stmt = conn.prepare(
+        "SELECT id, document_id, ref_type, target_kind, target_id, target_label, position \
+         FROM document_references \
+         WHERE document_id = ? AND ref_type IN ('task_card', 'mention')",
+    )?;
+    let existing = stmt
+        .query_map(params![document_id], reference_from_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    // Drop rows whose anchor disappeared from the body (an Undo, a
+    // restore, or an edit removed the card or mention).
+    for row in &existing {
+        let alive = match row.ref_type.as_str() {
+            "task_card" => row
+                .target_id
+                .is_some_and(|id| cards.iter().any(|(card_id, _)| *card_id == id)),
+            "mention" => match row.target_kind.as_str() {
+                "task" | "project" | "document" => row.target_id.is_some_and(|id| {
+                    mentions.iter().any(|m| m.kind == row.target_kind && m.target_id == Some(id))
+                }),
+                "date" => mentions.iter().any(|m| m.kind == "date" && m.label == row.target_label),
+                _ => true,
+            },
+            _ => true,
+        };
+        if !alive {
+            conn.execute("DELETE FROM document_references WHERE id = ?", params![row.id])?;
+        }
+    }
+
+    // Upsert every marker still anchored. Card labels denormalize the
+    // Task's current title; a permanently deleted Task keeps the row
+    // (the invalid placeholder) with its last known label.
+    for (task_id, position) in &cards {
+        let title = conn
+            .query_row("SELECT title FROM tasks WHERE id = ?", params![task_id], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap_or_default();
+        upsert_reference(
+            conn,
+            &existing,
+            document_id,
+            "task_card",
+            "task",
+            Some(*task_id),
+            &title,
+            *position,
+            now,
+        )?;
+    }
+    for marker in &mentions {
+        upsert_reference(
+            conn,
+            &existing,
+            document_id,
+            "mention",
+            &marker.kind,
+            marker.target_id,
+            &marker.label,
+            marker.position,
+            now,
+        )?;
+    }
+    Ok(())
+}
+
+/// Inserts or refreshes one reference row of the committed body.
+#[allow(clippy::too_many_arguments)]
+fn upsert_reference(
+    conn: &Connection,
+    existing: &[DocumentReference],
+    document_id: i64,
+    ref_type: &str,
+    target_kind: &str,
+    target_id: Option<i64>,
+    label: &str,
+    position: usize,
+    now: &str,
+) -> Result<()> {
+    let found = existing.iter().find(|row| {
+        row.ref_type == ref_type && row.target_kind == target_kind && row.target_id == target_id
+    });
+    match found {
+        Some(row) => {
+            // A target gone from the database (permanently deleted Task)
+            // keeps the row's last known label.
+            let label = if label.is_empty() { row.target_label.as_str() } else { label };
+            conn.execute(
+                "UPDATE document_references SET position = ?, target_label = ? WHERE id = ?",
+                params![position as i64, label, row.id],
+            )?;
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO document_references \
+                 (document_id, ref_type, target_kind, target_id, target_label, position, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params![document_id, ref_type, target_kind, target_id, label, position as i64, now],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn task_from_row(row: &Row<'_>) -> std::result::Result<Task, rusqlite::Error> {
@@ -1671,6 +2034,7 @@ fn task_from_row(row: &Row<'_>) -> std::result::Result<Task, rusqlite::Error> {
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
         completed_at: row.get("completed_at")?,
+        trashed_at: row.get("trashed_at")?,
     })
 }
 

@@ -237,16 +237,18 @@ fn kb_shelf_creates_opens_and_edits_a_book() -> Result<(), String> {
 
 /// Seeds a workspace file through the domain facade, so a UI test starts
 /// from a deterministic world without driving dozens of interactions.
-fn seed(
+/// Returns the closure's value for the caller's assertions.
+fn seed<T>(
     path: &std::path::Path,
     now: &str,
-    setup: impl FnOnce(&mut nsh_app_kanon::domain::Workspace),
-) {
+    setup: impl FnOnce(&mut nsh_app_kanon::domain::Workspace) -> T,
+) -> T {
     use nsh_app_kanon::domain::{FixedClock, LocalDateTime, Workspace};
     let clock = FixedClock::at(LocalDateTime::parse(now).expect("valid fixed datetime"));
     let mut ws = Workspace::open(path, clock).expect("seed workspace");
-    setup(&mut ws);
+    let value = setup(&mut ws);
     drop(ws);
+    value
 }
 
 fn count_text(app: &Headless, needle: &str) -> usize {
@@ -1035,6 +1037,308 @@ fn named_version_save_and_restore_round_trips_the_body() -> Result<(), String> {
     let mut app = start(&path, "2026-11-20 10:00");
     open_seeded_document(&mut app, "文案")?;
     app.wait_for("第二版初稿")?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Issue #7: Checklist → Task promotion, Linked Task Card live sync,
+// `@` mentions and backlinks.
+// ---------------------------------------------------------------------
+
+#[test]
+fn checklist_item_promotes_to_a_linked_task_card_and_undo_keeps_the_task() -> Result<(), String> {
+    let path = temp_db("promote-ui");
+    seed(&path, "2026-11-20 09:00", |ws| {
+        let book = ws.create_knowledge_base("手册").expect("kb");
+        let doc = ws.create_document(book.id, None, "周报").expect("doc");
+        ws.save_document(doc.id, "周报", "- [ ] 写周报").expect("seed body");
+    });
+    let mut app = start(&path, "2026-11-20 09:00");
+    open_seeded_document(&mut app, "周报")?;
+
+    // Editing mode: the caret starts inside the only Checklist Item, so
+    // the promotion chooser opens and targets it.
+    app.press("编辑")?;
+    app.wait_for("完成")?;
+    app.wait_for("转为任务")?;
+    app.press("转为任务")?;
+    app.wait_for("新任务存入")?;
+    app.press("收件箱")?;
+
+    // The Linked Task Card renders the created Task live; the Inbox
+    // badge counts it.
+    app.wait_for("打开任务 写周报")?;
+    assert!(!circle_checked(&app, "完成 写周报"), "the card starts unchecked");
+    app.wait_for("label:收件箱 1 项任务")?;
+
+    // Editor Undo after the promotion: the card reverts to a Checklist
+    // Item, the reference index drops it — and the Task survives.
+    app.press("撤销")?;
+    app.wait_for_gone("打开任务 写周报", Duration::from_secs(2))?;
+    app.wait_for("label:收件箱 1 项任务")?;
+
+    // Finish, restart: the checklist body persisted and the Task is
+    // still in the Inbox.
+    app.press("完成")?;
+    app.wait_for("编辑")?;
+    drop(app);
+    let mut app = start(&path, "2026-11-20 09:30");
+    open_seeded_document(&mut app, "周报")?;
+    app.wait_for("写周报")?;
+    app.wait_for("label:收件箱 1 项任务")?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[test]
+fn linked_task_card_syncs_from_today_detail_and_survives_restart() -> Result<(), String> {
+    let path = temp_db("card-sync-ui");
+    seed(&path, "2026-11-20 09:00", |ws| {
+        let book = ws.create_knowledge_base("手册").expect("kb");
+        let doc = ws.create_document(book.id, None, "周报").expect("doc");
+        let task = ws
+            .create_task(&nsh_app_kanon::domain::NewTask {
+                title: "写周报".to_owned(),
+                scheduled_date: Some(date("2026-11-20")),
+                ..Default::default()
+            })
+            .expect("task")
+            .task;
+        ws.save_document(
+            doc.id,
+            "周报",
+            &format!("{}\n\n- [ ] 普通项", nsh_app_kanon::domain::task_card_marker(task.id)),
+        )
+        .expect("seed body");
+    });
+    let mut app = start(&path, "2026-11-20 09:00");
+    open_seeded_document(&mut app, "周报")?;
+    app.wait_for("打开任务 写周报")?;
+
+    // Pin the document tab so the sidebar opens Today in its own tab.
+    app.press("固定标签页 >> nth=0")?;
+
+    // Toggle the Task from its Document card…
+    app.press("完成 写周报")?;
+    assert!(circle_checked(&app, "完成 写周报"), "the card shows done");
+
+    // …Today reflects the same single source of truth…
+    app.press("id:nav-今天")?;
+    app.wait_for("id:date-strip")?;
+    app.press("完成 写周报 >> nth=0")?;
+    app.press("label:标签页 周报 >> nth=0")?;
+    assert!(
+        !circle_checked(&app, "完成 写周报"),
+        "the card follows Today's toggle back to todo"
+    );
+
+    // …and a Task Detail edit (a rename) reaches the card immediately.
+    app.press("打开任务 写周报")?;
+    app.wait_for("任务详情")?;
+    app.clear("label:任务标题")?;
+    app.type_text("label:任务标题", "写周报 v2")?;
+    app.wait_for("写周报 v2")?;
+    assert!(
+        visible_texts(&app).iter().any(|text| text == "写周报 v2"),
+        "the card re-renders the renamed title"
+    );
+
+    // The whole state survives a restart.
+    drop(app);
+    let mut app = start(&path, "2026-11-20 09:30");
+    open_seeded_document(&mut app, "周报")?;
+    app.wait_for("写周报 v2")?;
+    app.wait_for("label:收件箱 0 项任务")?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[test]
+fn reading_tab_card_stays_checkable_while_another_tab_edits() -> Result<(), String> {
+    let path = temp_db("card-lock-ui");
+    seed(&path, "2026-11-20 09:00", |ws| {
+        let book = ws.create_knowledge_base("手册").expect("kb");
+        let doc = ws.create_document(book.id, None, "方案").expect("doc");
+        let task = ws
+            .create_task(&nsh_app_kanon::domain::NewTask {
+                title: "评审方案".to_owned(),
+                scheduled_date: Some(date("2026-11-20")),
+                ..Default::default()
+            })
+            .expect("task")
+            .task;
+        ws.save_document(
+            doc.id,
+            "方案",
+            &format!("{}\n\n- [ ] 锁定项", nsh_app_kanon::domain::task_card_marker(task.id)),
+        )
+        .expect("seed body");
+    });
+    let mut app = start(&path, "2026-11-20 09:00");
+    open_seeded_document(&mut app, "方案")?;
+
+    // Tab 2 reads the same Document; tab 1 takes the single-editor lock.
+    app.press("在新标签页打开")?;
+    app.wait_for("编辑")?;
+    app.press("label:标签页 方案 >> nth=0")?;
+    app.wait_for("编辑")?;
+    app.press("编辑")?;
+    app.wait_for("完成")?;
+
+    // Tab 2 (reading): the lock banner shows and its Checklist Items
+    // are read-only…
+    app.press("label:标签页 方案 >> nth=1")?;
+    app.wait_for("此文档正在其他标签页编辑 · 清单项已锁定")?;
+    assert!(
+        app.screen()
+            .accessibility_state("清单项")
+            .expect("the checklist state")
+            .disabled,
+        "reading Checklist Items lock while another tab edits"
+    );
+
+    // …but its Linked Task Card stays checkable — a Task write, not a
+    // Document write.
+    app.press("完成 评审方案")?;
+    assert!(circle_checked(&app, "完成 评审方案"), "the card toggles from the reading tab");
+    app.wait_for("此文档正在其他标签页编辑 · 清单项已锁定")?;
+
+    // The editing tab agrees without any document write of its own.
+    app.press("label:标签页 方案 >> nth=0")?;
+    assert!(
+        circle_checked(&app, "完成 评审方案"),
+        "the editing tab's card sees the same live state"
+    );
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[test]
+fn trashed_linked_task_card_degrades_recovers_and_stays_invalid_after_delete() -> Result<(), String> {
+    let path = temp_db("card-trash-ui");
+    seed(&path, "2026-11-20 09:00", |ws| {
+        let book = ws.create_knowledge_base("手册").expect("kb");
+        let doc = ws.create_document(book.id, None, "周报").expect("doc");
+        let task = ws
+            .create_task(&nsh_app_kanon::domain::NewTask { title: "写周报".to_owned(), ..Default::default() })
+            .expect("task")
+            .task;
+        ws.save_document(doc.id, "周报", &nsh_app_kanon::domain::task_card_marker(task.id))
+            .expect("seed body");
+    });
+    let mut app = start(&path, "2026-11-20 09:00");
+    open_seeded_document(&mut app, "周报")?;
+    app.wait_for("打开任务 写周报")?;
+
+    // Trash the Task from its Task Detail: the card turns into the
+    // non-interactive removed-task placeholder in place.
+    app.press("打开任务 写周报")?;
+    app.wait_for("任务详情")?;
+    app.press("移入回收站")?;
+    app.wait_for("任务已移除")?;
+    app.wait_for_gone("完成 写周报", Duration::from_secs(2))?;
+
+    // Restore it from the Trash screen: the card goes live again.
+    app.press("id:nav-回收站")?;
+    app.wait_for("写周报")?;
+    app.press("恢复")?;
+    app.press("id:nav-知识库")?;
+    app.wait_for("全部知识库")?;
+    app.press("打开知识库 手册")?;
+    app.wait_for("id:catalog-tree")?;
+    app.press("id:catalog-tree >> text:周报")?;
+    app.wait_for("完成 写周报")?;
+    assert!(!circle_checked(&app, "完成 写周报"), "the restored card is live and unchecked");
+
+    // Trash again and delete permanently: the invalid placeholder stays.
+    app.press("打开任务 写周报")?;
+    app.wait_for("任务详情")?;
+    app.press("移入回收站")?;
+    app.wait_for("任务已移除")?;
+    app.press("id:nav-回收站")?;
+    app.wait_for("写周报")?;
+    app.press("彻底删除")?;
+    app.wait_for_gone("写周报", Duration::from_secs(2))?;
+    app.press("id:nav-知识库")?;
+    app.wait_for("全部知识库")?;
+    app.press("打开知识库 手册")?;
+    app.wait_for("id:catalog-tree")?;
+    app.press("id:catalog-tree >> text:周报")?;
+    app.wait_for("任务已移除")?;
+    app.wait_for_gone("完成 写周报", Duration::from_secs(2))?;
+
+    // The invalid placeholder survives a restart.
+    drop(app);
+    let mut app = start(&path, "2026-11-20 09:30");
+    open_seeded_document(&mut app, "周报")?;
+    app.wait_for("任务已移除")?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[test]
+fn inline_mentions_flow_and_feed_the_backlinks_panel() -> Result<(), String> {
+    let path = temp_db("mention-ui");
+    let (source_id, target_id) = seed(&path, "2026-11-20 09:00", |ws| {
+        let book = ws.create_knowledge_base("手册").expect("kb");
+        let target = ws.create_document(book.id, None, "手册正文").expect("target");
+        let source = ws.create_document(book.id, None, "计划").expect("source");
+        let body = format!(
+            "前文{}后文{}",
+            nsh_app_kanon::domain::mention_marker("document", &target.id.to_string(), "手册正文"),
+            nsh_app_kanon::domain::mention_marker("date", "2026-11-21", "2026-11-21"),
+        );
+        // The editor save path indexes the references; use it in the seed
+        // so the backlinks panel has rows from the start.
+        ws.update_document_body_and_references(source.id, "计划", &body, None).expect("seed body");
+        (source.id, target.id)
+    });
+    let _ = (source_id, target_id);
+    let mut app = start(&path, "2026-11-20 09:00");
+
+    // The mentions flow inline: the paragraph's pieces stay in order.
+    app.wait_for("今天")?;
+    app.press("id:nav-知识库")?;
+    app.wait_for("全部知识库")?;
+    app.press("打开知识库 手册")?;
+    app.wait_for("id:catalog-tree")?;
+    app.press("id:catalog-tree >> text:计划")?;
+    // The mentions flow inline: the whole paragraph reads as one run —
+    // no line breaks around the chips.
+    app.wait_for("前文@手册正文后文@2026-11-21")?;
+    let texts = visible_texts(&app);
+    assert!(
+        texts.contains(&"前文@手册正文后文@2026-11-21".to_owned()),
+        "both mention chips flow inside the paragraph: {texts:?}"
+    );
+
+    // The target Document's right panel lists the backlink.
+    app.press("id:catalog-tree >> text:手册正文")?;
+    app.wait_for("反向链接")?;
+    app.wait_for("label:打开文档 计划")?;
+    // Jump through the backlink into the source Document.
+    app.press("label:打开文档 计划")?;
+    app.wait_for("前文@手册正文后文@2026-11-21")?;
+
+    // Trash the source through its catalog row menu: the backlink
+    // degrades but stays listed.
+    app.press("节点菜单 >> nth=0")?;
+    app.wait_for("移入回收站")?;
+    app.press("移入回收站")?;
+    app.wait_for("id:catalog-tree")?;
+    app.press("id:catalog-tree >> text:手册正文")?;
+    app.wait_for("反向链接")?;
+    app.wait_for("计划（源文档已删除）")?;
+
+    // Restore the source from the catalog's 最近删除 section: the
+    // backlink recovers and jumps again.
+    app.press("label:恢复 计划")?;
+    app.wait_for_gone("label:恢复 计划", Duration::from_secs(2))?;
+    app.press("id:catalog-tree >> text:手册正文")?;
+    app.wait_for("label:打开文档 计划")?;
+    app.press("label:打开文档 计划")?;
+    app.wait_for("前文@手册正文后文@2026-11-21")?;
     let _ = std::fs::remove_file(path);
     Ok(())
 }

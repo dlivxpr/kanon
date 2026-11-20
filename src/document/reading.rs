@@ -23,7 +23,8 @@ use crate::ui::controls::{
 };
 use crate::ui::theme as tokens;
 
-use super::{build_session, doc_markdown, reveal_heading};
+use super::task_card::TaskCardView;
+use super::{CARD_NODE, build_session, doc_markdown, reveal_heading};
 
 /// The reading chrome of one Document tab.
 pub fn reading_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoElement {
@@ -105,7 +106,8 @@ pub fn reading_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
                                     let session = build_session(
                                         &body,
                                         NodeViews::new()
-                                            .with("taskItem", Arc::new(ReadingTaskItem { store })),
+                                            .with("taskItem", Arc::new(ReadingTaskItem { store }))
+                                            .with(CARD_NODE, Arc::new(TaskCardView { store })),
                                     );
                                     current.set(Some(session.clone()));
                                     let change_session = session.clone();
