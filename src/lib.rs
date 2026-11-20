@@ -5,6 +5,7 @@
 //! styled control layer in `ui/`, and the workbench shell in `shell/`.
 
 pub mod domain;
+mod kb;
 mod shell;
 mod today;
 mod ui;

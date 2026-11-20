@@ -81,7 +81,7 @@ fn tab_chip(store: Store, tab: ReadSignal<Tab>, active_id: Memo<u64>) -> impl In
     let id = move || tab.with(|tab| tab.id);
     let is_active = move || id() == active_id.get();
     let pinned = move || tab.with(|tab| tab.pinned);
-    let title = move || tab.with(|tab| tab.current.title());
+    let title = move || store.route_title(&tab.with(|tab| tab.current.clone()));
     let glyph = move || tab.with(|tab| tab.current.glyph());
     view()
         .flex_row()

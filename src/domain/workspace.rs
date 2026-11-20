@@ -24,6 +24,9 @@ pub enum WorkspaceError {
     Sqlite(rusqlite::Error),
     /// A date/time string in storage or input that is not well-formed.
     InvalidDateTime(String),
+    /// A catalog move that would create a cycle, cross books, or attach
+    /// to a trashed parent.
+    InvalidMove(String),
 }
 
 impl fmt::Display for WorkspaceError {
@@ -31,6 +34,7 @@ impl fmt::Display for WorkspaceError {
         match self {
             Self::Sqlite(err) => write!(f, "SQLite error: {err}"),
             Self::InvalidDateTime(value) => write!(f, "invalid date/time value: {value}"),
+            Self::InvalidMove(value) => write!(f, "invalid catalog move: {value}"),
         }
     }
 }
@@ -53,6 +57,32 @@ pub struct KnowledgeBase {
     pub description: String,
     pub icon: String,
     pub color: String,
+    pub favorited: bool,
+}
+
+/// A partial edit of a Knowledge Base: `Some` replaces, `None` leaves.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct KnowledgeBasePatch {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub icon: Option<String>,
+    pub color: Option<String>,
+}
+
+/// Live statistics of one Knowledge Base (its book-style home and the
+/// shelf cards read these; docs/words exclude trashed content).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BookStats {
+    pub documents: usize,
+    pub words: usize,
+}
+
+/// One flattened row of a book's catalog in display order (pre-order),
+/// carrying its nesting depth for indentation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatalogEntry {
+    pub node: CatalogNode,
+    pub depth: usize,
 }
 
 /// A Catalog Node: a pure grouping node, or a node carrying a Document
@@ -65,6 +95,9 @@ pub struct CatalogNode {
     pub document_id: Option<i64>,
     pub title: String,
     pub expanded: bool,
+    /// Local timestamp of the last structural or content change (the
+    /// dot-leader catalog on the book home renders it after the title).
+    pub updated_at: String,
 }
 
 /// A Document, owned strictly by one Knowledge Base (ADR-0001).
@@ -531,11 +564,13 @@ impl Workspace {
     // Knowledge Bases, Catalog, Documents (schema and ownership rules)
     // ------------------------------------------------------------------
 
-    /// Creates a Knowledge Base.
+    /// Creates a Knowledge Base (appended after the existing ones; the
+    /// shelf reorders by favorite, not by creation).
     pub fn create_knowledge_base(&mut self, name: &str) -> Result<KnowledgeBase> {
         let now = self.stamp();
         self.conn.execute(
-            "INSERT INTO knowledge_bases (name, created_at, updated_at) VALUES (?, ?, ?)",
+            "INSERT INTO knowledge_bases (name, created_at, updated_at, sort_order) \
+             VALUES (?, ?, ?, (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM knowledge_bases))",
             params![name, now, now],
         )?;
         let id = self.conn.last_insert_rowid();
@@ -545,18 +580,190 @@ impl Workspace {
             description: String::new(),
             icon: "📕".to_owned(),
             color: "#547093".to_owned(),
+            favorited: false,
         })
+    }
+
+    /// All non-trashed Knowledge Bases: favorites first, then shelf
+    /// order (the grid/list and the book switcher read this).
+    pub fn knowledge_bases(&self) -> Result<Vec<KnowledgeBase>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, description, icon, color, favorited FROM knowledge_bases \
+             WHERE trashed_at IS NULL ORDER BY favorited DESC, sort_order, id",
+        )?;
+        Ok(stmt.query_map([], kb_from_row)?.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Loads a Knowledge Base regardless of its Trash state (the Trash
+    /// screen and the restore flow need the trashed rows).
+    pub fn knowledge_base(&self, id: i64) -> Result<Option<KnowledgeBase>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, name, description, icon, color, favorited FROM knowledge_bases WHERE id = ?",
+                params![id],
+                kb_from_row,
+            )
+            .optional()?)
+    }
+
+    /// Applies a partial edit to a Knowledge Base.
+    pub fn update_knowledge_base(
+        &mut self,
+        id: i64,
+        patch: &KnowledgeBasePatch,
+    ) -> Result<KnowledgeBase> {
+        let mut sets: Vec<&str> = Vec::new();
+        let mut values: Vec<String> = Vec::new();
+        if let Some(name) = &patch.name {
+            sets.push("name = ?");
+            values.push(name.clone());
+        }
+        if let Some(description) = &patch.description {
+            sets.push("description = ?");
+            values.push(description.clone());
+        }
+        if let Some(icon) = &patch.icon {
+            sets.push("icon = ?");
+            values.push(icon.clone());
+        }
+        if let Some(color) = &patch.color {
+            sets.push("color = ?");
+            values.push(color.clone());
+        }
+        if !sets.is_empty() {
+            sets.push("updated_at = ?");
+            values.push(self.stamp());
+            let mut refs: Vec<&dyn rusqlite::ToSql> =
+                values.iter().map(|value| value as &dyn rusqlite::ToSql).collect();
+            let id_param: &dyn rusqlite::ToSql = &id;
+            refs.push(id_param);
+            let sql = format!("UPDATE knowledge_bases SET {} WHERE id = ?", sets.join(", "));
+            let changed = self.conn.execute(&sql, &refs[..])?;
+            if changed == 0 {
+                return Err(WorkspaceError::InvalidDateTime(format!("no knowledge base {id}")));
+            }
+        }
+        self.knowledge_base(id)?.ok_or_else(|| WorkspaceError::InvalidDateTime(format!("no knowledge base {id}")))
+    }
+
+    /// Pins or unpins a Knowledge Base on the shelf.
+    pub fn set_knowledge_base_favorite(&mut self, id: i64, favorited: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE knowledge_bases SET favorited = ?, updated_at = ? WHERE id = ?",
+            params![favorited as i64, self.stamp(), id],
+        )?;
+        Ok(())
+    }
+
+    /// Live document/word counts of one book (trashed content excluded):
+    /// the shelf cards and the book-style home page display these.
+    pub fn book_stats(&self, book_id: i64) -> Result<BookStats> {
+        let (documents, words) = self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(word_count), 0) FROM documents \
+             WHERE book_id = ? AND trashed_at IS NULL",
+            params![book_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        Ok(BookStats { documents: documents as usize, words: words as usize })
+    }
+
+    /// Moves a Knowledge Base and its whole descendant subtree — every
+    /// Catalog Node and Document of the book — into Trash, atomically
+    /// (ADR-0001). Project bindings stay untouched so a restore brings
+    /// the book back exactly as it was.
+    pub fn trash_knowledge_base(&mut self, id: i64) -> Result<()> {
+        let now = self.stamp();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE knowledge_bases SET trashed_at = ?, updated_at = ? WHERE id = ? AND trashed_at IS NULL",
+            params![now, now, id],
+        )?;
+        tx.execute(
+            "UPDATE catalog_nodes SET trashed_at = ?, updated_at = ? WHERE book_id = ? AND trashed_at IS NULL",
+            params![now, now, id],
+        )?;
+        tx.execute(
+            "UPDATE documents SET trashed_at = ?, updated_at = ? WHERE book_id = ? AND trashed_at IS NULL",
+            params![now, now, id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Restores a Knowledge Base and its whole subtree from Trash,
+    /// atomically.
+    pub fn restore_knowledge_base(&mut self, id: i64) -> Result<()> {
+        let now = self.stamp();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE knowledge_bases SET trashed_at = NULL, updated_at = ? WHERE id = ?",
+            params![now, id],
+        )?;
+        tx.execute(
+            "UPDATE catalog_nodes SET trashed_at = NULL, updated_at = ? WHERE book_id = ?",
+            params![now, id],
+        )?;
+        tx.execute(
+            "UPDATE documents SET trashed_at = NULL, updated_at = ? WHERE book_id = ?",
+            params![now, id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Permanently deletes a Knowledge Base, its Catalog Nodes and its
+    /// Documents (with revisions, references and tag links). Projects
+    /// bound to the book or to one of its nodes fall back to unbound
+    /// (ADR-0001). One transaction; not undoable.
+    pub fn delete_knowledge_base_permanent(&mut self, id: i64) -> Result<()> {
+        let now = self.stamp();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE projects SET linked_book_id = NULL, linked_group_node_id = NULL, updated_at = ? \
+             WHERE linked_book_id = ?",
+            params![now, id],
+        )?;
+        tx.execute(
+            "UPDATE projects SET linked_group_node_id = NULL, updated_at = ? \
+             WHERE linked_group_node_id IN (SELECT id FROM catalog_nodes WHERE book_id = ?)",
+            params![now, id],
+        )?;
+        tx.execute(
+            "DELETE FROM document_references WHERE document_id IN \
+             (SELECT id FROM documents WHERE book_id = ?)",
+            params![id],
+        )?;
+        tx.execute(
+            "DELETE FROM document_revisions WHERE document_id IN \
+             (SELECT id FROM documents WHERE book_id = ?)",
+            params![id],
+        )?;
+        tx.execute(
+            "DELETE FROM document_tags WHERE document_id IN (SELECT id FROM documents WHERE book_id = ?)",
+            params![id],
+        )?;
+        // Catalog nodes reference their documents; delete the tree first.
+        tx.execute("DELETE FROM catalog_nodes WHERE book_id = ?", params![id])?;
+        tx.execute("DELETE FROM documents WHERE book_id = ?", params![id])?;
+        tx.execute("DELETE FROM knowledge_bases WHERE id = ?", params![id])?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Creates a Document strictly inside one Knowledge Base
     /// (ADR-0001), optionally under a parent Catalog Node, and links it
-    /// into the catalog tree.
+    /// into the catalog tree at the TOP of its level (spec: the top `+`
+    /// inserts at the top of the catalog; a node-level `+` nests the new
+    /// Document as a child at the top of that level). First-level nodes
+    /// start expanded, deeper nodes collapsed (the first-open rule).
     pub fn create_document(
         &mut self,
         book_id: i64,
         parent_node_id: Option<i64>,
         title: &str,
     ) -> Result<Document> {
+        let expanded = self.validate_parent(book_id, parent_node_id)?;
         let now = self.stamp();
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -564,30 +771,275 @@ impl Workspace {
             params![book_id, title, now, now],
         )?;
         let document_id = tx.last_insert_rowid();
+        let sort_order = top_sort_order(&tx, book_id, parent_node_id)?;
         tx.execute(
-            "INSERT INTO catalog_nodes (book_id, parent_id, document_id, title, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?)",
-            params![book_id, parent_node_id, document_id, title, now, now],
+            "INSERT INTO catalog_nodes \
+             (book_id, parent_id, document_id, title, sort_order, expanded, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            params![book_id, parent_node_id, document_id, title, sort_order, expanded as i64, now, now],
         )?;
         tx.commit()?;
         Ok(Document { id: document_id, book_id, title: title.to_owned(), body: String::new() })
     }
 
-    /// Creates a pure grouping Catalog Node (or a child position).
+    /// Creates a pure grouping Catalog Node at the TOP of its level
+    /// (see [`Self::create_document`] for the insertion rule).
     pub fn create_catalog_node(
         &mut self,
         book_id: i64,
         parent_id: Option<i64>,
         title: &str,
     ) -> Result<CatalogNode> {
+        let expanded = self.validate_parent(book_id, parent_id)?;
         let now = self.stamp();
-        self.conn.execute(
-            "INSERT INTO catalog_nodes (book_id, parent_id, title, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?)",
-            params![book_id, parent_id, title, now, now],
+        let tx = self.conn.transaction()?;
+        let sort_order = top_sort_order(&tx, book_id, parent_id)?;
+        tx.execute(
+            "INSERT INTO catalog_nodes \
+             (book_id, parent_id, title, sort_order, expanded, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            params![book_id, parent_id, title, sort_order, expanded as i64, now, now],
         )?;
-        let id = self.conn.last_insert_rowid();
-        Ok(CatalogNode { id, book_id, parent_id, document_id: None, title: title.to_owned(), expanded: true })
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(CatalogNode {
+            id,
+            book_id,
+            parent_id,
+            document_id: None,
+            title: title.to_owned(),
+            expanded,
+            updated_at: now,
+        })
+    }
+
+    /// The Catalog Node carrying a Document (locate-current in the inner
+    /// catalog sidebar resolves a document tab back to its tree row).
+    pub fn catalog_node_of_document(&self, document_id: i64) -> Result<Option<CatalogNode>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, book_id, parent_id, document_id, title, expanded, updated_at \
+                 FROM catalog_nodes WHERE document_id = ?",
+                params![document_id],
+                catalog_node_from_row,
+            )
+            .optional()?)
+    }
+
+    /// Loads one Catalog Node (regardless of Trash state).
+    pub fn catalog_node(&self, id: i64) -> Result<Option<CatalogNode>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, book_id, parent_id, document_id, title, expanded, updated_at \
+                 FROM catalog_nodes WHERE id = ?",
+                params![id],
+                catalog_node_from_row,
+            )
+            .optional()?)
+    }
+
+    /// The flattened catalog of one book in display order (pre-order),
+    /// depths included. Trashed nodes disappear; a node whose parent is
+    /// still trashed renders at top level until its parent comes back
+    /// (its stored parent link never changes).
+    pub fn catalog_outline(&self, book_id: i64) -> Result<Vec<CatalogEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, book_id, parent_id, document_id, title, expanded, updated_at FROM catalog_nodes \
+             WHERE book_id = ? AND trashed_at IS NULL ORDER BY sort_order, id",
+        )?;
+        let nodes = stmt
+            .query_map(params![book_id], catalog_node_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(flatten_catalog(nodes))
+    }
+
+    /// Persists one node's expand/collapse state (the inner catalog
+    /// sidebar re-reads it on every open).
+    pub fn set_catalog_node_expanded(&mut self, id: i64, expanded: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE catalog_nodes SET expanded = ?, updated_at = ? WHERE id = ?",
+            params![expanded as i64, self.stamp(), id],
+        )?;
+        Ok(())
+    }
+
+    /// The catalog sidebar's expand/collapse-all: one persisted write
+    /// for every node of the book.
+    pub fn set_catalog_expanded_all(&mut self, book_id: i64, expanded: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE catalog_nodes SET expanded = ?, updated_at = ? WHERE book_id = ? AND trashed_at IS NULL",
+            params![expanded as i64, self.stamp(), book_id],
+        )?;
+        Ok(())
+    }
+
+    /// The catalog sidebar's restore section: this book's trashed nodes
+    /// (whole subtrees listed by their root row), newest first.
+    pub fn trashed_catalog_nodes(&self, book_id: i64) -> Result<Vec<CatalogNode>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, book_id, parent_id, document_id, title, expanded, updated_at \
+             FROM catalog_nodes \
+             WHERE book_id = ? AND trashed_at IS NOT NULL \
+             AND (parent_id IS NULL OR parent_id NOT IN \
+                  (SELECT id FROM catalog_nodes WHERE trashed_at IS NOT NULL)) \
+             ORDER BY updated_at DESC, id",
+        )?;
+        Ok(stmt
+            .query_map(params![book_id], catalog_node_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The Trash screen: every trashed Knowledge Base, newest first.
+    pub fn trashed_knowledge_bases(&self) -> Result<Vec<KnowledgeBase>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, description, icon, color, favorited FROM knowledge_bases \
+             WHERE trashed_at IS NOT NULL ORDER BY updated_at DESC, id",
+        )?;
+        Ok(stmt.query_map([], kb_from_row)?.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Moves a Catalog Node to `new_parent_id` (its own id's level when
+    /// `None`) at `index` among the target level's children, renumbering
+    /// both affected levels. Rejects a move into the node itself or any
+    /// descendant (a cycle), across books, or under a trashed parent
+    /// (spec: drag/move reparenting stays a tree).
+    pub fn move_catalog_node(
+        &mut self,
+        id: i64,
+        new_parent_id: Option<i64>,
+        index: usize,
+    ) -> Result<()> {
+        let node = self
+            .catalog_node(id)?
+            .ok_or_else(|| WorkspaceError::InvalidDateTime(format!("no catalog node {id}")))?;
+        let _ = self.validate_parent(node.book_id, new_parent_id)?;
+        if let Some(parent) = new_parent_id {
+            if parent == id {
+                return Err(WorkspaceError::InvalidMove(format!("cannot move node {id} into itself")));
+            }
+            let mut cursor = Some(parent);
+            while let Some(current) = cursor {
+                if current == id {
+                    return Err(WorkspaceError::InvalidMove(format!(
+                        "cannot move node {id} into its own descendant {parent}"
+                    )));
+                }
+                cursor = self.catalog_node(current)?.and_then(|ancestor| ancestor.parent_id);
+            }
+        }
+        if node.parent_id == new_parent_id {
+            let siblings = self.children_of(node.book_id, new_parent_id)?;
+            let mut ids: Vec<i64> =
+                siblings.iter().filter(|sibling| sibling.id != id).map(|sibling| sibling.id).collect();
+            let at = index.min(ids.len());
+            ids.insert(at, id);
+            self.renumber_level(node.book_id, new_parent_id, &ids)?;
+        } else {
+            let old_ids: Vec<i64> = self
+                .children_of(node.book_id, node.parent_id)?
+                .iter()
+                .filter(|sibling| sibling.id != id)
+                .map(|sibling| sibling.id)
+                .collect();
+            let mut new_ids: Vec<i64> = self
+                .children_of(node.book_id, new_parent_id)?
+                .iter()
+                .filter(|sibling| sibling.id != id)
+                .map(|sibling| sibling.id)
+                .collect();
+            let at = index.min(new_ids.len());
+            new_ids.insert(at, id);
+            let now = self.stamp();
+            let tx = self.conn.transaction()?;
+            for (parent, ids) in [(node.parent_id, old_ids), (new_parent_id, new_ids)] {
+                for (order, child) in ids.iter().enumerate() {
+                    tx.execute(
+                        "UPDATE catalog_nodes SET parent_id = ?, sort_order = ?, updated_at = ? WHERE id = ?",
+                        params![parent, order as f64, now, child],
+                    )?;
+                }
+            }
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Moves a Catalog Node and its whole descendant subtree into
+    /// Trash, atomically (the subtree restores together).
+    pub fn trash_catalog_node(&mut self, id: i64) -> Result<()> {
+        self.set_catalog_subtree_trashed(id, true)
+    }
+
+    /// Restores a Catalog Node and its whole descendant subtree from
+    /// Trash, atomically.
+    pub fn restore_catalog_node(&mut self, id: i64) -> Result<()> {
+        self.set_catalog_subtree_trashed(id, false)
+    }
+
+    fn set_catalog_subtree_trashed(&mut self, id: i64, trashed: bool) -> Result<()> {
+        let now = self.stamp();
+        let tx = self.conn.transaction()?;
+        let mut stmt = tx.prepare(
+            "WITH RECURSIVE subtree(id) AS ( \
+                SELECT id FROM catalog_nodes WHERE id = :id \
+                UNION ALL \
+                SELECT child.id FROM catalog_nodes child JOIN subtree ON child.parent_id = subtree.id \
+            ) \
+            SELECT id FROM subtree",
+        )?;
+        let ids = stmt
+            .query_map(&[(":id", &id)], |row| row.get::<_, i64>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        for node_id in &ids {
+            if trashed {
+                tx.execute(
+                    "UPDATE catalog_nodes SET trashed_at = ?, updated_at = ? WHERE id = ? AND trashed_at IS NULL",
+                    params![now, now, node_id],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE catalog_nodes SET trashed_at = NULL, updated_at = ? WHERE id = ?",
+                    params![now, node_id],
+                )?;
+            }
+        }
+        // The subtree's Documents move with it, atomically.
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let trashed_value: Option<String> = if trashed { Some(now.clone()) } else { None };
+        let trashed_clause = if trashed { "trashed_at IS NULL" } else { "trashed_at IS NOT NULL" };
+        tx.execute(
+            &format!(
+                "UPDATE documents SET trashed_at = ?, updated_at = ? \
+                 WHERE id IN (SELECT document_id FROM catalog_nodes WHERE id IN ({placeholders})) \
+                 AND {trashed_clause}",
+            ),
+            rusqlite::params_from_iter(
+                std::iter::once(Box::new(trashed_value) as Box<dyn rusqlite::ToSql>)
+                    .chain(std::iter::once(Box::new(now) as Box<dyn rusqlite::ToSql>))
+                    .chain(ids.iter().map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>))
+                    .map(|param| param as Box<dyn rusqlite::ToSql>),
+            ),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Saves a Document's title and body, refreshing its word count
+    /// (CJK characters count individually, other alphanumeric runs as
+    /// words). The editor milestone (#6) drives this after every edit.
+    pub fn save_document(&mut self, id: i64, title: &str, body: &str) -> Result<Document> {
+        let words = count_words(body);
+        let changed = self.conn.execute(
+            "UPDATE documents SET title = ?, body = ?, word_count = ?, updated_at = ? WHERE id = ?",
+            params![title, body, words, self.stamp(), id],
+        )?;
+        if changed == 0 {
+            return Err(WorkspaceError::InvalidDateTime(format!("no document {id}")));
+        }
+        self.document(id)?.ok_or_else(|| WorkspaceError::InvalidDateTime(format!("no document {id}")))
     }
 
     /// Saves a Document revision; `name = None` records an automatic
@@ -749,6 +1201,66 @@ impl Workspace {
     // Internals
     // ------------------------------------------------------------------
 
+    /// A parent must exist in the same book and not be trashed; returns
+    /// the new child's initial expand state (first level expands, deeper
+    /// levels collapse — the first-open default).
+    fn validate_parent(&self, book_id: i64, parent_id: Option<i64>) -> Result<bool> {
+        match parent_id {
+            None => Ok(true),
+            Some(parent) => {
+                let parent = self.catalog_node(parent)?.ok_or_else(|| {
+                    WorkspaceError::InvalidMove(format!("no parent catalog node {parent}"))
+                })?;
+                if parent.book_id != book_id {
+                    return Err(WorkspaceError::InvalidMove(format!(
+                        "parent {} belongs to book {}, not {book_id}",
+                        parent.id, parent.book_id
+                    )));
+                }
+                let trashed = self.conn.query_row(
+                    "SELECT trashed_at IS NOT NULL FROM catalog_nodes WHERE id = ?",
+                    params![parent.id],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if trashed {
+                    return Err(WorkspaceError::InvalidMove(format!(
+                        "parent {} is in Trash",
+                        parent.id
+                    )));
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    /// The children of one level (direct children of `parent_id` in
+    /// `book_id`), in display order.
+    fn children_of(&self, book_id: i64, parent_id: Option<i64>) -> Result<Vec<CatalogNode>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, book_id, parent_id, document_id, title, expanded, updated_at FROM catalog_nodes \
+             WHERE book_id = ? AND parent_id IS ? AND trashed_at IS NULL ORDER BY sort_order, id",
+        )?;
+        Ok(stmt
+            .query_map(params![book_id, parent_id], catalog_node_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Renumbers one level's children 0..n in display order and points
+    /// them at `parent_id` (a single transaction).
+    fn renumber_level(&mut self, book_id: i64, parent_id: Option<i64>, ids: &[i64]) -> Result<()> {
+        let now = self.stamp();
+        let tx = self.conn.transaction()?;
+        for (order, child) in ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE catalog_nodes SET parent_id = ?, sort_order = ?, updated_at = ? \
+                 WHERE id = ? AND book_id = ?",
+                params![parent_id, order as f64, now, child, book_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     fn with_details(&self, task: Task) -> Result<TaskAggregate> {
         let tags = self.tags_of_task(task.id)?;
         let subtasks = self.subtasks_of_task(task.id)?;
@@ -829,6 +1341,109 @@ fn task_from_row(row: &Row<'_>) -> std::result::Result<Task, rusqlite::Error> {
 
 fn tag_from_row(row: &Row<'_>) -> std::result::Result<Tag, rusqlite::Error> {
     Ok(Tag { id: row.get(0)?, name: row.get(1)?, color: row.get(2)? })
+}
+
+fn kb_from_row(row: &Row<'_>) -> std::result::Result<KnowledgeBase, rusqlite::Error> {
+    Ok(KnowledgeBase {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        description: row.get(2)?,
+        icon: row.get(3)?,
+        color: row.get(4)?,
+        favorited: row.get::<_, i64>(5)? != 0,
+    })
+}
+
+fn catalog_node_from_row(row: &Row<'_>) -> std::result::Result<CatalogNode, rusqlite::Error> {
+    Ok(CatalogNode {
+        id: row.get(0)?,
+        book_id: row.get(1)?,
+        parent_id: row.get(2)?,
+        document_id: row.get(3)?,
+        title: row.get(4)?,
+        expanded: row.get::<_, i64>(5)? != 0,
+        updated_at: row.get(6)?,
+    })
+}
+
+/// The `sort_order` that puts a new sibling at the TOP of its level:
+/// one step ahead of the current first entry.
+fn top_sort_order(
+    tx: &rusqlite::Transaction<'_>,
+    book_id: i64,
+    parent_id: Option<i64>,
+) -> Result<f64> {
+    let min: Option<f64> = tx.query_row(
+        "SELECT MIN(sort_order) FROM catalog_nodes \
+         WHERE book_id = ? AND parent_id IS ? AND trashed_at IS NULL",
+        params![book_id, parent_id],
+        |row| row.get(0),
+    )?;
+    Ok(min.map(|min| min - 1.0).unwrap_or(0.0))
+}
+
+/// Groups flat nodes into a pre-order outline with depths. A node whose
+/// parent is not in the set (a trashed ancestor) renders at top level;
+/// every visible chain is walked from there.
+fn flatten_catalog(nodes: Vec<CatalogNode>) -> Vec<CatalogEntry> {
+    use std::collections::HashMap;
+    let ids: HashMap<i64, ()> = nodes.iter().map(|node| (node.id, ())).collect();
+    let mut children: HashMap<Option<i64>, Vec<&CatalogNode>> = HashMap::new();
+    for node in &nodes {
+        children.entry(node.parent_id).or_default().push(node);
+    }
+    let mut outline = Vec::new();
+    fn walk(
+        children: &HashMap<Option<i64>, Vec<&CatalogNode>>,
+        parent: Option<i64>,
+        depth: usize,
+        outline: &mut Vec<CatalogEntry>,
+    ) {
+        let Some(level) = children.get(&parent) else { return };
+        for node in level {
+            outline.push(CatalogEntry { node: (*node).clone(), depth });
+            walk(children, Some(node.id), depth + 1, outline);
+        }
+    }
+    for node in &nodes {
+        let visible_root = match node.parent_id {
+            None => true,
+            Some(parent) => !ids.contains_key(&parent),
+        };
+        if visible_root {
+            outline.push(CatalogEntry { node: (*node).clone(), depth: 0 });
+            walk(&children, Some(node.id), 1, &mut outline);
+        }
+    }
+    outline
+}
+
+/// Yuque-style word count: every CJK character counts as one word, each
+/// maximal run of other alphanumeric characters counts as one.
+pub fn count_words(body: &str) -> i64 {
+    let cjk = |ch: char| {
+        ('\u{4e00}'..='\u{9fff}').contains(&ch)
+            || ('\u{3400}'..='\u{4dbf}').contains(&ch)
+            || ('\u{f900}'..='\u{faff}').contains(&ch)
+            || ('\u{3040}'..='\u{30ff}').contains(&ch)
+            || ('\u{ac00}'..='\u{d7af}').contains(&ch)
+    };
+    let mut count = 0_i64;
+    let mut in_latin_run = false;
+    for ch in body.chars() {
+        if cjk(ch) {
+            count += 1;
+            in_latin_run = false;
+        } else if ch.is_alphanumeric() {
+            if !in_latin_run {
+                count += 1;
+            }
+            in_latin_run = true;
+        } else {
+            in_latin_run = false;
+        }
+    }
+    count
 }
 
 fn project_from_row(row: &Row<'_>) -> std::result::Result<Project, rusqlite::Error> {

@@ -132,11 +132,45 @@ pub fn input_field(
     placeholder: &'static str,
     value: impl Fn() -> String + 'static,
     on_change: impl Fn(&str) + 'static,
-) -> impl IntoElement {
+) -> nsh_base::Input {
     nsh_base::input()
         .value(value)
         .on_change(on_change)
         .placeholder(placeholder)
+        .placeholder_color(|| color(theme().muted_foreground))
+        .caret_color(|| color(theme().primary))
+        .h(px(32.0))
+        .px_3()
+        .text_size(px(13.0))
+        .rounded(move || theme().radius)
+        .bg(tokens::control_bg())
+        .border_1()
+        .border_color(move || theme().background.opacity(0.0))
+        .focus(|s| s.border_color(tokens::accent()))
+        .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
+        .transition_colors()
+        .duration(tokens::ms(tokens::MOTION_INSTANT_MS))
+        .flex_1()
+        .min_w(px(0.0))
+}
+
+/// The app's text field with an Enter-to-commit handler: `on_submit`
+/// fires with the current text (used by the Knowledge Base creation
+/// rows, where Enter is the primary commit gesture).
+pub fn input_field_on_submit(
+    placeholder: impl Into<String> + Clone + 'static,
+    value: impl Fn() -> String + 'static,
+    on_change: impl Fn(&str) + 'static,
+    on_submit: impl Fn(&str) + 'static,
+) -> impl IntoElement {
+    let label: String = placeholder.into();
+    let placeholder_text = label.clone();
+    nsh_base::input()
+        .value(value)
+        .on_change(on_change)
+        .on_submit(on_submit)
+        .placeholder(move || placeholder_text.clone())
+        .label(move || label.clone())
         .placeholder_color(|| color(theme().muted_foreground))
         .caret_color(|| color(theme().primary))
         .h(px(32.0))

@@ -26,6 +26,9 @@ pub struct Store {
     /// The workbench tab strip (routes, per-tab history, pin state).
     pub strip: Signal<TabStrip>,
     pub sidebar_collapsed: Signal<bool>,
+    /// The manual temporary expand while the responsive rules
+    /// auto-collapse the outer sidebar (docs/ui-design.md §3.4).
+    pub sidebar_temp_expand: Signal<bool>,
     pub panel_open: Signal<bool>,
     /// The Task shown in the right context panel's Task Detail.
     pub selected_task: Signal<Option<i64>>,
@@ -44,6 +47,7 @@ impl Store {
             bump: signal(0),
             strip: signal(TabStrip::new(Route::Today, today)),
             sidebar_collapsed: signal(sidebar_collapsed),
+            sidebar_temp_expand: signal(false),
             panel_open: signal(panel_open),
             selected_task: signal(None),
         }
@@ -71,6 +75,65 @@ impl Store {
 
     pub fn carryover_count(&self) -> usize {
         self.workspace.with(|ws| ws.carryover_count().unwrap_or_default())
+    }
+
+    // ------------------------------------------------------------------
+    // Knowledge Base and catalog reads
+    // ------------------------------------------------------------------
+
+    pub fn knowledge_bases(&self) -> Vec<crate::domain::KnowledgeBase> {
+        self.bump.get();
+        self.workspace.with(|ws| ws.knowledge_bases().unwrap_or_default())
+    }
+
+    pub fn knowledge_base(&self, id: i64) -> Option<crate::domain::KnowledgeBase> {
+        self.bump.get();
+        self.workspace.with(|ws| ws.knowledge_base(id).unwrap_or_default())
+    }
+
+    pub fn book_stats(&self, id: i64) -> crate::domain::BookStats {
+        self.bump.get();
+        self.workspace.with(|ws| ws.book_stats(id).unwrap_or_default())
+    }
+
+    pub fn catalog_outline(&self, book_id: i64) -> Vec<crate::domain::CatalogEntry> {
+        self.bump.get();
+        self.workspace.with(|ws| ws.catalog_outline(book_id).unwrap_or_default())
+    }
+
+    /// The catalog sidebar's restore section rows.
+    pub fn trashed_catalog_nodes(&self, book_id: i64) -> Vec<crate::domain::CatalogNode> {
+        self.bump.get();
+        self.workspace.with(|ws| ws.trashed_catalog_nodes(book_id).unwrap_or_default())
+    }
+
+    pub fn document(&self, id: i64) -> Option<crate::domain::Document> {
+        self.bump.get();
+        self.workspace.with(|ws| ws.document(id).unwrap_or_default())
+    }
+
+    pub fn catalog_node_of_document(&self, document_id: i64) -> Option<crate::domain::CatalogNode> {
+        self.bump.get();
+        self.workspace.with(|ws| ws.catalog_node_of_document(document_id).unwrap_or_default())
+    }
+
+    /// The tab/sidebar label for a route: book and document routes take
+    /// their live names, everything else its static title.
+    pub fn route_title(&self, route: &Route) -> String {
+        self.bump.get();
+        match route {
+            Route::Book(id) => self
+                .workspace
+                .with(|ws| ws.knowledge_base(*id).ok().flatten())
+                .map(|kb| kb.name)
+                .unwrap_or_else(|| route.title()),
+            Route::Document(id) => self
+                .workspace
+                .with(|ws| ws.document(*id).ok().flatten())
+                .map(|doc| doc.title)
+                .unwrap_or_else(|| route.title()),
+            other => other.title(),
+        }
     }
 
     // ------------------------------------------------------------------
@@ -207,6 +270,234 @@ impl Store {
     }
 
     // ------------------------------------------------------------------
+    // Knowledge Base and catalog commands
+    // ------------------------------------------------------------------
+
+    /// Creates a Knowledge Base and lands on its book home. Returns the id.
+    pub fn create_knowledge_base(&self, name: &str) -> Option<i64> {
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        let result = self.workspace.with(|ws| ws.create_knowledge_base(name));
+        match result {
+            Ok(kb) => {
+                self.bump();
+                Some(kb.id)
+            }
+            Err(err) => {
+                log::warn!("create knowledge base failed: {err}");
+                None
+            }
+        }
+    }
+
+    pub fn update_knowledge_base(&self, id: i64, patch: &crate::domain::KnowledgeBasePatch) {
+        if let Err(err) = self.workspace.with(|ws| ws.update_knowledge_base(id, patch)) {
+            log::warn!("update knowledge base {id} failed: {err}");
+        }
+        self.bump();
+    }
+
+    pub fn set_kb_favorite(&self, id: i64, favorited: bool) {
+        if let Err(err) = self.workspace.with(|ws| ws.set_knowledge_base_favorite(id, favorited)) {
+            log::warn!("favorite knowledge base {id} failed: {err}");
+        }
+        self.bump();
+    }
+
+    /// Trashes a book's whole subtree and closes the tabs that showed it
+    /// (they fall back to the shelf).
+    pub fn trash_knowledge_base(&self, id: i64) {
+        if let Err(err) = self.workspace.with(|ws| ws.trash_knowledge_base(id)) {
+            log::warn!("trash knowledge base {id} failed: {err}");
+            return;
+        }
+        self.strip.update(|strip| {
+            for tab in &mut strip.tabs {
+                let stale = match &tab.current {
+                    Route::Book(book) => *book == id,
+                    Route::Document(doc) => self
+                        .workspace
+                        .with(|ws| ws.document(*doc).ok().flatten())
+                        .is_some_and(|doc| doc.book_id == id),
+                    _ => false,
+                };
+                if stale {
+                    tab.navigate(Route::KnowledgeBases);
+                }
+            }
+        });
+        self.bump();
+    }
+
+    pub fn restore_knowledge_base(&self, id: i64) {
+        if let Err(err) = self.workspace.with(|ws| ws.restore_knowledge_base(id)) {
+            log::warn!("restore knowledge base {id} failed: {err}");
+        }
+        self.bump();
+    }
+
+    /// The Trash screen's rows.
+    pub fn trashed_knowledge_bases(&self) -> Vec<crate::domain::KnowledgeBase> {
+        self.bump.get();
+        self.workspace.with(|ws| ws.trashed_knowledge_bases().unwrap_or_default())
+    }
+
+    /// Permanently deletes a trashed Knowledge Base (not undoable).
+    pub fn delete_knowledge_base_permanent(&self, id: i64) {
+        if let Err(err) = self.workspace.with(|ws| ws.delete_knowledge_base_permanent(id)) {
+            log::warn!("delete knowledge base {id} failed: {err}");
+        }
+        self.bump();
+    }
+
+    /// Creates a Document at the top of its level (the catalog's top `+`);
+    /// `parent` nests it under that node. Returns the new document id.
+    pub fn create_document_in(&self, book_id: i64, parent: Option<i64>, title: &str) -> Option<i64> {
+        let title = title.trim();
+        if title.is_empty() {
+            return None;
+        }
+        let result = self.workspace.with(|ws| ws.create_document(book_id, parent, title));
+        match result {
+            Ok(doc) => {
+                self.bump();
+                Some(doc.id)
+            }
+            Err(err) => {
+                log::warn!("create document failed: {err}");
+                None
+            }
+        }
+    }
+
+    /// Creates a grouping Catalog Node at the top of its level. Returns
+    /// the new node id.
+    pub fn create_group_in(&self, book_id: i64, parent: Option<i64>, title: &str) -> Option<i64> {
+        let title = title.trim();
+        if title.is_empty() {
+            return None;
+        }
+        let result = self.workspace.with(|ws| ws.create_catalog_node(book_id, parent, title));
+        match result {
+            Ok(node) => {
+                self.bump();
+                Some(node.id)
+            }
+            Err(err) => {
+                log::warn!("create catalog node failed: {err}");
+                None
+            }
+        }
+    }
+
+    /// Drag/move reparenting. Returns false (and changes nothing) when
+    /// the move would create a cycle or cross books.
+    pub fn move_catalog_node(&self, id: i64, parent: Option<i64>, index: usize) -> bool {
+        let result = self.workspace.with(|ws| ws.move_catalog_node(id, parent, index));
+        match result {
+            Ok(()) => {
+                self.bump();
+                true
+            }
+            Err(err) => {
+                log::warn!("move catalog node {id} failed: {err}");
+                false
+            }
+        }
+    }
+
+    /// The catalog row menu's reorder: `delta` of -1/1 moves the node
+    /// one slot within its level.
+    pub fn move_catalog_node_rel(&self, id: i64, delta: isize) {
+        let (book_id, parent) = {
+            let node = self.workspace.with(|ws| ws.catalog_node(id).ok().flatten());
+            match node {
+                Some(node) => (node.book_id, node.parent_id),
+                None => return,
+            }
+        };
+        let outline = self.workspace.with(|ws| ws.catalog_outline(book_id).unwrap_or_default());
+        let siblings = outline
+            .iter()
+            .filter(|entry| entry.node.parent_id == parent)
+            .map(|entry| entry.node.id)
+            .collect::<Vec<_>>();
+        let Some(position) = siblings.iter().position(|sibling| *sibling == id) else { return };
+        let at = (position as isize + delta).clamp(0, siblings.len() as isize - 1) as usize;
+        self.move_catalog_node(id, parent, at);
+    }
+
+    /// The catalog row menu's outdent: move the node to the top of the
+    /// book's root level.
+    pub fn move_catalog_node_to_top(&self, id: i64) {
+        self.move_catalog_node(id, None, 0);
+    }
+
+    pub fn set_node_expanded(&self, id: i64, expanded: bool) {
+        if let Err(err) = self.workspace.with(|ws| ws.set_catalog_node_expanded(id, expanded)) {
+            log::warn!("set node {id} expanded failed: {err}");
+        }
+        self.bump();
+    }
+
+    /// The catalog sidebar's expand/collapse-all.
+    pub fn set_catalog_expanded_all(&self, book_id: i64, expanded: bool) {
+        if let Err(err) = self.workspace.with(|ws| ws.set_catalog_expanded_all(book_id, expanded)) {
+            log::warn!("set catalog expanded-all failed: {err}");
+        }
+        self.bump();
+    }
+
+    pub fn trash_catalog_node(&self, id: i64) {
+        if let Err(err) = self.workspace.with(|ws| ws.trash_catalog_node(id)) {
+            log::warn!("trash catalog node {id} failed: {err}");
+            return;
+        }
+        // A document tab whose tree row just disappeared falls back to
+        // its book home.
+        self.strip.update(|strip| {
+            for tab in &mut strip.tabs {
+                if let Route::Document(doc_id) = &tab.current {
+                    let book = self
+                        .workspace
+                        .with(|ws| ws.document(*doc_id).ok().flatten())
+                        .map(|doc| doc.book_id);
+                    let visible = book.and_then(|book_id| {
+                        self.workspace.with(|ws| ws.catalog_outline(book_id).ok()).map(|outline| {
+                            outline.iter().any(|entry| entry.node.document_id == Some(*doc_id))
+                        })
+                    });
+                    if visible == Some(false)
+                        && let Some(book_id) = book
+                    {
+                        tab.navigate(Route::Book(book_id));
+                    }
+                }
+            }
+        });
+        self.bump();
+    }
+
+    pub fn restore_catalog_node(&self, id: i64) {
+        if let Err(err) = self.workspace.with(|ws| ws.restore_catalog_node(id)) {
+            log::warn!("restore catalog node {id} failed: {err}");
+        }
+        self.bump();
+    }
+
+    /// Opens a book's home (focus-or-reuse, like every sidebar entry).
+    pub fn open_book(&self, id: i64) {
+        self.open_or_focus(Route::Book(id));
+    }
+
+    /// Opens a document's reading view.
+    pub fn open_document(&self, id: i64) {
+        self.open_or_focus(Route::Document(id));
+    }
+
+    // ------------------------------------------------------------------
     // Tab commands
     // ------------------------------------------------------------------
 
@@ -266,7 +557,35 @@ impl Store {
     // Shell commands
     // ------------------------------------------------------------------
 
+    /// Whether the responsive rules (docs/ui-design.md §3.4) currently
+    /// force the outer sidebar into its icon rail: a window under
+    /// 1440 px showing an inner-catalog destination. The strip read is
+    /// tracked: bindings that ask re-run when the active tab changes.
+    pub fn sidebar_auto_collapsed(&self) -> bool {
+        let strip = self.strip.get();
+        nsh_core::prelude::window().width.0 < 1440.0
+            && strip
+                .tabs
+                .get(strip.active)
+                .is_some_and(|tab| tab.current.has_inner_catalog())
+    }
+
+    /// The sidebar's effective width state for the current window and
+    /// tab: the auto rule wins unless manually expanded for a while.
+    pub fn sidebar_effective_collapsed(&self) -> bool {
+        self.bump.get();
+        if self.sidebar_auto_collapsed() {
+            !self.sidebar_temp_expand.get()
+        } else {
+            self.sidebar_collapsed.get()
+        }
+    }
+
     pub fn toggle_sidebar(&self) {
+        if self.sidebar_auto_collapsed() {
+            self.sidebar_temp_expand.update(|expanded| *expanded = !*expanded);
+            return;
+        }
         let collapsed = !self.sidebar_collapsed.get_untracked();
         self.sidebar_collapsed.set(collapsed);
         let result =
