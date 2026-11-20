@@ -4,7 +4,8 @@
 
 use nsh_core::prelude::*;
 
-use crate::ui::controls::{input_field, panel, section_heading};
+use crate::domain::outline;
+use crate::ui::controls::{panel, section_heading, submit_field};
 use crate::ui::theme as tokens;
 
 use super::store::{use_store, Store};
@@ -23,9 +24,14 @@ pub fn context_panel() -> impl IntoElement {
             // reads more signals (the detail's aggregate computed evaluates
             // eagerly), which must not re-run this region.
             let selected = store.selected_task.get();
-            untracked(move || match selected {
-                Some(id) => task_detail::task_detail(store, id).into_element(),
-                None => overview(store).into_element(),
+            let document = store.strip.with(|strip| match &strip.tabs[strip.active].current {
+                super::tabs::Route::Document(id) => Some((strip.tabs[strip.active].id, *id)),
+                _ => None,
+            });
+            untracked(move || match (selected, document) {
+                (Some(id), _) => task_detail::task_detail(store, id).into_element(),
+                (None, Some((tab_id, doc_id))) => document_outline(store, tab_id, doc_id).into_element(),
+                (None, None) => overview(store).into_element(),
             })
         }))
 }
@@ -41,6 +47,8 @@ fn panel_header(store: Store) -> impl IntoElement {
         .child(text(move || {
             if store.selected_task.get().is_some() {
                 "任务详情".to_owned()
+            } else if store.strip.with(|strip| matches!(strip.tabs[strip.active].current, super::tabs::Route::Document(_))) {
+                "文档大纲".to_owned()
             } else {
                 "任务速览".to_owned()
             }
@@ -48,6 +56,47 @@ fn panel_header(store: Store) -> impl IntoElement {
         .text_size(px(14.0))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(tokens::fg_primary()))
+}
+
+/// The Document outline (docs/ui-design.md §4.6): the committed body's
+/// H1–H3 headings; pressing one asks the tab showing the document to
+/// reveal that heading.
+fn document_outline(store: Store, tab_id: u64, document_id: i64) -> impl IntoElement {
+    let entries = move || {
+        store.bump.get();
+        let body = store.document(document_id).map(|doc| doc.body).unwrap_or_default();
+        outline(&body, 3)
+    };
+    scroll().flex_1().child(
+        view().flex_col().p_2().gap_1().child(each(
+            entries,
+            |entry: &crate::domain::OutlineEntry| entry.ordinal,
+            move |entry, _index| {
+                let ordinal = entry.with(|entry| entry.ordinal);
+                let level = entry.with(|entry| entry.level);
+                let text_label = entry.with(|entry| entry.text.clone());
+                let jump = store;
+                nsh_base::button()
+                    .on_press(move || jump.request_outline_jump(tab_id, ordinal))
+                    .accessibility_label(text_label.clone())
+                    .items_start()
+                    .px_2()
+                    .py_1()
+                    .rounded(tokens::radius_row())
+                    .bg(move || nsh_base::theme().background.opacity(0.0))
+                    .hover(|s| s.bg(tokens::control_bg()))
+                    .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
+                    .child(
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .pl(px((level.saturating_sub(1)) as f32 * 12.0))
+                            .child(text(text_label).text_size(px(12.0)).text_color(tokens::fg_body())),
+                    )
+            },
+        )),
+    )
 }
 
 /// Task Overview: mutually-exclusive groups 逾期 / 今天 / 收件箱 plus a
@@ -72,10 +121,14 @@ fn overview(store: Store) -> impl IntoElement {
                             .flex_row()
                             .items_center()
                             .gap_2()
-                            .child(input_field(
+                            .child(submit_field(
                                 "速记待办，回车保存",
                                 move || capture.get(),
                                 move |text: &str| capture.set(text.to_owned()),
+                                move |text: &str| {
+                                    store.create_inbox_task(text);
+                                    capture.set(String::new());
+                                },
                             ))
                             .child(when(
                                 move || !capture.get().trim().is_empty(),

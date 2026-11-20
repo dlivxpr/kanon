@@ -25,8 +25,15 @@ const BOTTOM: &[Route] = &[Route::KnowledgeBases, Route::Trash, Route::Settings]
 
 pub fn sidebar() -> impl IntoElement {
     let store = use_store();
+    // The window width subscribes the binding: resizing across the
+    // 1440 px breakpoint re-applies the auto-collapse rule
+    // (docs/ui-design.md §3.4).
+    let width = move || {
+        let _ = window();
+        if store.sidebar_effective_collapsed() { px(64.0) } else { px(232.0) }
+    };
     view()
-        .w(move || if store.sidebar_collapsed.get() { px(64.0) } else { px(232.0) })
+        .w(width)
         .flex_col()
         .gap_1()
         .py_2()
@@ -48,7 +55,7 @@ fn nav_row(store: Store, route: &'static Route) -> impl IntoElement {
         let strip = store.strip.get();
         strip.tabs.get(strip.active).is_some_and(|tab| tab.current == *route)
     };
-    let collapsed = move || store.sidebar_collapsed.get();
+    let collapsed = move || store.sidebar_effective_collapsed();
     let label = route.title();
     let glyph = route.glyph();
     nsh_base::button()

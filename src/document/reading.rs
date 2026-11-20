@@ -6,22 +6,26 @@
 
 use std::sync::Arc;
 
-use nsh_base::rich_editor::{
-    model::Node,
-    view::{EditorSession, NodeView, NodeViewCx, NodeViews, rich_editor},
+use nsh_base::{
+    rich_editor::{
+        model::Node,
+        view::{rich_editor, EditorSession, NodeView, NodeViewCx, NodeViews},
+    },
+    theme,
 };
 use nsh_core::prelude::*;
 use serde_json::Value;
 
-use crate::shell::Store;
 use crate::shell::store::EditOutcome;
-use crate::ui::controls::{app_button, app_button_with, empty_state, panel_icon_button, ButtonKind};
+use crate::shell::Store;
+use crate::ui::controls::{
+    app_button, app_button_with, empty_state, panel_icon_button, ButtonKind,
+};
 use crate::ui::theme as tokens;
 
 use super::{build_session, doc_markdown, reveal_heading};
 
 /// The reading chrome of one Document tab.
-#[component]
 pub fn reading_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoElement {
     if store.document(document_id).is_none() {
         return empty_state("文档不存在", "它可能已被删除；关闭此标签页即可").into_element();
@@ -30,22 +34,32 @@ pub fn reading_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
     // effect rebuilds the editor only when the committed body differs
     // from this: a checklist toggle this tab just made updates it first,
     // so the view stays put; another tab's commit does not.
-    let shown_body = RwSignal::new(store.document(document_id).map(|doc| doc.body).unwrap_or_default());
+    let shown_body = signal(
+        store
+            .document(document_id)
+            .map(|doc| doc.body)
+            .unwrap_or_default(),
+    );
     let epoch = signal(0_u64);
-    let history_open = RwSignal::new(false);
+    let history_open = signal(false);
     // The session the dynamic below last built, for outline jumps and
     // checklist toggles.
-    let current: RwSignal<Option<EditorSession>> = RwSignal::new(None);
+    let current: Signal<Option<EditorSession>> = signal(None);
     effect(move || {
         store.bump.get();
-        let committed = store.document(document_id).map(|doc| doc.body).unwrap_or_default();
+        let committed = store
+            .document(document_id)
+            .map(|doc| doc.body)
+            .unwrap_or_default();
         if committed != shown_body.get_untracked() {
             shown_body.set(committed);
             epoch.update(|value| *value += 1);
         }
     });
     effect(move || {
-        let Some(request) = store.outline_request.get() else { return };
+        let Some(request) = store.outline_request.get() else {
+            return;
+        };
         if request.tab_id != tab_id {
             return;
         }
@@ -82,14 +96,16 @@ pub fn reading_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
                                 .py_6()
                                 .child(dynamic(move || {
                                     epoch.get();
-                                    let body =
-                                        store.document(document_id).map(|doc| doc.body).unwrap_or_default();
+                                    // `shown_body` is the committed body
+                                    // this session was built from (the
+                                    // sync effect keeps it current), so
+                                    // the editor rebuilds only when the
+                                    // body actually changes.
+                                    let body = shown_body.get();
                                     let session = build_session(
                                         &body,
-                                        NodeViews::new().with(
-                                            "taskItem",
-                                            Arc::new(ReadingTaskItem { store, document_id }),
-                                        ),
+                                        NodeViews::new()
+                                            .with("taskItem", Arc::new(ReadingTaskItem { store })),
                                     );
                                     current.set(Some(session.clone()));
                                     let change_session = session.clone();
@@ -99,6 +115,7 @@ pub fn reading_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
                                         .editable(false)
                                         .accessibility_label("文档正文")
                                         .placeholder("正文为空")
+                                        .show_only_when_editable(false)
                                         .on_change(move |_: &_| {
                                             // A reading Checklist toggle: persist
                                             // the body in place, keeping the view.
@@ -111,7 +128,12 @@ pub fn reading_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
                                 })),
                         ),
                 )
-                .child(super::history::history_panel(store, document_id, true, history_open)),
+                .child(super::history::history_panel(
+                    store,
+                    document_id,
+                    true,
+                    history_open,
+                )),
         )
         .child(word_count_bar(store, document_id))
         .into_element()
@@ -120,36 +142,42 @@ pub fn reading_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
 /// The slim notice while another tab edits: reading tabs stay synced but
 /// their Checklist Items lock read-only, with the jump to the editor.
 fn lock_banner(store: Store, tab_id: u64) -> impl IntoElement {
-    let locked_elsewhere =
-        move || store.editor_lock.get().is_some_and(|lock| lock.tab_id != tab_id);
-    when(
-        locked_elsewhere,
-        move || {
-            view()
-                .flex_row()
-                .items_center()
-                .gap_3()
-                .px_4()
-                .py_2()
-                .bg(tokens::info_soft())
-                .child(
-                    text("此文档正在其他标签页编辑 · 清单项已锁定")
-                        .text_size(px(12.0))
-                        .text_color(tokens::info()),
-                )
-                .child(
-                    app_button(ButtonKind::Ghost, "跳到编辑标签", move || {
-                        if let Some(lock) = store.editor_lock.get_untracked() {
-                            store.activate_tab_by_id(lock.tab_id);
-                        }
-                    })
-                    .flex_none(),
-                )
-        },
-    )
+    let locked_elsewhere = move || {
+        store
+            .editor_lock
+            .get()
+            .is_some_and(|lock| lock.tab_id != tab_id)
+    };
+    when(locked_elsewhere, move || {
+        view()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .px_4()
+            .py_2()
+            .bg(tokens::info_soft())
+            .child(
+                text("此文档正在其他标签页编辑 · 清单项已锁定")
+                    .text_size(px(12.0))
+                    .text_color(tokens::info()),
+            )
+            .child(
+                app_button(ButtonKind::Ghost, "跳到编辑标签", move || {
+                    if let Some(lock) = store.editor_lock.get_untracked() {
+                        store.activate_tab_by_id(lock.tab_id);
+                    }
+                })
+                .flex_none(),
+            )
+    })
 }
 
-fn reading_header(store: Store, tab_id: u64, document_id: i64, history_open: RwSignal<bool>) -> impl IntoElement {
+fn reading_header(
+    store: Store,
+    tab_id: u64,
+    document_id: i64,
+    history_open: Signal<bool>,
+) -> impl IntoElement {
     let crumb = move || {
         store.bump.get();
         let name = store
@@ -161,7 +189,10 @@ fn reading_header(store: Store, tab_id: u64, document_id: i64, history_open: RwS
     };
     let title = move || {
         store.bump.get();
-        store.document(document_id).map(|doc| doc.title).unwrap_or_default()
+        store
+            .document(document_id)
+            .map(|doc| doc.title)
+            .unwrap_or_default()
     };
     view()
         .flex_row()
@@ -171,7 +202,11 @@ fn reading_header(store: Store, tab_id: u64, document_id: i64, history_open: RwS
         .py_2()
         .border_b_1()
         .border_color(tokens::border_subtle())
-        .child(text(crumb).text_size(px(12.0)).text_color(tokens::fg_muted()))
+        .child(
+            text(crumb)
+                .text_size(px(12.0))
+                .text_color(tokens::fg_muted()),
+        )
         .child(
             text(title)
                 .text_size(px(14.0))
@@ -180,14 +215,20 @@ fn reading_header(store: Store, tab_id: u64, document_id: i64, history_open: RwS
                 .flex_1()
                 .min_w(px(0.0)),
         )
-        .child(panel_icon_button("▣", "在新标签页打开", move || {
-            store.open_document_in_new_tab(document_id);
-        }))
+        .child(panel_icon_button(
+            "▣",
+            "在新标签页打开",
+            move || {
+                store.open_document_in_new_tab(document_id);
+            },
+        ))
         .child(super::history::history_button(history_open))
         .child(
-            app_button_with(ButtonKind::Primary, move || "编辑".into(), move || {
-                request_edit(store, tab_id, document_id)
-            })
+            app_button_with(
+                ButtonKind::Primary,
+                move || "编辑".into(),
+                move || request_edit(store, tab_id, document_id),
+            )
             .flex_none(),
         )
 }
@@ -216,7 +257,11 @@ fn word_count_bar(store: Store, document_id: i64) -> impl IntoElement {
         .py_2()
         .border_t_1()
         .border_color(tokens::border_subtle())
-        .child(text(counter).text_size(px(11.0)).text_color(tokens::fg_muted()))
+        .child(
+            text(counter)
+                .text_size(px(11.0))
+                .text_color(tokens::fg_muted()),
+        )
 }
 
 // ---------------------------------------------------------------------
@@ -228,7 +273,6 @@ fn word_count_bar(store: Store, document_id: i64) -> impl IntoElement {
 
 struct ReadingTaskItem {
     store: Store,
-    document_id: i64,
 }
 
 impl NodeView for ReadingTaskItem {
@@ -237,8 +281,9 @@ impl NodeView for ReadingTaskItem {
         let session = cx.session.clone();
         let pos = cx.get_pos();
         let node = cx.node();
-        let checked =
-            move || node.with(|node| node.attrs().get("checked").and_then(Value::as_bool) == Some(true));
+        let checked = move || {
+            node.with(|node| node.attrs().get("checked").and_then(Value::as_bool) == Some(true))
+        };
         let locked = move || store.editing_locked();
         view()
             .flex_row()
@@ -246,7 +291,7 @@ impl NodeView for ReadingTaskItem {
             .gap_2()
             .child(
                 nsh_base::checkbox()
-                    .accessibility_label("清单项")
+                    .accessibility_label(Some("清单项".into()))
                     .checked(checked)
                     .disabled(locked)
                     .on_change(move |next: &bool| {
@@ -258,7 +303,34 @@ impl NodeView for ReadingTaskItem {
                         let _ = change.set_node_attribute(pos, "checked", Value::Bool(*next));
                         let _ = session.dispatch(change);
                     })
-                    .mt_1(),
+                    .size(px(16.0))
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.0))
+                    .border_2()
+                    .mt_1()
+                    .border_color(move || {
+                        if checked() {
+                            tokens::positive()
+                        } else {
+                            tokens::border_default()
+                        }
+                    })
+                    .bg(move || {
+                        if checked() {
+                            tokens::positive()
+                        } else {
+                            theme().background.opacity(0.0)
+                        }
+                    })
+                    .indicator_style(|s| s.size(px(12.0)).items_center().justify_center())
+                    .indicator(
+                        text(move || if checked() { "✓" } else { "" })
+                            .text_size(px(10.0))
+                            .text_color(move || theme().primary_foreground),
+                    )
+                    .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent())),
             )
             .child(cx.take_content().expect("a task item's content"))
             .into_element()

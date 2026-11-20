@@ -7,6 +7,7 @@ pub mod sidebar;
 pub mod store;
 pub mod tabs;
 pub mod task_detail;
+pub mod task_row;
 pub mod topbar;
 
 use nsh_core::prelude::*;
@@ -73,6 +74,22 @@ fn main_panel(store: Store) -> impl IntoElement {
             .child(untracked(move || match route {
                 Route::Today => crate::today::today_view(store).into_element(),
                 Route::Start => start_view(store).into_element(),
+                Route::Tasks => crate::tasks::tasks_view(store).into_element(),
+                Route::Upcoming => crate::upcoming::upcoming_view(store).into_element(),
+                Route::KnowledgeBases => crate::kb::kb_shelf(store).into_element(),
+                Route::Trash => crate::kb::trash_view(store).into_element(),
+                Route::Book(book_id) => crate::kb::book_shell(store, tab_id, book_id, crate::kb::CatalogFocus::Home)
+                    .into_element(),
+                Route::Document(doc_id) => match store.document(doc_id) {
+                    Some(document) => crate::kb::book_shell(
+                        store,
+                        tab_id,
+                        document.book_id,
+                        crate::kb::CatalogFocus::Document(doc_id),
+                    )
+                    .into_element(),
+                    None => crate::kb::kb_shelf(store).into_element(),
+                },
                 other => unreleased_view(other).into_element(),
             }))
             .key(format!("tab-{tab_id}"))

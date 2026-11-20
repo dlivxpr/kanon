@@ -42,7 +42,48 @@ pub fn top_bar() -> impl IntoElement {
                 .child(text("本地").text_size(px(11.0)).text_color(tokens::shell_muted())),
         )
         .child(tab_strip(store).flex_1().min_w(px(0.0)))
+        .child(inbox_badge(store))
         .child(icon_button("▤", "切换上下文面板", move || store.toggle_panel()))
+}
+
+/// The top-bar Inbox badge (docs/ui-design.md §4.6): it counts strict
+/// Inbox tasks only and jumps to the Tasks view, whose 收件箱 group is
+/// the Inbox.
+fn inbox_badge(store: Store) -> impl IntoElement {
+    let count = move || {
+        store.bump.get();
+        store.inbox_count()
+    };
+    nsh_base::button()
+        .on_press(move || store.open_or_focus(super::tabs::Route::Tasks))
+        .accessibility_label(move || Some(format!("收件箱 {} 项任务", count()).into()))
+        .test_id("inbox-badge")
+        .h(px(28.0))
+        .px_2()
+        .items_center()
+        .gap_1()
+        .rounded(move || theme().radius)
+        .bg(move || theme().background.opacity(0.0))
+        .text_color(move || if count() > 0 { tokens::shell_fg() } else { tokens::shell_muted() })
+        .hover(|s| s.bg(tokens::shell_surface_active()).text_color(tokens::shell_fg()))
+        .active(|s| s.opacity(0.7))
+        .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
+        .transition_colors()
+        .duration(tokens::ms(tokens::MOTION_INSTANT_MS))
+        .child(text("收件箱").text_size(px(12.0)))
+        .child(
+            view()
+                .min_w(px(18.0))
+                .h(px(18.0))
+                .px_1()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(move || if count() > 0 { tokens::accent() } else { tokens::shell_surface_active() })
+                .child(text(move || count().to_string()).text_size(px(11.0)).text_color(move || {
+                    if count() > 0 { theme().primary_foreground } else { tokens::shell_muted() }
+                })),
+        )
 }
 
 /// The workbench tab strip: one chip per tab plus the new-tab button.
@@ -81,7 +122,7 @@ fn tab_chip(store: Store, tab: ReadSignal<Tab>, active_id: Memo<u64>) -> impl In
     let id = move || tab.with(|tab| tab.id);
     let is_active = move || id() == active_id.get();
     let pinned = move || tab.with(|tab| tab.pinned);
-    let title = move || tab.with(|tab| tab.current.title());
+    let title = move || store.route_title(&tab.with(|tab| tab.current.clone()));
     let glyph = move || tab.with(|tab| tab.current.glyph());
     view()
         .flex_row()

@@ -5,9 +5,13 @@
 //! styled control layer in `ui/`, and the workbench shell in `shell/`.
 
 pub mod domain;
+mod document;
+mod kb;
 mod shell;
+mod tasks;
 mod today;
 mod ui;
+mod upcoming;
 
 use std::path::Path;
 use std::sync::Arc;

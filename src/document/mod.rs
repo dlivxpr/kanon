@@ -16,7 +16,7 @@ use nsh_base::rich_editor::{
         kit::{starter_kit, table_kit},
         suggestion::{SuggestionOptions, suggestion},
     },
-    formats::{DocFormat, markdown::MarkdownFormat},
+    formats::{DocFormat, MarkdownFormat},
     model::{Fragment, Node},
     state::{EditorState, EditorStateConfig},
     view::{EditorSession, NodeViews},
@@ -36,11 +36,17 @@ pub fn document_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEl
             .is_some_and(|lock| lock.tab_id == tab_id && lock.document_id == document_id)
     };
     dynamic(move || {
-        if is_editor() {
-            editing::editing_view(store, tab_id, document_id).into_element()
-        } else {
-            reading::reading_view(store, tab_id, document_id).into_element()
-        }
+        // Only the lock selects the chrome; building the content reads
+        // workspace signals (through store.document's bump) and must not
+        // re-run this region.
+        let editing = is_editor();
+        untracked(move || {
+            if editing {
+                editing::editing_view(store, tab_id, document_id).into_element()
+            } else {
+                reading::reading_view(store, tab_id, document_id).into_element()
+            }
+        })
     })
 }
 
@@ -48,14 +54,16 @@ pub fn document_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEl
 /// Checklist Items, marks, history, Markdown shortcuts) plus tables and
 /// the `/` block-insertion suggestion.
 fn build_extensions() -> ExtensionManager {
-    let mut slash = SuggestionOptions::default();
-    slash.key = SLASH_KEY.into();
-    slash.trigger.char = "/".into();
-    slash.trigger.allowed_prefixes = None;
     ExtensionManager::with_core(vec![
         starter_kit(),
         table_kit(),
-        Extension::new("kanonSlash").with_priority(1000).add_plugins(|_| vec![suggestion(slash)]),
+        Extension::new("kanonSlash").with_priority(1000).add_plugins(|_| {
+            let mut slash = SuggestionOptions::default();
+            slash.key = SLASH_KEY.into();
+            slash.trigger.char = "/".into();
+            slash.trigger.allowed_prefixes = None;
+            vec![suggestion(slash)]
+        }),
     ])
     .expect("the kanon editor extensions build")
 }
@@ -69,7 +77,7 @@ pub(crate) fn build_session(body: &str, node_views: NodeViews) -> EditorSession 
     let format = MarkdownFormat::default();
     let doc = format
         .parse(&schema, body)
-        .unwrap_or_else(|_| schema.top_node_type().create(None, Fragment::empty(), &[]).expect("empty doc"));
+        .unwrap_or_else(|_| schema.top_node_type().create(None, Fragment::empty(), Vec::new()).expect("empty doc"));
     let state =
         EditorState::create(EditorStateConfig::new(schema).doc(doc).plugins(manager.plugins()))
             .expect("the editor state builds");
@@ -78,7 +86,7 @@ pub(crate) fn build_session(body: &str, node_views: NodeViews) -> EditorSession 
 
 /// The markdown a session's document serializes to (the auto-save payload).
 pub(crate) fn doc_markdown(session: &EditorSession) -> String {
-    MarkdownFormat::default().serialize_fragment(&session.state().doc().content())
+    MarkdownFormat::default().serialize_fragment(session.state().doc().content())
 }
 
 /// Where the `ordinal`-th heading starts in `doc` (ProseMirror position),
@@ -87,7 +95,7 @@ pub(crate) fn doc_markdown(session: &EditorSession) -> String {
 pub(crate) fn heading_position(doc: &Node, ordinal: usize) -> Option<usize> {
     let mut seen = 0_usize;
     let mut pos = 0_usize;
-    for child in doc.children() {
+    for child in doc.content().iter() {
         if child.ty().name() == "heading" {
             if seen == ordinal {
                 return Some(pos);
@@ -104,7 +112,7 @@ pub(crate) fn heading_position(doc: &Node, ordinal: usize) -> Option<usize> {
 pub(crate) fn reveal_heading(session: &EditorSession, ordinal: usize) {
     use nsh_base::rich_editor::commands::tiptap;
     let state = session.state();
-    let Some(pos) = heading_position(&state.doc(), ordinal) else { return };
+    let Some(pos) = heading_position(state.doc(), ordinal) else { return };
     let at = (pos + 2).min(state.doc().node_size().saturating_sub(2));
     session.run(&tiptap::set_text_selection(at, at));
     session.focus();
@@ -118,13 +126,14 @@ mod tests {
     #[test]
     fn heading_positions_follow_document_order() {
         let session = build_session("# 一\n\n段落\n\n## 二\n\n### 三\n", NodeViews::new());
-        let doc = session.state().doc();
-        let sizes = doc.children().map(|child| child.node_size()).collect::<Vec<_>>();
+        let state = session.state();
+        let doc = state.doc();
+        let sizes = doc.content().iter().map(|child| child.node_size()).collect::<Vec<_>>();
         assert_eq!(sizes.len(), 4);
-        assert_eq!(heading_position(&doc, 0), Some(0));
-        assert_eq!(heading_position(&doc, 1), Some(sizes[0] + sizes[1]));
-        assert_eq!(heading_position(&doc, 2), Some(sizes[0] + sizes[1] + sizes[2]));
-        assert_eq!(heading_position(&doc, 3), None);
+        assert_eq!(heading_position(doc, 0), Some(0));
+        assert_eq!(heading_position(doc, 1), Some(sizes[0] + sizes[1]));
+        assert_eq!(heading_position(doc, 2), Some(sizes[0] + sizes[1] + sizes[2]));
+        assert_eq!(heading_position(doc, 3), None);
     }
 
     #[test]
@@ -136,8 +145,8 @@ mod tests {
         assert!(markdown.contains("- [ ] 清单项") && markdown.contains("- [x] 已完成"), "checklist states serialize");
         assert!(markdown.contains("# not a heading"), "code fences keep their text");
         fn has_table(node: &Node) -> bool {
-            node.ty().name() == "table" || node.children().any(|child| has_table(&child))
+            node.ty().name() == "table" || node.content().iter().any(has_table)
         }
-        assert!(has_table(&session.state().doc()), "tables parse into table nodes");
+        assert!(has_table(session.state().doc()), "tables parse into table nodes");
     }
 }

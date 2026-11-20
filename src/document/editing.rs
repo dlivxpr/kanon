@@ -4,11 +4,10 @@
 //! Document; finishing (or closing the tab) records the finish-to-read
 //! transition as a history snapshot and frees the lock.
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nsh_base::rich_editor::{
-    commands::{BoxCommand, chain, command, toggle_mark, tiptap},
+    commands::{BoxCommand, chain, command, tiptap, toggle_mark},
     extensions::{
         history::{redo, undo},
         suggestion::{replace_suggestion, suggestion_state},
@@ -23,7 +22,9 @@ use serde_json::{Value, json};
 
 use crate::domain::{WorkspaceError, should_snapshot};
 use crate::shell::Store;
-use crate::ui::controls::{app_button, app_button_with, empty_state, panel_icon_button, ButtonKind};
+use crate::ui::controls::{
+    ButtonKind, app_button, app_button_with, empty_state, panel_icon_button,
+};
 use crate::ui::theme as tokens;
 
 use super::{SLASH_KEY, build_session, doc_markdown};
@@ -39,30 +40,30 @@ enum SaveState {
 }
 
 /// The editing chrome of one Document tab (its holder owns the lock).
-#[component]
 pub fn editing_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoElement {
     let Some(document) = store.document(document_id) else {
         return empty_state("文档不存在", "它可能已被删除；关闭此标签页即可").into_element();
     };
-    // Leaving the view — 完成, close, or navigate away — ends the edit
+    // Leaving the view — 完成 or the tab navigating away — ends the edit
     // session: the finish-to-read transition snapshots, then frees the
-    // single-editor lock.
-    cleanup(move || store.release_editor(tab_id, true));
+    // single-editor lock. Switching to another tab unmounts too, but the
+    // lock belongs to the tab and must survive (route-aware release).
+    cleanup(move || store.release_editor_if_route_left(tab_id, true));
 
     let session = build_session(&document.body, NodeViews::new());
-    let draft_title = RwSignal::new(document.title.clone());
-    let draft_body = RwSignal::new(document.body.clone());
-    let base_version = RwSignal::new(document.version);
-    let save_state = RwSignal::new(SaveState::Saved);
-    let composing = RwSignal::new(false);
-    let history_open = RwSignal::new(false);
+    let draft_title = signal(document.title.clone());
+    let draft_body = signal(document.body.clone());
+    let base_version = signal(document.version);
+    let save_state = signal(SaveState::Saved);
+    let composing = signal(false);
+    let history_open = signal(false);
     // Debounce bookkeeping: the newest scheduled save wins.
-    let save_epoch = RwSignal::new(0_u64);
+    let save_epoch = signal(0_u64);
     // History policy bookkeeping (milliseconds since this view started).
     let started = Instant::now();
     let now_ms = move || started.elapsed().as_millis() as u64;
-    let last_edit_at = RwSignal::new(now_ms());
-    let last_snapshot_at = RwSignal::new(None::<u64>);
+    let last_edit_at = signal(now_ms());
+    let last_snapshot_at = signal(None::<u64>);
     let maybe_snapshot = move || {
         if should_snapshot(
             last_edit_at.get_untracked(),
@@ -75,7 +76,7 @@ pub fn editing_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
             last_snapshot_at.set(Some(now_ms()));
         }
     };
-    let _interval = set_interval(Duration::from_secs(5), move || maybe_snapshot());
+    let _interval = set_interval(Duration::from_secs(5), maybe_snapshot);
 
     let try_save = move || {
         let result = store.save_document_body(
@@ -98,12 +99,10 @@ pub fn editing_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
         }
     };
     let schedule_save = {
-        let try_save = try_save.clone();
         move || {
             save_state.set(SaveState::Dirty);
             save_epoch.update(|epoch| *epoch += 1);
             let epoch = save_epoch.get_untracked();
-            let try_save = try_save.clone();
             set_timeout(Duration::from_millis(600), move || {
                 if save_epoch.get_untracked() != epoch {
                     return;
@@ -113,14 +112,12 @@ pub fn editing_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
         }
     };
     let mark_edited = {
-        let schedule_save = schedule_save.clone();
         move || {
             last_edit_at.set(now_ms());
             schedule_save();
         }
     };
     let on_title = {
-        let mark_edited = mark_edited.clone();
         move |text: &str| {
             draft_title.set(text.to_owned());
             mark_edited();
@@ -142,7 +139,6 @@ pub fn editing_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
     // commit it (an explicit user decision to overwrite the concurrent
     // change).
     let retry = {
-        let try_save = try_save.clone();
         move || {
             if let Some(document) = store.document(document_id) {
                 base_version.set(document.version);
@@ -164,7 +160,7 @@ pub fn editing_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
         composing.set(*composing_now);
     };
     // Re-read suggestion state on every change/selection event.
-    let editor_events = RwSignal::new(0_u64);
+    let editor_events = signal(0_u64);
     let on_activity = move |_: &_| {
         editor_events.update(|events| *events += 1);
     };
@@ -174,8 +170,6 @@ pub fn editing_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
         .min_h(px(0.0))
         .flex_col()
         .child(editing_header(
-            store,
-            document_id,
             draft_title,
             save_state,
             history_open,
@@ -219,18 +213,20 @@ pub fn editing_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
                                 ),
                         ),
                 )
-                .child(super::history::history_panel(store, document_id, false, history_open)),
+                .child(super::history::history_panel(
+                    store,
+                    document_id,
+                    false,
+                    history_open,
+                )),
         )
         .into_element()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn editing_header(
-    store: Store,
-    document_id: i64,
-    draft_title: RwSignal<String>,
-    save_state: RwSignal<SaveState>,
-    history_open: RwSignal<bool>,
+    draft_title: Signal<String>,
+    save_state: Signal<SaveState>,
+    history_open: Signal<bool>,
     finish: impl Fn() + Copy + 'static,
     retry: impl Fn() + Copy + 'static,
     on_title: impl Fn(&str) + Copy + 'static,
@@ -263,13 +259,14 @@ fn editing_header(
         .child(app_button_with(ButtonKind::Positive, move || "完成".into(), finish).flex_none())
 }
 
-fn save_indicator(save_state: RwSignal<SaveState>, retry: impl Fn() + Copy + 'static) -> impl IntoElement {
-    let label = move || {
-        match save_state.get() {
-            SaveState::Dirty => "保存中…".to_owned(),
-            SaveState::Saved => "已自动保存".to_owned(),
-            SaveState::Failed => "保存失败 · 草稿已保留".to_owned(),
-        }
+fn save_indicator(
+    save_state: Signal<SaveState>,
+    retry: impl Fn() + Copy + 'static,
+) -> impl IntoElement {
+    let label = move || match save_state.get() {
+        SaveState::Dirty => "保存中…".to_owned(),
+        SaveState::Saved => "已自动保存".to_owned(),
+        SaveState::Failed => "保存失败 · 草稿已保留".to_owned(),
     };
     view()
         .flex_row()
@@ -306,10 +303,15 @@ fn toolbar(session: EditorSession) -> impl IntoElement {
     let task_item = schema.node_type("taskItem").unwrap();
     let blockquote = schema.node_type("blockquote").unwrap();
     let code_block = schema.node_type("codeBlock").unwrap();
-    let level = |n: u64| [("level".to_owned(), json!(n))].into_iter().collect::<nsh_base::rich_editor::model::Attrs>();
+    let level = |n: u64| {
+        [("level".to_owned(), json!(n))]
+            .into_iter()
+            .collect::<nsh_base::rich_editor::model::Attrs>()
+    };
     let no_attrs = nsh_base::rich_editor::model::Attrs::new();
-    let language_none =
-        [("language".to_owned(), Value::Null)].into_iter().collect::<nsh_base::rich_editor::model::Attrs>();
+    let language_none = [("language".to_owned(), Value::Null)]
+        .into_iter()
+        .collect::<nsh_base::rich_editor::model::Attrs>();
     let bold = schema.mark_type("bold").unwrap();
     let italic = schema.mark_type("italic").unwrap();
     let underline = schema.mark_type("underline").unwrap();
@@ -320,22 +322,49 @@ fn toolbar(session: EditorSession) -> impl IntoElement {
     let tools: Vec<(&'static str, BoxCommand)> = vec![
         ("撤销", command(undo)),
         ("重做", command(redo)),
-        ("正文", tiptap::set_node(paragraph.clone(), no_attrs.clone())),
-        ("一级标题", tiptap::toggle_node(heading.clone(), paragraph.clone(), level(1))),
-        ("二级标题", tiptap::toggle_node(heading.clone(), paragraph.clone(), level(2))),
-        ("三级标题", tiptap::toggle_node(heading.clone(), paragraph.clone(), level(3))),
+        (
+            "正文",
+            tiptap::set_node(paragraph.clone(), no_attrs.clone()),
+        ),
+        (
+            "一级标题",
+            tiptap::toggle_node(heading.clone(), paragraph.clone(), level(1)),
+        ),
+        (
+            "二级标题",
+            tiptap::toggle_node(heading.clone(), paragraph.clone(), level(2)),
+        ),
+        (
+            "三级标题",
+            tiptap::toggle_node(heading.clone(), paragraph.clone(), level(3)),
+        ),
         ("加粗", toggle_mark(bold, None, true)),
         ("斜体", toggle_mark(italic, None, true)),
         ("下划线", toggle_mark(underline, None, true)),
         ("删除线", toggle_mark(strike, None, true)),
         ("行内代码", toggle_mark(code, None, true)),
-        ("无序列表", tiptap::toggle_list(bullet_list, list_item.clone(), false, no_attrs.clone())),
-        ("有序列表", tiptap::toggle_list(ordered_list, list_item, false, no_attrs.clone())),
-        ("清单", tiptap::toggle_list(task_list, task_item, false, no_attrs)),
-        ("引用", tiptap::toggle_wrap(blockquote, no_attrs)),
-        ("代码块", tiptap::toggle_node(code_block, paragraph, language_none)),
+        (
+            "无序列表",
+            tiptap::toggle_list(bullet_list, list_item.clone(), false, no_attrs.clone()),
+        ),
+        (
+            "有序列表",
+            tiptap::toggle_list(ordered_list, list_item, false, no_attrs.clone()),
+        ),
+        (
+            "清单",
+            tiptap::toggle_list(task_list, task_item, false, no_attrs.clone()),
+        ),
+        ("引用", tiptap::toggle_wrap(blockquote, no_attrs.clone())),
+        (
+            "代码块",
+            tiptap::toggle_node(code_block, paragraph, language_none),
+        ),
         ("表格", insert_table(3, 2, true)),
-        ("清除格式", chain(vec![tiptap::unset_all_marks(), tiptap::clear_nodes()])),
+        (
+            "清除格式",
+            chain(vec![tiptap::unset_all_marks(), tiptap::clear_nodes()]),
+        ),
     ];
 
     view()
@@ -381,6 +410,7 @@ impl SlashItem {
             Self::Heading(1) => "一级标题",
             Self::Heading(2) => "二级标题",
             Self::Heading(3) => "三级标题",
+            Self::Heading(_) => "标题",
             Self::BulletList => "无序列表",
             Self::OrderedList => "有序列表",
             Self::TaskList => "清单",
@@ -442,26 +472,31 @@ const SLASH_ITEMS: &[SlashItem] = &[
 
 fn slash_panel(
     session: EditorSession,
-    editor_events: RwSignal<u64>,
-    composing: RwSignal<bool>,
+    editor_events: Signal<u64>,
+    composing: Signal<bool>,
 ) -> impl IntoElement {
+    let items_session = session.clone();
     let items = move || {
         editor_events.get();
         if composing.get() {
             return Vec::new();
         }
-        let state: EditorState = session.state();
-        let Some(suggestion) = suggestion_state(&state, SLASH_KEY) else { return Vec::new() };
+        let state: EditorState = items_session.state();
+        let Some(suggestion) = suggestion_state(&state, SLASH_KEY) else {
+            return Vec::new();
+        };
         if !suggestion.active {
             return Vec::new();
         }
-        let query = suggestion.query.unwrap_or_default();
+        let query = suggestion.query.clone().unwrap_or_default();
         SLASH_ITEMS
             .iter()
             .copied()
             .filter(|item| query.is_empty() || item.label().contains(query.as_str()))
             .collect::<Vec<_>>()
     };
+    let items_list = items.clone();
+    let session_list = session.clone();
     when(
         move || !items().is_empty(),
         move || {
@@ -476,16 +511,27 @@ fn slash_panel(
                 .border_1()
                 .border_color(tokens::border_subtle())
                 .p_2()
-                .child(each(items, |item: &SlashItem| item.label(), move |item, _index| {
-                    let pick = session.clone();
-                    app_button(ButtonKind::Soft, item.get().label(), move || {
-                        let state = pick.state();
-                        let Ok(node) = state.schema().node_from_json(&item.get().json()) else { return };
-                        pick.run(&replace_suggestion(SLASH_KEY, Fragment::from(node)));
-                        pick.focus();
-                    })
-                    .flex_none()
-                }))
+                .child({
+                    let list = items_list.clone();
+                    let pick_source = session_list.clone();
+                    each(
+                        list,
+                        |item: &SlashItem| item.label(),
+                        move |item, _index| {
+                            let pick = pick_source.clone();
+                            app_button(ButtonKind::Soft, item.get().label(), move || {
+                                let state = pick.state();
+                                let Ok(node) = state.schema().node_from_json(&item.get().json())
+                                else {
+                                    return;
+                                };
+                                pick.run(&replace_suggestion(SLASH_KEY, Fragment::from(node)));
+                                pick.focus();
+                            })
+                            .flex_none()
+                        },
+                    )
+                })
         },
     )
 }

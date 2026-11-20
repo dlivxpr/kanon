@@ -6,8 +6,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use nsh_app_kanon::domain::{
-    FixedClock, LocalDate, LocalDateTime, LocalTime, NewTask, Priority, TaskPatch, TaskStatus,
-    Workspace, count_words,
+    FixedClock, KnowledgeBasePatch, LocalDate, LocalDateTime, LocalTime, NewTask, Priority,
+    ProjectFilter, TaskFilter, TaskPatch, TaskSort, TaskStatus, Workspace, WorkspaceError,
+    count_words,
 };
 
 fn at(text: &str) -> Arc<FixedClock> {
@@ -329,6 +330,213 @@ fn inbox_predicate_is_strict_and_groups_are_mutually_exclusive() {
 }
 
 #[test]
+fn inbox_triage_removes_task_and_updates_the_inbox_count() {
+    let clock = at("2026-11-20 09:00");
+    let mut ws = Workspace::open_in_memory_with_clock(clock).expect("workspace");
+    let by_project = ws.create_task(&NewTask { title: "分项目".to_owned(), ..Default::default() }).expect("a").task.id;
+    let by_schedule = ws.create_task(&NewTask { title: "排期".to_owned(), ..Default::default() }).expect("b").task.id;
+    let by_due = ws.create_task(&NewTask { title: "截止".to_owned(), ..Default::default() }).expect("c").task.id;
+    assert_eq!(ws.inbox_count().expect("count"), 3);
+    assert_eq!(ws.inbox_tasks().expect("inbox").len(), 3);
+
+    let project = ws.create_project("项目", "#547093", "📌", None, None).expect("project");
+    ws.update_task(by_project, &TaskPatch { project_id: Some(Some(project.id)), ..Default::default() }).unwrap();
+    assert_eq!(ws.inbox_count().expect("count"), 2, "assigning a Project leaves the Inbox at once");
+    assert!(ws.inbox_tasks().expect("inbox").iter().all(|a| a.task.id != by_project));
+
+    ws.update_task(by_schedule, &TaskPatch { scheduled_date: Some(Some(date("2026-11-20"))), ..Default::default() }).unwrap();
+    assert_eq!(ws.inbox_count().expect("count"), 1, "assigning a Scheduled Date leaves the Inbox at once");
+
+    ws.update_task(by_due, &TaskPatch { due_date: Some(Some(date("2026-11-25"))), ..Default::default() }).unwrap();
+    assert_eq!(ws.inbox_count().expect("count"), 0, "assigning a Due Date leaves the Inbox at once");
+    assert!(ws.inbox_tasks().expect("inbox").is_empty());
+
+    // Completion and cancellation also drop a task from the strict Inbox.
+    let finishing = ws.create_task(&NewTask { title: "将完成".to_owned(), ..Default::default() }).expect("d").task.id;
+    assert_eq!(ws.inbox_count().expect("count"), 1);
+    ws.update_task(finishing, &TaskPatch { status: Some(TaskStatus::Done), ..Default::default() }).unwrap();
+    assert_eq!(ws.inbox_count().expect("count"), 0, "done tasks are not Inbox-shaped");
+}
+
+#[test]
+fn carryover_preserves_due_across_local_clock_transitions() {
+    let clock = at("2026-11-20 08:00");
+    let mut ws = Workspace::open_in_memory_with_clock(clock.clone()).expect("workspace");
+    let carry = ws
+        .create_task(&NewTask {
+            title: "连续结转".to_owned(),
+            scheduled_date: Some(date("2026-11-19")),
+            scheduled_time: Some(time("07:30")),
+            due_date: Some(date("2026-11-25")),
+            due_time: Some(time("12:00")),
+            ..Default::default()
+        })
+        .expect("carry")
+        .task
+        .id;
+    let today = ws
+        .create_task(&NewTask { title: "当天".to_owned(), scheduled_date: Some(date("2026-11-20")), ..Default::default() })
+        .expect("today")
+        .task
+        .id;
+
+    assert_eq!(ws.carryover().expect("first carryover"), 1);
+    let task = ws.task(carry).expect("load").expect("present").task;
+    assert_eq!(task.scheduled_date, Some(date("2026-11-20")));
+    assert_eq!(task.scheduled_time, None, "stale scheduled time-of-day cleared");
+    assert_eq!(task.due_date, Some(date("2026-11-25")), "due date untouched");
+    assert_eq!(task.due_time, Some(time("12:00")), "due time untouched");
+
+    // Midnight passes: everything scheduled before the new day moves again,
+    // and the Due Date/Time still stay exactly as promised.
+    clock.advance_to(LocalDateTime::parse("2026-11-21 00:00").unwrap());
+    assert_eq!(ws.carryover_count().expect("count"), 2);
+    assert_eq!(ws.carryover().expect("second carryover"), 2);
+    let task = ws.task(carry).expect("load").expect("present").task;
+    assert_eq!(task.scheduled_date, Some(date("2026-11-21")));
+    assert_eq!(task.scheduled_time, None, "scheduled time-of-day stays cleared");
+    assert_eq!(task.due_date, Some(date("2026-11-25")), "due date survives the clock transition");
+    assert_eq!(task.due_time, Some(time("12:00")), "due time survives the clock transition");
+    assert_eq!(ws.task(today).expect("load").expect("present").task.scheduled_date, Some(date("2026-11-21")));
+}
+
+#[test]
+fn upcoming_lists_future_scheduled_tasks_in_date_order() {
+    let clock = at("2026-11-20 09:00");
+    let mut ws = Workspace::open_in_memory_with_clock(clock).expect("workspace");
+    let base = |title: &str, scheduled: &str| NewTask {
+        title: title.to_owned(),
+        scheduled_date: Some(date(scheduled)),
+        ..Default::default()
+    };
+    ws.create_task(&base("过去", "2026-11-19")).expect("past");
+    ws.create_task(&base("今天", "2026-11-20")).expect("today");
+    let third = ws.create_task(&base("第三天", "2026-11-23")).expect("d3").task.id;
+    let early = ws
+        .create_task(&NewTask { title: "当天早".to_owned(), scheduled_date: Some(date("2026-11-21")), scheduled_time: Some(time("09:00")), ..Default::default() })
+        .expect("early")
+        .task
+        .id;
+    let late = ws
+        .create_task(&NewTask { title: "当天晚".to_owned(), scheduled_date: Some(date("2026-11-21")), scheduled_time: Some(time("18:00")), ..Default::default() })
+        .expect("late")
+        .task
+        .id;
+    let cancelled = ws.create_task(&base("已取消", "2026-11-22")).expect("cancelled").task.id;
+    ws.update_task(cancelled, &TaskPatch { status: Some(TaskStatus::Cancelled), ..Default::default() }).unwrap();
+    let trashed = ws.create_task(&base("已删", "2026-11-22")).expect("trashed").task.id;
+    ws.move_task_to_trash(trashed).unwrap();
+
+    let titles = ws
+        .upcoming_tasks()
+        .expect("upcoming")
+        .into_iter()
+        .map(|a| a.task.title)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        titles,
+        vec!["当天早".to_owned(), "当天晚".to_owned(), "第三天".to_owned()],
+        "future Scheduled-Date tasks only, ordered by date then time-of-day"
+    );
+    let ids = ws.upcoming_tasks().expect("upcoming").into_iter().map(|a| a.task.id).collect::<Vec<_>>();
+    assert_eq!(ids, vec![early, late, third]);
+}
+
+#[test]
+fn task_filter_and_sort_narrow_and_reorder_groups() {
+    let clock = at("2026-11-20 09:00");
+    let mut ws = Workspace::open_in_memory_with_clock(clock).expect("workspace");
+    // Creation order is deliberately the reverse of the priority order.
+    let low = ws
+        .create_task(&NewTask { title: "低优".to_owned(), priority: Some(Priority::Low), ..Default::default() })
+        .expect("low")
+        .task
+        .id;
+    let high = ws
+        .create_task(&NewTask { title: "高优".to_owned(), priority: Some(Priority::High), ..Default::default() })
+        .expect("high")
+        .task
+        .id;
+    // Due-only tasks (no Project, no Scheduled Date) land in 未排期; their
+    // creation order is the reverse of their Due Date order.
+    let late_due = ws
+        .create_task(&NewTask {
+            title: "晚截止".to_owned(),
+            priority: Some(Priority::High),
+            due_date: Some(date("2026-11-28")),
+            ..Default::default()
+        })
+        .expect("late due")
+        .task
+        .id;
+    let early_due = ws
+        .create_task(&NewTask {
+            title: "早截止".to_owned(),
+            priority: Some(Priority::Low),
+            due_date: Some(date("2026-11-22")),
+            ..Default::default()
+        })
+        .expect("early due")
+        .task
+        .id;
+    let project = ws.create_project("项目", "#547093", "📌", None, None).expect("project");
+    let bound = ws
+        .create_task(&NewTask { title: "项内".to_owned(), project_id: Some(project.id), ..Default::default() })
+        .expect("bound")
+        .task
+        .id;
+    let finished = ws.create_task(&NewTask { title: "做完".to_owned(), ..Default::default() }).expect("done").task.id;
+    ws.update_task(finished, &TaskPatch { status: Some(TaskStatus::Done), ..Default::default() }).unwrap();
+
+    let groups = ws.task_groups().expect("groups");
+    let titles = |list: &[nsh_app_kanon::domain::TaskAggregate]| {
+        list.iter().map(|a| a.task.title.clone()).collect::<Vec<_>>()
+    };
+
+    // Manual order is the creation order.
+    assert_eq!(titles(&groups.inbox), vec!["低优".to_owned(), "高优".to_owned()]);
+
+    // Priority sort flips the inbox; Due Date sort is independent of it.
+    assert_eq!(titles(&groups.sorted(TaskSort::Priority).inbox), vec!["高优".to_owned(), "低优".to_owned()]);
+    assert_eq!(
+        titles(&groups.sorted(TaskSort::DueDate).unscheduled),
+        vec!["早截止".to_owned(), "晚截止".to_owned(), "项内".to_owned()],
+        "due-date order, rows without a Due Date last"
+    );
+    assert_eq!(
+        titles(&groups.sorted(TaskSort::Priority).unscheduled),
+        vec!["晚截止".to_owned(), "早截止".to_owned(), "项内".to_owned()],
+        "priority order, rows without a priority last"
+    );
+
+    // Filters narrow every group; mutual exclusion is preserved.
+    let only_done = groups.filtered(&TaskFilter { status: Some(TaskStatus::Done), ..Default::default() });
+    assert_eq!(only_done.total(), 1);
+    assert_eq!(titles(&only_done.done), vec!["做完".to_owned()]);
+
+    let only_high = groups.filtered(&TaskFilter { priority: Some(Priority::High), ..Default::default() });
+    assert_eq!(titles(&only_high.inbox), vec!["高优".to_owned()]);
+
+    let in_project = groups.filtered(&TaskFilter {
+        project: ProjectFilter::Project(project.id),
+        ..Default::default()
+    });
+    assert_eq!(in_project.total(), 1);
+    assert_eq!(titles(&in_project.unscheduled), vec!["项内".to_owned()]);
+
+    let unassigned = groups.filtered(&TaskFilter { project: ProjectFilter::Unassigned, ..Default::default() });
+    assert_eq!(unassigned.total(), 5, "everything except the project-bound task");
+    assert!(!titles(&unassigned.unscheduled).is_empty(), "due-only rows have no Project either");
+
+    // Filter and sort compose.
+    let sorted = groups
+        .filtered(&TaskFilter { project: ProjectFilter::Unassigned, ..Default::default() })
+        .sorted(TaskSort::Priority);
+    assert_eq!(titles(&sorted.inbox), vec!["高优".to_owned(), "低优".to_owned()]);
+    let _ = (low, high, late_due, early_due, bound);
+}
+
+#[test]
 fn task_patch_sets_and_clears_independent_dates() {
     let (mut ws, _path, _clock) = workspace_at("patch", "2026-11-20 09:00");
     let id = ws.create_task(&NewTask { title: "日程".to_owned(), ..Default::default() }).expect("create").task.id;
@@ -511,4 +719,235 @@ fn version2_migration_adds_document_version_to_existing_databases() {
     assert_eq!(saved.version, 1);
     assert_eq!(ws.document(1).expect("reload").expect("present").body, "新内容");
     let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn knowledge_base_shelf_favorites_first_and_edits_fields() {
+    let (mut ws, _path, _clock) = workspace_at("kb-shelf", "2026-11-20 09:00");
+    let first = ws.create_knowledge_base("产品手册").expect("create first");
+    let second = ws.create_knowledge_base("研究笔记").expect("create second");
+
+    // Default shelf order follows creation; unfavorite state is off.
+    let names = |ws: &Workspace| {
+        ws.knowledge_bases().expect("list").into_iter().map(|kb| kb.name).collect::<Vec<_>>()
+    };
+    assert_eq!(names(&ws), vec!["产品手册".to_owned(), "研究笔记".to_owned()]);
+
+    ws.set_knowledge_base_favorite(second.id, true).expect("favorite");
+    assert_eq!(names(&ws), vec!["研究笔记".to_owned(), "产品手册".to_owned()], "favorites lead the shelf");
+
+    let edited = ws
+        .update_knowledge_base(
+            first.id,
+            &KnowledgeBasePatch {
+                name: Some("产品手册 v2".to_owned()),
+                description: Some("对外发布的版本".to_owned()),
+                icon: Some("📗".to_owned()),
+                color: Some("#00b96b".to_owned()),
+            },
+        )
+        .expect("patch");
+    assert_eq!(edited.name, "产品手册 v2");
+    assert_eq!(edited.description, "对外发布的版本");
+    assert_eq!(edited.icon, "📗");
+    assert_eq!(edited.color, "#00b96b");
+}
+
+#[test]
+fn catalog_creates_at_the_top_of_its_level_and_nests_children() {
+    let (mut ws, _path, _clock) = workspace_at("kb-top-insert", "2026-11-20 09:00");
+    let book = ws.create_knowledge_base("目录规则").expect("book");
+
+    let a = ws.create_document(book.id, None, "甲").expect("doc 甲");
+    let b = ws.create_document(book.id, None, "乙").expect("doc 乙");
+    let g = ws.create_catalog_node(book.id, None, "分组一").expect("group");
+    let titles = |ws: &Workspace| {
+        ws.catalog_outline(book.id)
+            .expect("outline")
+            .into_iter()
+            .map(|entry| (entry.node.title, entry.depth))
+            .collect::<Vec<_>>()
+    };
+    // Every creation lands at the TOP of its level: newest first.
+    assert_eq!(
+        titles(&ws),
+        vec![
+            ("分组一".to_owned(), 0),
+            ("乙".to_owned(), 0),
+            ("甲".to_owned(), 0),
+        ]
+    );
+
+    // Child creation nests under the selected node, also at the top.
+    ws.create_document(book.id, Some(g.id), "子一").expect("child 1");
+    ws.create_document(book.id, Some(g.id), "子二").expect("child 2");
+    let _ = (a, b);
+    assert_eq!(
+        titles(&ws),
+        vec![
+            ("分组一".to_owned(), 0),
+            ("子二".to_owned(), 1),
+            ("子一".to_owned(), 1),
+            ("乙".to_owned(), 0),
+            ("甲".to_owned(), 0),
+        ],
+        "children nest under their parent at the top of its level"
+    );
+}
+
+#[test]
+fn catalog_move_reparents_reorders_and_rejects_cycles() {
+    let (mut ws, _path, _clock) = workspace_at("kb-move", "2026-11-20 09:00");
+    let book = ws.create_knowledge_base("移动规则").expect("book");
+    let group = ws.create_catalog_node(book.id, None, "分组").expect("group");
+    let a_doc = ws.create_document(book.id, Some(group.id), "甲").expect("甲");
+    let b_doc = ws.create_document(book.id, Some(group.id), "乙").expect("乙");
+    let node_of = |ws: &Workspace, doc_id: i64| {
+        ws.catalog_node_of_document(doc_id).expect("lookup").expect("node").id
+    };
+    let a = node_of(&ws, a_doc.id);
+    let b = node_of(&ws, b_doc.id);
+
+    // Reorder within the level: 甲 after 乙.
+    ws.move_catalog_node(a, Some(group.id), 1).expect("reorder");
+    let level_titles = |ws: &Workspace| {
+        ws.catalog_outline(book.id)
+            .expect("outline")
+            .into_iter()
+            .filter(|entry| entry.depth == 1)
+            .map(|entry| entry.node.title)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(level_titles(&ws), vec!["乙".to_owned(), "甲".to_owned()]);
+
+    // Reparent to the root at the top.
+    ws.move_catalog_node(b, None, 0).expect("reparent to root");
+    assert_eq!(level_titles(&ws), vec!["甲".to_owned()]);
+    let roots = ws.catalog_outline(book.id).expect("outline");
+    assert_eq!(roots.first().expect("top").node.title, "乙", "moved node lands at the top of the root level");
+
+    // Cycles: a node cannot move into itself or any descendant.
+    let err = ws.move_catalog_node(group.id, Some(group.id), 0).expect_err("into itself");
+    assert!(matches!(err, WorkspaceError::InvalidMove(_)), "self move rejected: {err}");
+    let err = ws.move_catalog_node(group.id, Some(a), 0).expect_err("into a descendant");
+    assert!(matches!(err, WorkspaceError::InvalidMove(_)), "descendant move rejected: {err}");
+    // And the tree is untouched after both rejections.
+    assert_eq!(ws.catalog_outline(book.id).expect("outline").len(), 3);
+}
+
+#[test]
+fn catalog_trash_and_restore_moves_the_whole_subtree() {
+    let (mut ws, path, _clock) = workspace_at("kb-trash", "2026-11-20 09:00");
+    let book = ws.create_knowledge_base("回收规则").expect("book");
+    let group = ws.create_catalog_node(book.id, None, "分组").expect("group");
+    let doc = ws.create_document(book.id, Some(group.id), "子文档").expect("doc");
+    let lone = ws.create_document(book.id, None, "独立文档").expect("lone");
+
+    // Trash the group: the descendant goes with it, the sibling stays.
+    ws.trash_catalog_node(group.id).expect("trash group");
+    let remaining = ws
+        .catalog_outline(book.id)
+        .expect("outline")
+        .into_iter()
+        .map(|entry| entry.node.title)
+        .collect::<Vec<_>>();
+    assert_eq!(remaining, vec!["独立文档".to_owned()]);
+    assert_eq!(ws.book_stats(book.id).expect("stats").documents, 1, "trashed document leaves the live counts");
+
+    // Restore brings the whole subtree back (sibling order is the
+    // top-insertion order the tree had before trashing).
+    ws.restore_catalog_node(group.id).expect("restore group");
+    let restored = ws
+        .catalog_outline(book.id)
+        .expect("outline")
+        .into_iter()
+        .map(|entry| (entry.node.title, entry.depth))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        restored,
+        vec![("独立文档".to_owned(), 0), ("分组".to_owned(), 0), ("子文档".to_owned(), 1)]
+    );
+    assert_eq!(ws.book_stats(book.id).expect("stats").documents, 2);
+    drop(ws);
+
+    // The Trash flags survive a restart (restore entry point after reopen).
+    let mut ws = Workspace::open(&path, at("2026-11-20 10:00")).expect("reopen");
+    ws.trash_catalog_node(lone.id).expect("trash after reopen");
+    assert_eq!(ws.catalog_outline(book.id).expect("outline").len(), 2);
+    let _ = doc;
+}
+
+#[test]
+fn knowledge_base_trash_restore_and_permanent_delete_unbinds_projects() {
+    let (mut ws, path, _clock) = workspace_at("kb-book-trash", "2026-11-20 09:00");
+    let book = ws.create_knowledge_base("整本回收").expect("book");
+    let group = ws.create_catalog_node(book.id, None, "分组").expect("group");
+    ws.create_document(book.id, Some(group.id), "文档").expect("doc");
+    let bound = ws.create_project("关联项目", "#547093", "📌", Some(book.id), Some(group.id)).expect("project");
+
+    // Trash the book: whole subtree leaves the shelf and the live tree.
+    ws.trash_knowledge_base(book.id).expect("trash book");
+    assert!(ws.knowledge_bases().expect("shelf").is_empty(), "trashed book leaves the shelf");
+    assert!(ws.catalog_outline(book.id).expect("outline").is_empty());
+    assert!(ws.knowledge_base(book.id).expect("row").is_some(), "the row itself remains for restore");
+
+    // The binding survives trashing (ADR-0001: restore brings it back).
+    let project = ws.projects().expect("projects").into_iter().find(|p| p.id == bound.id).expect("project");
+    assert_eq!(project.linked_book_id, Some(book.id));
+
+    // Restore: everything returns.
+    ws.restore_knowledge_base(book.id).expect("restore book");
+    assert_eq!(ws.knowledge_bases().expect("shelf").len(), 1);
+    assert_eq!(ws.catalog_outline(book.id).expect("outline").len(), 2);
+
+    // Permanent delete: rows are gone and the project falls back to unbound.
+    ws.delete_knowledge_base_permanent(book.id).expect("delete");
+    assert!(ws.knowledge_base(book.id).expect("gone").is_none());
+    assert!(ws.catalog_outline(book.id).expect("empty").is_empty());
+    let project = ws.projects().expect("projects").into_iter().find(|p| p.id == bound.id).expect("project");
+    assert_eq!(project.linked_book_id, None, "permanent delete unbinds the project");
+    assert_eq!(project.linked_group_node_id, None);
+    drop(ws);
+
+    // Deletion persists across restart.
+    let ws = Workspace::open(&path, at("2026-11-20 10:00")).expect("reopen");
+    assert!(ws.knowledge_bases().expect("shelf").is_empty());
+}
+
+#[test]
+fn catalog_expand_state_persists_and_first_level_defaults_expanded() {
+    let (mut ws, path, _clock) = workspace_at("kb-expand", "2026-11-20 09:00");
+    let book = ws.create_knowledge_base("展开规则").expect("book");
+    let group = ws.create_catalog_node(book.id, None, "分组").expect("group");
+    let doc = ws.create_document(book.id, Some(group.id), "子文档").expect("doc");
+
+    // First-open default: the first level starts expanded, deeper collapsed.
+    let doc_node = ws.catalog_node_of_document(doc.id).expect("lookup").expect("node").id;
+    let outline = ws.catalog_outline(book.id).expect("outline");
+    assert!(outline.iter().find(|e| e.node.id == group.id).expect("group").node.expanded);
+    assert!(!outline.iter().find(|e| e.node.id == doc_node).expect("doc").node.expanded);
+
+    // Toggling persists per node.
+    ws.set_catalog_node_expanded(doc_node, true).expect("expand doc");
+    ws.set_catalog_node_expanded(group.id, false).expect("collapse group");
+    drop(ws);
+
+    let ws = Workspace::open(&path, at("2026-11-20 10:00")).expect("reopen");
+    let outline = ws.catalog_outline(book.id).expect("outline");
+    assert!(!outline.iter().find(|e| e.node.id == group.id).expect("group").node.expanded, "collapse persisted");
+    assert!(outline.iter().find(|e| e.node.id == doc_node).expect("doc").node.expanded, "expand persisted");
+}
+
+#[test]
+fn book_stats_count_live_documents_and_words() {
+    let (mut ws, _path, _clock) = workspace_at("kb-stats", "2026-11-20 09:00");
+    let book = ws.create_knowledge_base("统计").expect("book");
+    let empty = ws.book_stats(book.id).expect("stats");
+    assert_eq!(empty, nsh_app_kanon::domain::BookStats { documents: 0, words: 0 });
+
+    let doc = ws.create_document(book.id, None, "正文").expect("doc");
+    ws.save_document(doc.id, "正文", "hello world 你好").expect("save");
+    let stats = ws.book_stats(book.id).expect("stats");
+    assert_eq!(stats.documents, 1);
+    assert_eq!(stats.words, 4, "two latin words + two CJK characters");
 }

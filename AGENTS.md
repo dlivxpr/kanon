@@ -26,8 +26,9 @@ view()
 | `src/main.rs` | Desktop launcher; passes `AppProps::desktop()` (file workspace, system clock) |
 | `src/domain/` | Pure-Rust domain: `workspace.rs` (SQLite facade + business rules), `date.rs`/`clock.rs` (floating local time), `schema.rs`, `task.rs`; zero UI-crate deps |
 | `src/ui/` | Styled control layer above `nsh-base`: `theme.rs` (semantic tokens + motion from `theme.json`), `controls.rs` (buttons, inputs, task circle, panels) |
-| `src/shell/` | Workbench shell: `store.rs` (reactive store over `Workspace`), `tabs.rs` (routes/history rules), `topbar.rs`, `sidebar.rs`, `context.rs`, `task_detail.rs` |
+| `src/shell/` | Workbench shell: `store.rs` (reactive store over `Workspace`), `tabs.rs` (routes/history rules), `topbar.rs`, `sidebar.rs` (responsive collapse rule), `context.rs`, `task_detail.rs` |
 | `src/today/` | The Today view (date strip, carryover, quick add, task list) |
+| `src/kb/` | Knowledge Base flows: `kb_shelf` (grid/list + favorites), `book_home` (dot-leader catalog), `catalog_sidebar` (book switcher, filter, locate, expand rules), `document_view` (reading view; the block editor is #6), `trash_view` |
 | `theme.json` | Semantic color/radius tokens (docs/ui-design.md §5), light + dark |
 | `.nsh/` | Generated: `.nsh/rust/` per-platform runner crates + workspace, `.nsh/types/` TS declarations (incl. `kanon/native.d.ts` from `#[native_module]`) |
 | `target/` | Cargo build output |

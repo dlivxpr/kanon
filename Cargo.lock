@@ -1820,6 +1820,7 @@ dependencies = [
  "nsh-platform-windows",
  "nsh-testing",
  "rusqlite",
+ "serde_json",
  "time",
 ]
 

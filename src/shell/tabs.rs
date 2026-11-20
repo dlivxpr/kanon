@@ -18,13 +18,15 @@ pub enum Route {
     Favorites,
     Tags,
     KnowledgeBases,
-    Trash,
-    Settings,
-    /// A Document open in this tab (docs/ui-design.md §2.2 `doc/:docId`):
-    /// the payload is the document id. Equality is by id, so a Knowledge
+    /// One open book: its home page plus the inner catalog sidebar.
+    Book(i64),
+    /// One open Document (docs/ui-design.md §2.2 `doc/:docId`): the
+    /// payload is the document id. Equality is by id, so a Knowledge
     /// Base's catalog focuses the tab already showing this Document
     /// instead of opening a duplicate.
     Document(i64),
+    Trash,
+    Settings,
 }
 
 impl Route {
@@ -40,10 +42,18 @@ impl Route {
             Self::Favorites => "收藏".to_owned(),
             Self::Tags => "标签".to_owned(),
             Self::KnowledgeBases => "知识库".to_owned(),
+            Self::Book(_) => "知识库".to_owned(),
+            Self::Document(_) => "文档".to_owned(),
             Self::Trash => "回收站".to_owned(),
             Self::Settings => "设置".to_owned(),
-            Self::Document(_) => "文档".to_owned(),
         }
+    }
+
+    /// Whether the destination embeds the inner catalog sidebar
+    /// (docs/ui-design.md §3.3): the book home and document reading
+    /// views do.
+    pub fn has_inner_catalog(&self) -> bool {
+        matches!(self, Self::Book(_) | Self::Document(_))
     }
 
     /// A short glyph for the tab and the sidebar.
@@ -58,9 +68,10 @@ impl Route {
             Self::Favorites => "★",
             Self::Tags => "#",
             Self::KnowledgeBases => "📚",
+            Self::Book(_) => "📕",
+            Self::Document(_) => "📄",
             Self::Trash => "🗑",
             Self::Settings => "⚙",
-            Self::Document(_) => "📄",
         }
     }
 }
