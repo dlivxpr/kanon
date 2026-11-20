@@ -107,7 +107,11 @@ pub fn reading_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
                                         &body,
                                         NodeViews::new()
                                             .with("taskItem", Arc::new(ReadingTaskItem { store }))
-                                            .with(CARD_NODE, Arc::new(TaskCardView { store })),
+                                            .with(CARD_NODE, Arc::new(TaskCardView { store }))
+                                            .with(
+                                                super::kanon::MENTION_NODE,
+                                                Arc::new(super::mention::KanonMentionView { store }),
+                                            ),
                                     );
                                     current.set(Some(session.clone()));
                                     let change_session = session.clone();

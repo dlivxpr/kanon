@@ -54,7 +54,9 @@ pub fn editing_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
 
     let session = build_session(
         &document.body,
-        NodeViews::new().with(CARD_NODE, Arc::new(TaskCardView { store })),
+        NodeViews::new()
+            .with(CARD_NODE, Arc::new(TaskCardView { store }))
+            .with(super::kanon::MENTION_NODE, Arc::new(super::mention::KanonMentionView { store })),
     );
     let draft_title = signal(document.title.clone());
     let draft_body = signal(document.body.clone());
@@ -452,11 +454,11 @@ fn toolbar(
             },
         ))
         .child(
-            // 任务卡片: pick an existing Task to embed as a Linked Task
-            // Card block.
+            // 关联任务卡片 (GLOSSARY): pick an existing Task to embed as
+            // a Linked Task Card block.
             app_button_with(
                 ButtonKind::Soft,
-                move || "任务卡片".into(),
+                move || "关联任务卡片".into(),
                 move || {
                     card_picker_open.update(|open| *open = !*open);
                     promote_open.set(false);
@@ -654,7 +656,7 @@ fn slash_panel(
                             let title = aggregate.with(|a| a.task.title.clone());
                             app_button(
                                 ButtonKind::Soft,
-                                format!("任务卡片 · {title}"),
+                                format!("关联任务卡片 · {title}"),
                                 move || {
                                     insert_card_at_suggestion(&pick, SLASH_KEY, id);
                                 },
@@ -784,6 +786,16 @@ fn promote_selected_item(
         return;
     }
     let (start, end) = (resolved.start(depth), resolved.end(depth));
+    let insert_at = if depth >= 1
+        && resolved.node(depth - 1).ty().name() == "taskList"
+        && resolved.node(depth - 1).child_count() == 1
+    {
+        // A single-item list becomes the card whole.
+        resolved.start(depth - 1)
+    } else {
+        // Inside a longer list the transform fits the card by splitting.
+        start
+    };
     let schema = state.schema().clone();
     let Ok(card) =
         schema.node_from_json(&json!({"type": CARD_NODE, "attrs": {"taskId": 0}}))
@@ -794,15 +806,10 @@ fn promote_selected_item(
     // The undo boundary: one editor Undo reverts exactly this swap —
     // nothing before it (the typing) and nothing after it (the attr fix).
     close_history(&mut tr);
-    let swapped = if depth >= 1
-        && resolved.node(depth - 1).ty().name() == "taskList"
-        && resolved.node(depth - 1).child_count() == 1
-    {
-        // A single-item list becomes the card whole.
-        tr.replace_with(resolved.start(depth - 1), resolved.end(depth - 1), Fragment::from(card))
-    } else {
-        // Inside a longer list the transform fits the card by splitting.
+    let swapped = if insert_at == start {
         tr.replace_with(start, end, Fragment::from(card))
+    } else {
+        tr.replace_with(insert_at, resolved.end(depth - 1), Fragment::from(card))
     };
     if swapped.is_err() || session.dispatch(tr).is_err() {
         return;
@@ -823,7 +830,7 @@ fn promote_selected_item(
             let state = session.state();
             let mut fix = state.tr();
             fix.set_add_to_history(false);
-            if let Some(pos) = card_node_position(&state) {
+            if let Some(pos) = card_node_position(&state, insert_at) {
                 let _ = fix.set_node_attribute(pos, "taskId", json!(promotion.task_id));
             }
             let _ = session.dispatch(fix);
@@ -839,15 +846,20 @@ fn promote_selected_item(
     }
 }
 
-/// Where the top-level Linked Task Card sits in `state`'s document.
-fn card_node_position(state: &EditorState) -> Option<usize> {
+/// Where the Linked Task Card inserted at `at` sits in `state`'s
+/// document. A document may already hold other cards — with an existing
+/// card earlier in the body, the first card overall is the WRONG node;
+/// the freshly promoted placeholder is the first card reaching the
+/// insertion point.
+fn card_node_position(state: &EditorState, at: usize) -> Option<usize> {
     let doc = state.doc();
     let mut pos = 0_usize;
     for child in doc.content().iter() {
-        if child.ty().name() == CARD_NODE {
+        let size = child.node_size();
+        if child.ty().name() == CARD_NODE && at < pos + size {
             return Some(pos);
         }
-        pos += child.node_size();
+        pos += size;
     }
     None
 }
@@ -1008,32 +1020,30 @@ enum MentionItem {
 }
 
 impl MentionItem {
-    fn label(&self) -> String {
+    /// The one decomposition every accessor derives from:
+    /// (kind, label prefix, id part, display label).
+    fn parts(&self) -> (&'static str, &'static str, String, String) {
         match self {
-            Self::Date(text) => format!("日期 · {text}"),
-            Self::Document(_, title) => format!("文档 · {title}"),
-            Self::Project(_, name) => format!("项目 · {name}"),
-            Self::Task(_, title) => format!("任务 · {title}"),
+            Self::Date(text) => ("date", "日期", text.clone(), text.clone()),
+            Self::Document(id, title) => ("document", "文档", id.to_string(), title.clone()),
+            Self::Project(id, name) => ("project", "项目", id.to_string(), name.clone()),
+            Self::Task(id, title) => ("task", "任务", id.to_string(), title.clone()),
         }
+    }
+
+    fn label(&self) -> String {
+        let (_, prefix, _, text) = self.parts();
+        format!("{prefix} · {text}")
     }
 
     /// The mention node's `id` attr (`kind:id_part`).
     fn id(&self) -> String {
-        match self {
-            Self::Date(text) => format!("date:{text}"),
-            Self::Document(id, _) => format!("document:{id}"),
-            Self::Project(id, _) => format!("project:{id}"),
-            Self::Task(id, _) => format!("task:{id}"),
-        }
+        let (kind, _, id_part, _) = self.parts();
+        format!("{kind}:{id_part}")
     }
 
     fn label_attr(&self) -> String {
-        match self {
-            Self::Date(text) => text.clone(),
-            Self::Document(_, title) => title.clone(),
-            Self::Project(_, name) => name.clone(),
-            Self::Task(_, title) => title.clone(),
-        }
+        self.parts().3
     }
 }
 
@@ -1109,6 +1119,15 @@ fn mention_panel(
                         move |item, _index| {
                             let pick = pick.clone();
                             app_button(ButtonKind::Soft, item.with(|item| item.label()), move || {
+                                // Picking a Task embeds an interactive
+                                // Linked Task Card (ADR-0002), like the
+                                // `/` path — a plain inline mention would
+                                // lose the live card and its Trash
+                                // degradation.
+                                if let MentionItem::Task(task_id, _) = item.with(|item| item.clone()) {
+                                    insert_card_at_suggestion(&pick, MENTION_KEY, task_id);
+                                    return;
+                                }
                                 let state = pick.state();
                                 let Ok(node) = state.schema().node_from_json(&json!({
                                     "type": super::kanon::MENTION_NODE,

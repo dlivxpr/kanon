@@ -1297,19 +1297,27 @@ fn inline_mentions_flow_and_feed_the_backlinks_panel() -> Result<(), String> {
     let _ = (source_id, target_id);
     let mut app = start(&path, "2026-11-20 09:00");
 
-    // The mentions flow inline: the whole paragraph reads as one run —
-    // no line breaks around the chips.
+    // The mentions flow inline: 前文 and 后文 stay inside ONE paragraph
+    // run (no line breaks around the chips), and both chips render
+    // their labels as live targets.
     app.wait_for("今天")?;
     app.press("id:nav-知识库")?;
     app.wait_for("全部知识库")?;
     app.press("打开知识库 手册")?;
     app.wait_for("id:catalog-tree")?;
     app.press("id:catalog-tree >> text:计划")?;
-    app.wait_for("前文@手册正文后文@2026-11-21")?;
+    app.wait_for("手册正文")?;
     let texts = visible_texts(&app);
+    let paragraph = texts
+        .iter()
+        .find(|text| text.contains("前文") && text.contains("后文"))
+        .expect("前文 and 后文 stay in one paragraph run");
+    assert!(!paragraph.contains('\n'), "no line break inside the paragraph: {paragraph:?}");
+    assert!(texts.iter().any(|text| text == "手册正文"), "the document chip shows its label: {texts:?}");
+    assert!(texts.iter().any(|text| text == "2026-11-21"), "the date chip shows its label: {texts:?}");
     assert!(
-        texts.contains(&"前文@手册正文后文@2026-11-21".to_owned()),
-        "both mention chips flow inside the paragraph: {texts:?}"
+        !texts.iter().any(|text| text.contains("已失效")),
+        "live targets do not render the invalid placeholder: {texts:?}"
     );
 
     // The target Document's right panel lists the backlink.
@@ -1318,7 +1326,8 @@ fn inline_mentions_flow_and_feed_the_backlinks_panel() -> Result<(), String> {
     app.wait_for("label:打开文档 计划")?;
     // Jump through the backlink into the source Document.
     app.press("label:打开文档 计划")?;
-    app.wait_for("前文@手册正文后文@2026-11-21")?;
+    app.wait_for("text:手册正文")?;
+    app.wait_for("text:2026-11-21")?;
 
     // Trash the source through its catalog row menu: the backlink
     // degrades but stays listed.
@@ -1337,7 +1346,59 @@ fn inline_mentions_flow_and_feed_the_backlinks_panel() -> Result<(), String> {
     app.press("id:catalog-tree >> text:手册正文")?;
     app.wait_for("label:打开文档 计划")?;
     app.press("label:打开文档 计划")?;
-    app.wait_for("前文@手册正文后文@2026-11-21")?;
+    app.wait_for("text:手册正文")?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[test]
+fn mention_chips_degrade_while_the_target_sits_in_trash_and_recover_on_restore(
+) -> Result<(), String> {
+    let path = temp_db("mention-degrade-ui");
+    seed(&path, "2026-11-20 09:00", |ws| {
+        let book = ws.create_knowledge_base("手册").expect("kb");
+        let target = ws.create_document(book.id, None, "手册正文").expect("target");
+        let source = ws.create_document(book.id, None, "计划").expect("source");
+        let body = format!(
+            "前文{}后文",
+            nsh_app_kanon::domain::mention_marker("document", &target.id.to_string(), "手册正文"),
+        );
+        ws.update_document_body_and_references(source.id, "计划", &body, None).expect("seed body");
+    });
+    let mut app = start(&path, "2026-11-20 09:00");
+
+    // The mentions live-chip view degrades while its target sits in
+    // Trash and recovers on restore.
+    app.wait_for("今天")?;
+    app.press("id:nav-知识库")?;
+    app.wait_for("全部知识库")?;
+    app.press("打开知识库 手册")?;
+    app.wait_for("id:catalog-tree")?;
+    app.press("id:catalog-tree >> text:计划")?;
+    // The live target renders its plain label.
+    app.wait_for("手册正文")?;
+    let texts = visible_texts(&app);
+    assert!(
+        !texts.iter().any(|text| text.contains("已失效")),
+        "a live target shows no invalid placeholder: {texts:?}"
+    );
+
+    // Trash the TARGET through its catalog row menu: the chip degrades
+    // to the invalid placeholder while the source Document stays put.
+    app.press("节点菜单 >> nth=1")?;
+    app.wait_for("移入回收站")?;
+    app.press("移入回收站")?;
+    app.wait_for("手册正文（已失效）")?;
+
+    // Restore the target: the chip recovers automatically.
+    app.press("label:恢复 手册正文")?;
+    app.wait_for_gone("label:恢复 手册正文", Duration::from_secs(2))?;
+    app.wait_for("手册正文")?;
+    let texts = visible_texts(&app);
+    assert!(
+        !texts.iter().any(|text| text.contains("已失效")),
+        "the restored target renders the live chip again: {texts:?}"
+    );
     let _ = std::fs::remove_file(path);
     Ok(())
 }

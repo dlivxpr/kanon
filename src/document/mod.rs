@@ -9,6 +9,7 @@
 mod editing;
 mod history;
 pub(crate) mod kanon;
+mod mention;
 mod reading;
 mod task_card;
 
