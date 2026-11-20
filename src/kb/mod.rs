@@ -11,7 +11,7 @@ use crate::domain::{BookStats, CatalogEntry, KnowledgeBase, KnowledgeBasePatch};
 use crate::shell::store::Store;
 use crate::shell::tabs::Route;
 use crate::ui::controls::{
-    app_button, empty_state, input_field, input_field_on_submit, panel_icon_button,
+    app_button, empty_state, input_field, submit_field, panel_icon_button,
     section_heading, ButtonKind,
 };
 use crate::ui::theme as tokens;
@@ -107,7 +107,7 @@ pub fn kb_shelf(store: Store) -> impl IntoElement {
                             .flex_row()
                             .items_center()
                             .gap_2()
-                            .child(input_field_on_submit(
+                            .child(submit_field(
                                 "知识库名称，回车创建",
                                 move || draft.get(),
                                 move |text: &str| draft.set(text.to_owned()),
@@ -335,13 +335,13 @@ fn book_edit_form(store: Store, id: i64, editing: Signal<Option<i64>>) -> impl I
         .border_1()
         .border_color(tokens::accent())
         .bg(move || theme().card)
-        .child(input_field_on_submit(
+        .child(submit_field(
             "名称",
             move || name.get(),
             move |text: &str| name.set(text.to_owned()),
             move |_: &str| {},
         ))
-        .child(input_field_on_submit(
+        .child(submit_field(
             "简介",
             move || description.get(),
             move |text: &str| description.set(text.to_owned()),
@@ -533,7 +533,7 @@ pub fn catalog_sidebar(
                                 .flex_row()
                                 .items_center()
                                 .gap_1()
-                                .child(input_field_on_submit(
+                                .child(submit_field(
                                     placeholder,
                                     move || draft.get(),
                                     move |text: &str| draft.set(text.to_owned()),

@@ -154,10 +154,9 @@ pub fn input_field(
         .min_w(px(0.0))
 }
 
-/// The app's text field with an Enter-to-commit handler: `on_submit`
-/// fires with the current text (used by the Knowledge Base creation
-/// rows, where Enter is the primary commit gesture).
-pub fn input_field_on_submit(
+/// The same field plus an Enter-to-commit handler (quick capture boxes
+/// and the Knowledge Base creation rows, where Enter commits).
+pub fn submit_field(
     placeholder: impl Into<String> + Clone + 'static,
     value: impl Fn() -> String + 'static,
     on_change: impl Fn(&str) + 'static,
