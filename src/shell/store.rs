@@ -1282,7 +1282,7 @@ impl Store {
     pub fn restore_revision(&self, revision_id: i64) -> bool {
         let result = self.workspace.with(|ws| {
             let revision = ws.document_revision(revision_id)?.ok_or_else(|| {
-                WorkspaceError::InvalidDateTime(format!("no revision {revision_id}"))
+                WorkspaceError::NotFound(format!("revision {revision_id}"))
             })?;
             ws.save_document_revision(revision.document_id, None)?;
             ws.restore_document_revision(revision_id)

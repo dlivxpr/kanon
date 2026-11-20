@@ -165,10 +165,21 @@ pub fn task_card_marker(task_id: i64) -> String {
 }
 
 /// The archived form of an inline `@` mention. `id_part` is the target id
-/// (`3`) or, for dates, the date text itself (`2026-11-20`).
+/// (`3`) or, for dates, the date text itself (`2026-11-20`). The label
+/// sanitizes exactly the characters the parser rejects (a `)` would close
+/// the marker early; `{`, `}` and `@` would corrupt re-parsing): they are
+/// full-widthed instead, so every label round-trips losslessly.
 pub fn mention_marker(kind: &str, id_part: &str, label: &str) -> String {
-    // A `)` would close the marker early: full-width it instead.
-    let label: String = label.chars().map(|c| if c == ')' { '）' } else { c }).collect();
+    let label: String = label
+        .chars()
+        .map(|c| match c {
+            ')' => '）',
+            '{' => '｛',
+            '}' => '｝',
+            '@' => '＠',
+            c => c,
+        })
+        .collect();
     format!("@m{{{kind}:{id_part}}}({label})")
 }
 

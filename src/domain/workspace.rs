@@ -24,6 +24,12 @@ pub enum WorkspaceError {
     Sqlite(rusqlite::Error),
     /// A date/time string in storage or input that is not well-formed.
     InvalidDateTime(String),
+    /// The workspace file could not be prepared (its directory is not
+    /// creatable, and the like).
+    Io(std::io::Error),
+    /// A referenced entity (Knowledge Base, Catalog Node, Document,
+    /// revision, Project, Task) does not exist.
+    NotFound(String),
     /// An optimistic write whose base `updated_at` no longer matches the
     /// row: someone else committed first; retry against a fresh base.
     StaleDocument,
@@ -44,6 +50,8 @@ impl fmt::Display for WorkspaceError {
         match self {
             Self::Sqlite(err) => write!(f, "SQLite error: {err}"),
             Self::InvalidDateTime(value) => write!(f, "invalid date/time value: {value}"),
+            Self::Io(err) => write!(f, "workspace I/O error: {err}"),
+            Self::NotFound(what) => write!(f, "not found: {what}"),
             Self::StaleDocument => write!(f, "the document changed since this edit began"),
             Self::InvalidMove(value) => write!(f, "invalid catalog move: {value}"),
             Self::InvalidPromotion(value) => write!(f, "invalid checklist promotion: {value}"),
@@ -411,11 +419,9 @@ impl Workspace {
     /// Opens (creating if needed) the workspace at `path` and migrates it.
     pub fn open(path: &Path, clock: Arc<dyn Clock>) -> Result<Self> {
         if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent).map_err(|err| {
-                WorkspaceError::InvalidDateTime(format!("cannot create {}: {err}", parent.display()))
-            })?;
+            std::fs::create_dir_all(parent).map_err(WorkspaceError::Io)?;
         }
-        let mut workspace = Self { conn: Connection::open(path)?, clock };
+        let mut workspace = Self::connect(Connection::open(path)?, clock)?;
         workspace.migrate()?;
         Ok(workspace)
     }
@@ -427,9 +433,18 @@ impl Workspace {
 
     /// An in-memory workspace with an explicit clock.
     pub fn open_in_memory_with_clock(clock: Arc<dyn Clock>) -> Result<Self> {
-        let mut workspace = Self { conn: Connection::open_in_memory()?, clock };
+        let mut workspace = Self::connect(Connection::open_in_memory()?, clock)?;
         workspace.migrate()?;
         Ok(workspace)
+    }
+
+    /// A workspace over an open connection, with the enforcement
+    /// pragmas applied (ADR-0001: Documents belong strictly to one
+    /// Knowledge Base — the schema's foreign keys actually reject
+    /// orphans).
+    fn connect(conn: Connection, clock: Arc<dyn Clock>) -> Result<Self> {
+        conn.pragma_update(None, "foreign_keys", true)?;
+        Ok(Self { conn, clock })
     }
 
     /// Initializes the full schema in one transaction; safe to re-run.
@@ -514,7 +529,7 @@ impl Workspace {
         )?;
         let id = tx.last_insert_rowid();
         tx.commit()?;
-        self.task(id)?.ok_or_else(|| WorkspaceError::InvalidDateTime(format!("task {id} missing after insert")))
+        self.task(id)?.ok_or_else(|| WorkspaceError::NotFound(format!("task {id} missing after insert")))
     }
 
     /// Loads a Task with its tags, subtasks and project.
@@ -596,7 +611,7 @@ impl Workspace {
         let sql = format!("UPDATE tasks SET {} WHERE id = ?", sets.join(", "));
         let changed = self.conn.execute(&sql, &refs[..])?;
         if changed == 0 {
-            return Err(WorkspaceError::InvalidDateTime(format!("no task {id}")));
+            return Err(WorkspaceError::NotFound(format!("task {id}")));
         }
         Ok(self.task(id)?.expect("task exists after update").task)
     }
@@ -606,7 +621,7 @@ impl Workspace {
     pub fn toggle_task_circle(&mut self, id: i64) -> Result<Task> {
         let current = self
             .task(id)?
-            .ok_or_else(|| WorkspaceError::InvalidDateTime(format!("no task {id}")))?
+            .ok_or_else(|| WorkspaceError::NotFound(format!("task {id}")))?
             .task;
         self.update_task(id, &TaskPatch { status: Some(current.status.circle_toggled()), ..Default::default() })
     }
@@ -894,10 +909,10 @@ impl Workspace {
             let sql = format!("UPDATE knowledge_bases SET {} WHERE id = ?", sets.join(", "));
             let changed = self.conn.execute(&sql, &refs[..])?;
             if changed == 0 {
-                return Err(WorkspaceError::InvalidDateTime(format!("no knowledge base {id}")));
+                return Err(WorkspaceError::NotFound(format!("knowledge base {id}")));
             }
         }
-        self.knowledge_base(id)?.ok_or_else(|| WorkspaceError::InvalidDateTime(format!("no knowledge base {id}")))
+        self.knowledge_base(id)?.ok_or_else(|| WorkspaceError::NotFound(format!("knowledge base {id}")))
     }
 
     /// Pins or unpins a Knowledge Base on the shelf.
@@ -1264,7 +1279,7 @@ impl Workspace {
     ) -> Result<()> {
         let node = self
             .catalog_node(id)?
-            .ok_or_else(|| WorkspaceError::InvalidDateTime(format!("no catalog node {id}")))?;
+            .ok_or_else(|| WorkspaceError::NotFound(format!("catalog node {id}")))?;
         let _ = self.validate_parent(node.book_id, new_parent_id)?;
         if let Some(parent) = new_parent_id {
             if parent == id {
@@ -1389,9 +1404,9 @@ impl Workspace {
             params![title, body, words, self.stamp(), id],
         )?;
         if changed == 0 {
-            return Err(WorkspaceError::InvalidDateTime(format!("no document {id}")));
+            return Err(WorkspaceError::NotFound(format!("document {id}")));
         }
-        self.document(id)?.ok_or_else(|| WorkspaceError::InvalidDateTime(format!("no document {id}")))
+        self.document(id)?.ok_or_else(|| WorkspaceError::NotFound(format!("document {id}")))
     }
 
     /// Saves a Document revision; `name = None` records an automatic
@@ -1403,7 +1418,7 @@ impl Workspace {
     ) -> Result<DocumentRevision> {
         let document = self
             .document(document_id)?
-            .ok_or_else(|| WorkspaceError::InvalidDateTime(format!("no document {document_id}")))?;
+            .ok_or_else(|| WorkspaceError::NotFound(format!("document {document_id}")))?;
         let created_at = self.stamp();
         self.conn.execute(
             "INSERT INTO document_revisions (document_id, title, body, name, created_at) \
@@ -1503,7 +1518,7 @@ impl Workspace {
             if base_version.is_some() && self.document(id)?.is_some() {
                 return Err(WorkspaceError::StaleDocument);
             }
-            return Err(WorkspaceError::InvalidDateTime(format!("no document {id}")));
+            return Err(WorkspaceError::NotFound(format!("document {id}")));
         }
         Ok(self.document(id)?.expect("document exists after update"))
     }
@@ -1551,31 +1566,30 @@ impl Workspace {
     }
 
     /// Restores a saved revision: the Document's title, body and word
-    /// count are rewritten, and its references are re-anchored to the
-    /// restored text (the first occurrence of each reference's label, in
-    /// UTF-16 offsets as the editor counts). References whose label the
-    /// restored body does not contain keep their position. No Task — and
-    /// no other object — is ever touched (ADR-0002).
+    /// count are rewritten and its reference index is rebuilt from the
+    /// restored body's Linked Task Card and `@` mention markers, all in
+    /// one transaction — the index is a projection of the body, so
+    /// rollback brings the cards, mentions and their anchor positions
+    /// back exactly (and drops what the restored body does not contain).
+    /// No Task — and no other object — is ever touched (ADR-0002).
     pub fn restore_document_revision(&mut self, revision_id: i64) -> Result<Document> {
         let revision = self
             .document_revision(revision_id)?
-            .ok_or_else(|| WorkspaceError::InvalidDateTime(format!("no revision {revision_id}")))?;
-        let restored = self.update_document_body(
-            revision.document_id,
-            &revision.title,
-            &revision.body,
-            None,
+            .ok_or_else(|| WorkspaceError::NotFound(format!("revision {revision_id}")))?;
+        let now = self.stamp();
+        let words = super::document::count_words(&revision.body) as i64;
+        let tx = self.conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE documents SET title = ?, body = ?, word_count = ?, updated_at = ?, \
+             version = version + 1 WHERE id = ?",
+            params![revision.title, revision.body, words, now, revision.document_id],
         )?;
-        let references = self.document_references(revision.document_id)?;
-        for reference in references {
-            if let Some(position) = utf16_position_of(&restored.body, &reference.target_label) {
-                self.conn.execute(
-                    "UPDATE document_references SET position = ? WHERE id = ?",
-                    params![position as i64, reference.id],
-                )?;
-            }
+        if changed == 0 {
+            return Err(WorkspaceError::NotFound(format!("document {}", revision.document_id)));
         }
-        Ok(restored)
+        reconcile_references(&tx, revision.document_id, &revision.body, &now)?;
+        tx.commit()?;
+        Ok(self.document(revision.document_id)?.expect("document exists after restore"))
     }
 
     /// Loads a single revision.
@@ -1662,7 +1676,7 @@ impl Workspace {
             if base_version.is_some() && document_exists(&tx, document_id)? {
                 return Err(WorkspaceError::StaleDocument);
             }
-            return Err(WorkspaceError::InvalidDateTime(format!("no document {document_id}")));
+            return Err(WorkspaceError::NotFound(format!("document {document_id}")));
         }
         reconcile_references(&tx, document_id, &final_body, &now)?;
         tx.commit()?;
@@ -1716,7 +1730,7 @@ impl Workspace {
             if base_version.is_some() && document_exists(&tx, id)? {
                 return Err(WorkspaceError::StaleDocument);
             }
-            return Err(WorkspaceError::InvalidDateTime(format!("no document {id}")));
+            return Err(WorkspaceError::NotFound(format!("document {id}")));
         }
         reconcile_references(&tx, id, body, &now)?;
         tx.commit()?;
@@ -1868,6 +1882,9 @@ impl Workspace {
                 (Some(node.book_id), Some(node_id))
             }
             ProjectBinding::NewBook => {
+                // The same-named Knowledge Base and the Project binding
+                // commit atomically: a failure cannot leave an orphaned
+                // book behind (ADR-0003's cross-object atomicity).
                 let now = self.stamp();
                 let tx = self.conn.transaction()?;
                 tx.execute(
@@ -1876,8 +1893,17 @@ impl Workspace {
                     params![name, now, now],
                 )?;
                 let book_id = tx.last_insert_rowid();
+                tx.execute(
+                    "INSERT INTO projects (name, color, emoji, linked_book_id, linked_group_node_id, \
+                                           created_at, updated_at) \
+                     VALUES (?, ?, ?, ?, NULL, ?, ?)",
+                    params![name, color, emoji, book_id, now, now],
+                )?;
+                let project_id = tx.last_insert_rowid();
                 tx.commit()?;
-                (Some(book_id), None)
+                return self
+                    .project(project_id)?
+                    .ok_or_else(|| WorkspaceError::NotFound(format!("project {project_id}")));
             }
         };
         self.create_project(name, color, emoji, linked_book_id, linked_group_node_id)
@@ -1955,10 +1981,10 @@ impl Workspace {
             let sql = format!("UPDATE projects SET {} WHERE id = ?", sets.join(", "));
             let changed = self.conn.execute(&sql, &refs[..])?;
             if changed == 0 {
-                return Err(WorkspaceError::InvalidDateTime(format!("no project {id}")));
+                return Err(WorkspaceError::NotFound(format!("project {id}")));
             }
         }
-        self.project(id)?.ok_or_else(|| WorkspaceError::InvalidDateTime(format!("no project {id}")))
+        self.project(id)?.ok_or_else(|| WorkspaceError::NotFound(format!("project {id}")))
     }
 
     /// Every non-trashed Task assigned to the Project, in status order
@@ -2021,7 +2047,7 @@ impl Workspace {
     pub fn bind_new_book(&mut self, project_id: i64) -> Result<Project> {
         let project = self
             .project(project_id)?
-            .ok_or_else(|| WorkspaceError::InvalidDateTime(format!("no project {project_id}")))?;
+            .ok_or_else(|| WorkspaceError::NotFound(format!("project {project_id}")))?;
         let now = self.stamp();
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -2035,7 +2061,7 @@ impl Workspace {
             params![book_id, now, project_id],
         )?;
         tx.commit()?;
-        self.project(project_id)?.ok_or_else(|| WorkspaceError::InvalidDateTime(format!("no project {project_id}")))
+        self.project(project_id)?.ok_or_else(|| WorkspaceError::NotFound(format!("project {project_id}")))
     }
 
     /// How many non-trashed Documents live in the Project's linked scope
@@ -2073,7 +2099,7 @@ impl Workspace {
     pub fn project_document_target(&self, project_id: i64) -> Result<Option<ProjectDocsTarget>> {
         let project = self
             .project(project_id)?
-            .ok_or_else(|| WorkspaceError::InvalidDateTime(format!("no project {project_id}")))?;
+            .ok_or_else(|| WorkspaceError::NotFound(format!("project {project_id}")))?;
         if let Some(node_id) = project.linked_group_node_id {
             let node = self.catalog_node(node_id)?.ok_or_else(|| {
                 WorkspaceError::InvalidOperation(format!("linked grouping node {node_id} is gone"))
@@ -2176,10 +2202,22 @@ impl Workspace {
 
     /// A parent must exist in the same book and not be trashed; returns
     /// the new child's initial expand state (first level expands, deeper
-    /// levels collapse — the first-open default).
+    /// levels collapse — the first-open default). With no parent the
+    /// book itself must exist (ADR-0001: a Document never lands outside
+    /// a Knowledge Base).
     fn validate_parent(&self, book_id: i64, parent_id: Option<i64>) -> Result<bool> {
         match parent_id {
-            None => Ok(true),
+            None => {
+                let exists = self
+                    .conn
+                    .query_row("SELECT 1 FROM knowledge_bases WHERE id = ?", params![book_id], |_| Ok(()))
+                    .optional()?
+                    .is_some();
+                if !exists {
+                    return Err(WorkspaceError::NotFound(format!("knowledge base {book_id}")));
+                }
+                Ok(true)
+            }
             Some(parent) => {
                 let parent = self.catalog_node(parent)?.ok_or_else(|| {
                     WorkspaceError::InvalidMove(format!("no parent catalog node {parent}"))
@@ -2299,13 +2337,6 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool
         .query_map(params![table], |row| row.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(columns.iter().any(|name| name == column))
-}
-
-/// Whether `label` first occurs in `body`, counted in UTF-16 code units as
-/// the editor counts positions; `None` when absent.
-fn utf16_position_of(body: &str, label: &str) -> Option<usize> {
-    let byte = body.find(label)?;
-    Some(body[..byte].chars().map(char::len_utf16).sum())
 }
 
 /// Whether a Document row exists (any Trash state).

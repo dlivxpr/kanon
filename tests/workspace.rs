@@ -622,45 +622,62 @@ fn optimistic_body_update_rejects_stale_base_and_retry_commits() {
 }
 
 #[test]
-fn revisions_snapshot_and_restore_only_document_content_and_reference_positions() {
+fn revisions_snapshot_and_restore_only_document_content_and_rebuilt_references() {
     let (mut ws, path, clock) = workspace_at("doc-restore", "2026-11-20 09:00");
     let book = ws.create_knowledge_base("手册").expect("kb");
     let doc = ws.create_document(book.id, None, "方案").expect("doc");
 
-    // v1: the body mentions Kanon right away; the mention is indexed.
-    ws.update_document_body(doc.id, "方案 v1", "和 Kanon 一起\n\n尾部", None).expect("v1 body");
-    let mention = ws
-        .add_document_reference(doc.id, "mention", "document", Some(7), "Kanon", 2)
-        .expect("mention index");
-    let auto = ws.save_document_revision(doc.id, None).expect("auto snapshot");
-    assert_eq!(auto.name, None, "no name records an automatic snapshot");
-    let v1 = ws.save_document_revision(doc.id, Some("v1")).expect("named version");
-    assert_eq!(v1.name.as_deref(), Some("v1"));
-
-    // The body keeps moving after v1; a live Task is referenced too.
-    clock.advance_to(LocalDateTime::parse("2026-11-20 10:00").unwrap());
-    ws.update_document_body(doc.id, "方案 v2", "开头很长的一段\n\n和 Kanon 一起", None).expect("v2 body");
-    ws.save_document_revision(doc.id, None).expect("another auto snapshot");
+    // A live Task the v1 body links with a Linked Task Card.
     let task = ws
         .create_task(&NewTask { title: "被引用的任务".to_owned(), ..Default::default() })
         .expect("task")
         .task;
-    let card = ws
-        .add_document_reference(doc.id, "task_card", "task", Some(task.id), "被引用的任务", 14)
-        .expect("card index");
 
-    // Restoring v1 puts back exactly title/body and re-anchors the
-    // references' positions against the restored text; nothing else moves.
+    // v1: the body holds a real mention marker and a real card marker;
+    // both are indexed projections of the body.
+    let v1_body = format!(
+        "和 {} 一起\n\n{} 尾部",
+        nsh_app_kanon::domain::mention_marker("document", "7", "Kanon"),
+        nsh_app_kanon::domain::task_card_marker(task.id)
+    );
+    ws.update_document_body_and_references(doc.id, "方案 v1", &v1_body, None).expect("v1 body");
+    let auto = ws.save_document_revision(doc.id, None).expect("auto snapshot");
+    assert_eq!(auto.name, None, "no name records an automatic snapshot");
+    let v1 = ws.save_document_revision(doc.id, Some("v1")).expect("named version");
+    assert_eq!(v1.name.as_deref(), Some("v1"));
+    let expected_mention_pos = nsh_app_kanon::domain::scan_mention_markers(&v1_body)[0].position;
+    let expected_card_pos = nsh_app_kanon::domain::scan_task_card_markers(&v1_body)[0].1;
+
+    // The body keeps moving after v1; both markers disappear from the
+    // live body (the index reconciles them away).
+    clock.advance_to(LocalDateTime::parse("2026-11-20 10:00").unwrap());
+    ws.update_document_body_and_references(doc.id, "方案 v2", "开头很长的一段\n\n没有引用了", None)
+        .expect("v2 body");
+    ws.save_document_revision(doc.id, None).expect("another auto snapshot");
+    assert!(
+        ws.document_references(doc.id).expect("refs").is_empty(),
+        "editing the markers away reconciled the index"
+    );
+
+    // Restoring v1 puts back exactly title/body and REBUILDS the
+    // reference index from the restored body's markers — rollback
+    // recreates the cards and mentions with their anchor positions.
     let restored = ws.restore_document_revision(v1.id).expect("restore v1");
     assert_eq!(restored.title, "方案 v1");
-    assert_eq!(restored.body, "和 Kanon 一起\n\n尾部");
-    assert_eq!(restored.word_count, count_words("和 Kanon 一起\n\n尾部"));
+    assert_eq!(restored.body, v1_body);
+    assert_eq!(restored.word_count, count_words(&v1_body));
 
     let refs = ws.document_references(doc.id).expect("refs");
-    let mention = refs.iter().find(|r| r.id == mention.id).expect("mention survives");
-    assert_eq!(mention.position, 2, "Kanon starts at UTF-16 offset 2 in the restored body");
-    let card = refs.iter().find(|r| r.id == card.id).expect("card survives");
-    assert_eq!(card.position, 14, "labels absent from the restored body keep their position");
+    assert_eq!(refs.len(), 2, "the restored body's markers are indexed again");
+    let mention = refs.iter().find(|r| r.ref_type == "mention").expect("mention re-indexed");
+    assert_eq!(mention.target_kind, "document");
+    assert_eq!(mention.target_id, Some(7));
+    assert_eq!(mention.target_label, "Kanon");
+    assert_eq!(mention.position, expected_mention_pos as i64, "anchored where the marker sits");
+    let card = refs.iter().find(|r| r.ref_type == "task_card").expect("card re-indexed");
+    assert_eq!(card.target_id, Some(task.id));
+    assert_eq!(card.target_label, "被引用的任务", "card labels denormalize the Task's title");
+    assert_eq!(card.position, expected_card_pos as i64);
 
     // The Task itself is never mutated by a document restore.
     let untouched = ws.task(task.id).expect("load").expect("present").task;
@@ -670,8 +687,59 @@ fn revisions_snapshot_and_restore_only_document_content_and_reference_positions(
 
     // The restore is durable across a restart.
     let ws = Workspace::open(&path, at("2026-11-20 10:30")).expect("reopen");
-    assert_eq!(ws.document(doc.id).expect("load").expect("present").body, "和 Kanon 一起\n\n尾部");
+    assert_eq!(ws.document(doc.id).expect("load").expect("present").body, v1_body);
+    assert_eq!(ws.document_references(doc.id).expect("refs").len(), 2);
     let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn create_document_rejects_an_unknown_knowledge_base() {
+    let (mut ws, _path, _clock) = workspace_at("orphan-doc", "2026-11-20 09:00");
+    let err = ws.create_document(999, None, "孤儿").expect_err("no book 999");
+    assert!(matches!(err, WorkspaceError::NotFound(_)), "unknown book: {err}");
+    // The enforced foreign key is the second line of defense.
+    let err = ws.create_catalog_node(999, None, "孤儿分组").expect_err("no book 999");
+    assert!(matches!(err, WorkspaceError::NotFound(_)), "unknown book: {err}");
+    let book = ws.create_knowledge_base("手册").expect("kb");
+    let doc = ws.create_document(book.id, None, "正常").expect("doc in a real book");
+    assert_eq!(doc.book_id, book.id);
+}
+
+#[test]
+fn binding_a_new_book_creates_project_and_book_atomically() {
+    let (mut ws, path, _clock) = workspace_at("new-book-binding", "2026-11-20 09:00");
+    let project = ws
+        .create_project_with_binding("Kanon 手册", "#547093", "📕", ProjectBinding::NewBook)
+        .expect("project + same-named book in one commit");
+    let target = ws.project_document_target(project.id).expect("target").expect("bound");
+    let book = ws.knowledge_base(target.book_id).expect("book").expect("present");
+    assert_eq!(book.name, "Kanon 手册", "the book is same-named");
+
+    drop(ws);
+    let ws = Workspace::open(&path, at("2026-11-20 10:00")).expect("reopen");
+    let project = ws.project(project.id).expect("load").expect("present");
+    assert_eq!(project.linked_book_id, Some(target.book_id), "the binding persisted");
+    assert_eq!(ws.knowledge_bases().expect("books").len(), 1);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn mention_markers_round_trip_labels_with_special_characters() {
+    use nsh_app_kanon::domain::{mention_marker, parse_mention_marker, scan_mention_markers};
+    // The writer sanitizes exactly what the parser rejects: `)`, `{`,
+    // `}` and `@` in a label survive the archive round trip.
+    let marker = mention_marker("document", "7", "a)b{c}d@e");
+    let (parsed, len) = parse_mention_marker(&marker).expect("the sanitized marker parses");
+    assert_eq!(len, marker.len(), "the whole marker is consumed");
+    assert_eq!(parsed.kind, "document");
+    assert_eq!(parsed.target_id, Some(7));
+    assert_eq!(parsed.label, "a）b｛c｝d＠e");
+
+    let body = format!("前文{marker}后文");
+    let found = scan_mention_markers(&body);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].position, 2, "counted in UTF-16 code units");
+    assert_eq!(found[0].label, "a）b｛c｝d＠e");
 }
 
 #[test]
