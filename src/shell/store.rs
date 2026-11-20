@@ -12,7 +12,7 @@ use crate::domain::{
     TaskPatch, Workspace, WorkspaceError,
 };
 
-use super::tabs::{Route, TabStrip};
+use super::tabs::{ProjectSection, Route, TabStrip};
 
 /// The sidebar's persistence keys.
 pub const PREF_SIDEBAR_COLLAPSED: &str = "sidebar_collapsed";
@@ -129,6 +129,98 @@ impl Store {
         self.workspace.with(|ws| ws.projects().unwrap_or_default())
     }
 
+    /// One Project regardless of its Trash state (route titles, the
+    /// Trash screen, the Linked Documents notice).
+    pub fn project(&self, id: i64) -> Option<crate::domain::Project> {
+        self.bump.get();
+        self.workspace.with(|ws| ws.project(id).unwrap_or_default())
+    }
+
+    /// A Project's Milestones in display order.
+    pub fn milestones(&self, project_id: i64) -> Vec<crate::domain::Milestone> {
+        self.workspace
+            .with(|ws| ws.milestones(project_id).unwrap_or_default())
+    }
+
+    /// Every non-trashed Task assigned to the Project, in status order.
+    pub fn project_tasks(&self, project_id: i64) -> Vec<TaskAggregate> {
+        self.workspace
+            .with(|ws| ws.project_tasks(project_id).unwrap_or_default())
+    }
+
+    /// The sidebar badge: active (`todo`/`doing`) tasks of the Project.
+    pub fn project_open_count(&self, project_id: i64) -> usize {
+        self.project_tasks(project_id)
+            .iter()
+            .filter(|aggregate| aggregate.task.status.is_active())
+            .count()
+    }
+
+    /// Where the Project's Documents live (ADR-0001); `None` = unbound.
+    pub fn project_document_target(
+        &self,
+        project_id: i64,
+    ) -> Option<crate::domain::ProjectDocsTarget> {
+        self.bump.get();
+        self.workspace
+            .with(|ws| ws.project_document_target(project_id).unwrap_or_default())
+    }
+
+    /// Whether the Project's linked grouping node currently sits in
+    /// Trash (the recoverable-binding notice reads this).
+    pub fn project_linked_node_trashed(&self, project_id: i64) -> bool {
+        let Some(project) = self.project(project_id) else { return false };
+        let Some(node_id) = project.linked_group_node_id else { return false };
+        self.catalog_node_is_trashed(node_id)
+    }
+
+    pub fn catalog_node_is_trashed(&self, id: i64) -> bool {
+        self.bump.get();
+        self.workspace.with(|ws| ws.catalog_node_is_trashed(id).unwrap_or(false))
+    }
+
+    /// One Catalog Node regardless of its Trash state (labels and
+    /// breadcrumbs).
+    pub fn catalog_node(&self, id: i64) -> Option<crate::domain::CatalogNode> {
+        self.bump.get();
+        self.workspace.with(|ws| ws.catalog_node(id).unwrap_or_default())
+    }
+
+    /// The Trash screen's project rows.
+    pub fn trashed_projects(&self) -> Vec<crate::domain::Project> {
+        self.bump.get();
+        self.workspace.with(|ws| ws.trashed_projects().unwrap_or_default())
+    }
+
+    /// The Trash screen's catalog node rows (subtree roots, all books).
+    pub fn trashed_catalog_nodes_all(&self) -> Vec<crate::domain::CatalogNode> {
+        self.bump.get();
+        self.workspace
+            .with(|ws| ws.trashed_catalog_nodes_all().unwrap_or_default())
+    }
+
+    /// The Overview's 关联文档 metric: live documents in the linked scope.
+    pub fn project_document_count(&self, project_id: i64) -> usize {
+        self.bump.get();
+        self.workspace
+            .with(|ws| ws.project_document_count(project_id).unwrap_or_default())
+    }
+
+    /// One-click binding: creates the same-named Knowledge Base and binds
+    /// the Project to it (ADR-0001).
+    pub fn bind_project_new_book(&self, project_id: i64) -> bool {
+        match self.workspace.with(|ws| ws.bind_new_book(project_id)) {
+            Ok(_) => {
+                self.bump();
+                true
+            }
+            Err(err) => {
+                log::warn!("bind new book to project {project_id} failed: {err}");
+                false
+            }
+        }
+    }
+
     pub fn carryover_count(&self) -> usize {
         self.workspace
             .with(|ws| ws.carryover_count().unwrap_or_default())
@@ -195,6 +287,16 @@ impl Store {
                 .workspace
                 .with(|ws| ws.document(*id).ok().flatten())
                 .map(|doc| doc.title)
+                .unwrap_or_else(|| route.title()),
+            Route::Project(id) => self
+                .workspace
+                .with(|ws| ws.project(*id).ok().flatten())
+                .map(|project| project.name)
+                .unwrap_or_else(|| route.title()),
+            Route::ProjectEditor(Some(id)) => self
+                .workspace
+                .with(|ws| ws.project(*id).ok().flatten())
+                .map(|project| format!("编辑 {}", project.name))
                 .unwrap_or_else(|| route.title()),
             other => other.title(),
         }
@@ -595,6 +697,270 @@ impl Store {
         self.bump();
     }
 
+    /// Permanently deletes a trashed Catalog Node subtree (not undoable).
+    /// Projects bound to any node of the subtree reset to unbound
+    /// (ADR-0001); document tabs showing the removed documents fall back
+    /// to their book home.
+    pub fn delete_catalog_node_permanent(&self, id: i64) {
+        // Document tabs showing a removed document fall back to the
+        // subtree's book home; the book id must be read before the delete.
+        let book_id = self
+            .workspace
+            .with(|ws| ws.catalog_node(id).ok().flatten())
+            .map(|node| node.book_id);
+        let open_docs = self.strip.with_untracked(|strip| {
+            strip
+                .tabs
+                .iter()
+                .filter_map(|tab| match &tab.current {
+                    Route::Document(doc_id) => Some((tab.id, *doc_id)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        });
+        if let Err(err) = self
+            .workspace
+            .with(|ws| ws.delete_catalog_node_permanent(id))
+        {
+            log::warn!("delete catalog node {id} failed: {err}");
+            return;
+        }
+        let fallback = |doc_id: i64| {
+            self.workspace.with(|ws| ws.document(doc_id).ok().flatten()).is_none()
+        };
+        self.strip.update(|strip| {
+            for (tab_id, doc_id) in open_docs {
+                if fallback(doc_id)
+                    && let Some(book_id) = book_id
+                    && let Some(tab) = strip.tabs.iter_mut().find(|tab| tab.id == tab_id)
+                {
+                    tab.navigate(Route::Book(book_id));
+                }
+            }
+        });
+        self.bump();
+    }
+
+    // ------------------------------------------------------------------
+    // Project commands
+    // ------------------------------------------------------------------
+
+    /// Opens a Project (focus-or-reuse, like every sidebar entry).
+    pub fn open_project(&self, id: i64) {
+        self.open_or_focus(Route::Project(id));
+    }
+
+    /// Creates a Project with its binding choice; returns the new id.
+    pub fn create_project_with_binding(
+        &self,
+        name: &str,
+        color: &str,
+        emoji: &str,
+        binding: crate::domain::ProjectBinding,
+    ) -> Option<i64> {
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        let result = self.workspace.with(|ws| {
+            ws.create_project_with_binding(name, color, emoji, binding)
+        });
+        match result {
+            Ok(project) => {
+                self.bump();
+                Some(project.id)
+            }
+            Err(err) => {
+                log::warn!("create project failed: {err}");
+                None
+            }
+        }
+    }
+
+    pub fn update_project(&self, id: i64, patch: &crate::domain::ProjectPatch) -> bool {
+        let result = self.workspace.with(|ws| ws.update_project(id, patch));
+        match result {
+            Ok(_) => {
+                self.bump();
+                true
+            }
+            Err(err) => {
+                log::warn!("update project {id} failed: {err}");
+                false
+            }
+        }
+    }
+
+    /// Moves a Project into Trash; tabs showing it fall back to 待办.
+    /// The Tasks keep their `project_id` (ADR-0001).
+    pub fn trash_project(&self, id: i64) {
+        if let Err(err) = self.workspace.with(|ws| ws.trash_project(id)) {
+            log::warn!("trash project {id} failed: {err}");
+            return;
+        }
+        self.strip.update(|strip| {
+            for tab in &mut strip.tabs {
+                let stale = matches!(tab.current, Route::Project(project) if project == id)
+                    || matches!(tab.current, Route::ProjectEditor(Some(project)) if project == id);
+                if stale {
+                    tab.navigate(Route::Tasks);
+                }
+            }
+        });
+        self.bump();
+    }
+
+    pub fn restore_project(&self, id: i64) {
+        if let Err(err) = self.workspace.with(|ws| ws.restore_project(id)) {
+            log::warn!("restore project {id} failed: {err}");
+        }
+        self.bump();
+    }
+
+    /// Permanently deletes a trashed Project: its Tasks are detached and
+    /// its Milestones deleted, while Knowledge Bases and Documents stay
+    /// (ADR-0001).
+    pub fn delete_project_permanent(&self, id: i64) {
+        if let Err(err) = self
+            .workspace
+            .with(|ws| ws.delete_project_permanent(id))
+        {
+            log::warn!("delete project {id} failed: {err}");
+        }
+        self.bump();
+    }
+
+    /// The Task List sub-view's quick-add: creates a `todo` Task in the
+    /// Project. Returns the new task id.
+    pub fn create_project_task(&self, project_id: i64, title: &str) -> Option<i64> {
+        let title = title.trim();
+        if title.is_empty() {
+            return None;
+        }
+        let result = self.workspace.with(|ws| {
+            ws.create_task(&NewTask {
+                title: title.to_owned(),
+                project_id: Some(project_id),
+                ..Default::default()
+            })
+        });
+        match result {
+            Ok(aggregate) => {
+                self.bump();
+                Some(aggregate.task.id)
+            }
+            Err(err) => {
+                log::warn!("create project task failed: {err}");
+                None
+            }
+        }
+    }
+
+    /// The kanban card's move: sets a Task's status (recording the
+    /// completion time on `done`).
+    pub fn set_task_status(&self, id: i64, status: crate::domain::TaskStatus) {
+        if let Err(err) = self.workspace.with(|ws| {
+            ws.update_task(id, &TaskPatch { status: Some(status), ..Default::default() })
+        }) {
+            log::warn!("set task {id} status failed: {err}");
+        }
+        self.bump();
+    }
+
+    pub fn create_milestone(
+        &self,
+        project_id: i64,
+        title: &str,
+        target_date: Option<LocalDate>,
+    ) -> bool {
+        let title = title.trim();
+        if title.is_empty() {
+            return false;
+        }
+        match self
+            .workspace
+            .with(|ws| ws.create_milestone(project_id, title, target_date))
+        {
+            Ok(_) => {
+                self.bump();
+                true
+            }
+            Err(err) => {
+                log::warn!("create milestone failed: {err}");
+                false
+            }
+        }
+    }
+
+    pub fn delete_milestone(&self, milestone_id: i64) {
+        if let Err(err) = self.workspace.with(|ws| ws.delete_milestone(milestone_id)) {
+            log::warn!("delete milestone {milestone_id} failed: {err}");
+        }
+        self.bump();
+    }
+
+    /// The Linked Documents view's creation: places the new Document
+    /// under the linked grouping node, or at the top of the linked
+    /// book's root (ADR-0001). Returns the new document id.
+    pub fn create_document_for_project(&self, project_id: i64, title: &str) -> Option<i64> {
+        let title = title.trim();
+        if title.is_empty() {
+            return None;
+        }
+        let result = self
+            .workspace
+            .with(|ws| ws.create_document_for_project(project_id, title));
+        match result {
+            Ok(doc) => {
+                self.bump();
+                Some(doc.id)
+            }
+            Err(err) => {
+                log::warn!("create project document failed: {err}");
+                None
+            }
+        }
+    }
+
+    /// The Linked Documents view remembers which Document is open, per
+    /// tab (like the Today view's selected date).
+    pub fn set_project_section(&self, section: super::tabs::ProjectSection) {
+        self.strip.update(|strip| strip.set_project_section(section));
+    }
+
+    pub fn set_project_document(&self, document: Option<i64>) {
+        self.strip.update(|strip| strip.set_project_document(document));
+    }
+
+    /// The Project sub-view one tab currently shows.
+    pub fn project_section_of(&self, tab_id: u64) -> ProjectSection {
+        self.strip
+            .with(|strip| {
+                strip
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == tab_id)
+                    .map(|tab| tab.project_section)
+            })
+            .unwrap_or_default()
+    }
+
+    /// The Document open inside the tab's Linked Documents sub-view.
+    pub fn project_document_of(&self, tab_id: u64) -> Option<i64> {
+        self.strip.with(|strip| {
+            strip
+                .tabs
+                .iter()
+                .find(|tab| tab.id == tab_id)
+                .and_then(|tab| tab.project_doc)
+        })
+    }
+
+    /// Opens the Project editor (create when `editing` is None).
+    pub fn open_project_editor(&self, editing: Option<i64>) {
+        self.open_or_focus(Route::ProjectEditor(editing));
+    }
+
     /// Opens a book's home (focus-or-reuse, like every sidebar entry).
     pub fn open_book(&self, id: i64) {
         self.open_or_focus(Route::Book(id));
@@ -867,13 +1233,15 @@ impl Store {
     /// force the outer sidebar into its icon rail: a window under
     /// 1440 px showing an inner-catalog destination. The strip read is
     /// tracked: bindings that ask re-run when the active tab changes.
+    /// A Project counts only while its Linked Documents sub-view shows.
     pub fn sidebar_auto_collapsed(&self) -> bool {
         let strip = self.strip.get();
         nsh_core::prelude::window().width.0 < 1440.0
-            && strip
-                .tabs
-                .get(strip.active)
-                .is_some_and(|tab| tab.current.has_inner_catalog())
+            && strip.tabs.get(strip.active).is_some_and(|tab| match &tab.current {
+                Route::Book(_) | Route::Document(_) => true,
+                Route::Project(_) => tab.project_section == ProjectSection::Documents,
+                _ => false,
+            })
     }
 
     /// The sidebar's effective width state for the current window and

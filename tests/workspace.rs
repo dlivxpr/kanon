@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use nsh_app_kanon::domain::{
     FixedClock, KnowledgeBasePatch, LocalDate, LocalDateTime, LocalTime, NewTask, Priority,
-    ProjectFilter, ProjectPatch, TaskFilter, TaskPatch, TaskSort, TaskStatus, Workspace,
-    WorkspaceError, count_words,
+    ProjectBinding, ProjectFilter, ProjectPatch, TaskFilter, TaskPatch, TaskSort, TaskStatus,
+    Workspace, WorkspaceError, count_words,
 };
 
 fn at(text: &str) -> Arc<FixedClock> {
@@ -1190,4 +1190,33 @@ fn project_tasks_lists_every_assignment_in_status_order() {
     assert_eq!(titles, vec!["待办", "进行中"], "status order, other projects excluded");
     assert_eq!(tasks[1].task.milestone_id, Some(milestone.id));
     assert_eq!(tasks.len(), 2);
+}
+
+#[test]
+fn create_project_with_binding_resolves_the_node_book_and_creates_a_same_named_book() {
+    let (mut ws, _path, _clock) = workspace_at("proj-create-binding", "2026-11-20 09:00");
+    let book = ws.create_knowledge_base("手册").expect("book");
+    let group = ws.create_catalog_node(book.id, None, "第一章").expect("group");
+
+    // Binding a node stores the node's book alongside.
+    let bound = ws
+        .create_project_with_binding("节点项目", "#547093", "📌", ProjectBinding::Node(group.id))
+        .expect("project");
+    assert_eq!(bound.linked_book_id, Some(book.id));
+    assert_eq!(bound.linked_group_node_id, Some(group.id));
+
+    // One-click: the same-named Knowledge Base is created with the project.
+    let made = ws
+        .create_project_with_binding("同名项目", "#547093", "📌", ProjectBinding::NewBook)
+        .expect("project");
+    let named = ws.knowledge_bases().expect("shelf").into_iter().find(|kb| kb.name == "同名项目");
+    assert!(named.is_some(), "the same-named book exists");
+    assert_eq!(made.linked_book_id, named.map(|kb| kb.id));
+    assert_eq!(ws.knowledge_bases().expect("shelf").len(), 2);
+
+    // Refused bindings: missing book, trashed book, trashed node.
+    assert!(ws.create_project_with_binding("坏", "#547093", "📌", ProjectBinding::Book(999)).is_err());
+    ws.trash_knowledge_base(book.id).expect("trash book");
+    assert!(ws.create_project_with_binding("坏", "#547093", "📌", ProjectBinding::Book(book.id)).is_err());
+    assert!(ws.create_project_with_binding("坏", "#547093", "📌", ProjectBinding::Node(group.id)).is_err());
 }

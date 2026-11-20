@@ -198,6 +198,18 @@ pub struct ProjectDocsTarget {
     pub group_node_id: Option<i64>,
 }
 
+/// How a new Project binds its Knowledge Base (ADR-0001): not at all, to
+/// a whole existing book, to one grouping Catalog Node (its book is
+/// resolved and stored alongside), or one-click to a brand-new
+/// same-named Knowledge Base created atomically with the Project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectBinding {
+    None,
+    Book(i64),
+    Node(i64),
+    NewBook,
+}
+
 /// A Quick Note (GLOSSARY).
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuickNote {
@@ -1579,6 +1591,70 @@ impl Workspace {
         })
     }
 
+    /// Creates a Project together with its binding choice, atomically
+    /// (ADR-0001). `ProjectBinding::Node` resolves and stores the node's
+    /// book; `NewBook` creates the same-named Knowledge Base first, so a
+    /// failure cannot leave an orphaned book behind.
+    pub fn create_project_with_binding(
+        &mut self,
+        name: &str,
+        color: &str,
+        emoji: &str,
+        binding: ProjectBinding,
+    ) -> Result<Project> {
+        let (linked_book_id, linked_group_node_id) = match binding {
+            ProjectBinding::None => (None, None),
+            ProjectBinding::Book(book_id) => {
+                let trashed: Option<bool> = self
+                    .conn
+                    .query_row(
+                        "SELECT trashed_at IS NOT NULL FROM knowledge_bases WHERE id = ?",
+                        params![book_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                match trashed {
+                    None => {
+                        return Err(WorkspaceError::InvalidOperation(format!(
+                            "no knowledge base {book_id}"
+                        )));
+                    }
+                    Some(true) => {
+                        return Err(WorkspaceError::InvalidOperation(format!(
+                            "knowledge base {book_id} is in Trash"
+                        )));
+                    }
+                    Some(false) => {}
+                }
+                (Some(book_id), None)
+            }
+            ProjectBinding::Node(node_id) => {
+                let node = self.catalog_node(node_id)?.ok_or_else(|| {
+                    WorkspaceError::InvalidOperation(format!("no catalog node {node_id}"))
+                })?;
+                if self.catalog_node_is_trashed(node_id)? {
+                    return Err(WorkspaceError::InvalidOperation(format!(
+                        "catalog node {node_id} is in Trash"
+                    )));
+                }
+                (Some(node.book_id), Some(node_id))
+            }
+            ProjectBinding::NewBook => {
+                let now = self.stamp();
+                let tx = self.conn.transaction()?;
+                tx.execute(
+                    "INSERT INTO knowledge_bases (name, created_at, updated_at, sort_order) \
+                     VALUES (?, ?, ?, (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM knowledge_bases))",
+                    params![name, now, now],
+                )?;
+                let book_id = tx.last_insert_rowid();
+                tx.commit()?;
+                (Some(book_id), None)
+            }
+        };
+        self.create_project(name, color, emoji, linked_book_id, linked_group_node_id)
+    }
+
     /// All non-trashed Projects.
     pub fn projects(&self) -> Result<Vec<Project>> {
         let mut stmt = self
@@ -1710,6 +1786,55 @@ impl Workspace {
         tx.execute("DELETE FROM projects WHERE id = ?", params![id])?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Binds an existing Project to a brand-new same-named Knowledge
+    /// Base, atomically (ADR-0001's one-click binding).
+    pub fn bind_new_book(&mut self, project_id: i64) -> Result<Project> {
+        let project = self
+            .project(project_id)?
+            .ok_or_else(|| WorkspaceError::InvalidDateTime(format!("no project {project_id}")))?;
+        let now = self.stamp();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO knowledge_bases (name, created_at, updated_at, sort_order) \
+             VALUES (?, ?, ?, (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM knowledge_bases))",
+            params![project.name, now, now],
+        )?;
+        let book_id = tx.last_insert_rowid();
+        tx.execute(
+            "UPDATE projects SET linked_book_id = ?, linked_group_node_id = NULL, updated_at = ? WHERE id = ?",
+            params![book_id, now, project_id],
+        )?;
+        tx.commit()?;
+        self.project(project_id)?.ok_or_else(|| WorkspaceError::InvalidDateTime(format!("no project {project_id}")))
+    }
+
+    /// How many non-trashed Documents live in the Project's linked scope
+    /// (the whole book, or the grouping node's subtree) — the Overview's
+    /// 关联文档 metric.
+    pub fn project_document_count(&self, project_id: i64) -> Result<usize> {
+        let Some(target) = self.project_document_target(project_id)? else { return Ok(0) };
+        let count = match target.group_node_id {
+            Some(node_id) => self.conn.query_row(
+                "WITH RECURSIVE subtree(id) AS ( \
+                    SELECT id FROM catalog_nodes WHERE id = :id \
+                    UNION ALL \
+                    SELECT child.id FROM catalog_nodes child JOIN subtree ON child.parent_id = subtree.id \
+                 ) \
+                 SELECT COUNT(*) FROM documents \
+                 WHERE trashed_at IS NULL AND id IN \
+                 (SELECT document_id FROM catalog_nodes WHERE id IN (SELECT id FROM subtree) AND document_id IS NOT NULL)",
+                &[(":id", &node_id)],
+                |row| row.get::<_, i64>(0),
+            )?,
+            None => self.conn.query_row(
+                "SELECT COUNT(*) FROM documents WHERE book_id = ? AND trashed_at IS NULL",
+                params![target.book_id],
+                |row| row.get::<_, i64>(0),
+            )?,
+        };
+        Ok(count as usize)
     }
 
     /// Resolves where a Project's Documents live (ADR-0001): the linked
