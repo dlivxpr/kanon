@@ -7,7 +7,7 @@
 use nsh_base::{button, theme};
 use nsh_core::prelude::*;
 
-use crate::domain::{Task, TaskAggregate, TaskStatus};
+use crate::domain::{TaskAggregate, TaskStatus};
 use crate::ui::controls::{chip, list_row, overdue_badge, task_circle};
 use crate::ui::theme as tokens;
 
@@ -18,14 +18,18 @@ pub fn task_row(store: Store, aggregate: TaskAggregate) -> impl IntoElement {
     let id = aggregate.task.id;
     let row_title = aggregate.task.title.clone();
     let circle_title = aggregate.task.title.clone();
-    let overdue = aggregate.task.is_overdue_at(store.now());
-    let project = aggregate.project.clone();
-    let tags = aggregate.tags.clone();
-    let (done_subs, total_subs) = Task::subtask_progress(&aggregate.subtasks);
-    let scheduled_time = aggregate.task.scheduled_time;
-    let due_date = aggregate.task.due_date;
-    let due_time = aggregate.task.due_time;
-    let priority = aggregate.task.priority;
+    // Live lookups: the row must follow every workspace change (circle
+    // toggle, scheduling, triage) instead of the snapshot it was built
+    // from — the surrounding list keeps rows by key.
+    let live = move || store.task(id);
+    let overdue = move || live().is_some_and(|a| a.task.is_overdue_at(store.now()));
+    let scheduled_time = move || live().and_then(|a| a.task.scheduled_time);
+    let due = move || live().map(|a| (a.task.due_date, a.task.due_time));
+    let project = move || live().and_then(|a| a.project);
+    let subtasks = move || live().map(|a| a.subtasks).unwrap_or_default();
+    let high_priority =
+        move || live().is_some_and(|a| a.task.priority == crate::domain::Priority::High);
+    let tags = move || live().map(|a| a.tags).unwrap_or_default();
     list_row()
         .items_start()
         .pt_3()
@@ -56,11 +60,11 @@ pub fn task_row(store: Store, aggregate: TaskAggregate) -> impl IntoElement {
                                 .child(
                                     text(row_title.clone())
                                         .text_size(px(14.0))
-                                        .text_color(tokens::fg_primary())
+                                        .text_color(move || tokens::fg_primary())
                                         .number_of_lines(1),
                                 ),
                         )
-                        .child(when(move || overdue, overdue_badge))
+                        .child(when(overdue, overdue_badge))
                         .child(when(
                             move || {
                                 store.task(id).is_some_and(|a| a.task.status == TaskStatus::Doing)
@@ -81,45 +85,57 @@ pub fn task_row(store: Store, aggregate: TaskAggregate) -> impl IntoElement {
                         .items_center()
                         .gap_2()
                         .flex_wrap()
-                        .child(when(scheduled_time.is_some(), move || {
-                            text(scheduled_time.map(|t| t.to_string()).unwrap_or_default())
-                                .text_size(px(11.0))
-                                .text_color(tokens::fg_muted())
+                        .child(when(move || scheduled_time().is_some(), move || {
+                            text(move || {
+                                scheduled_time().map(|t| t.to_string()).unwrap_or_default()
+                            })
+                            .text_size(px(11.0))
+                            .text_color(tokens::fg_muted())
                         }))
                         .child(when(
-                            due_date.is_some(),
+                            move || due().is_some_and(|(date, _)| date.is_some()),
                             move || {
-                                let due = due_date.map(|d| d.to_string()).unwrap_or_default();
-                                let time = due_time.map(|t| format!(" {}", t)).unwrap_or_default();
-                                text(format!("截止 {due}{time}"))
-                                    .text_size(px(11.0))
-                                    .text_color(move || {
-                                        if overdue { tokens::accent() } else { tokens::fg_muted() }
-                                    })
+                                text(move || {
+                                    let (date, time) = due().unwrap_or_default();
+                                    let due = date.map(|d| d.to_string()).unwrap_or_default();
+                                    let time = time.map(|t| format!(" {t}")).unwrap_or_default();
+                                    format!("截止 {due}{time}")
+                                })
+                                .text_size(px(11.0))
+                                .text_color(move || {
+                                    if overdue() { tokens::accent() } else { tokens::fg_muted() }
+                                })
                             },
                         ))
-                        .child(when(project.is_some(), move || {
-                            let project = project.clone().expect("checked above");
+                        .child(when(move || project().is_some(), move || {
+                            let name = project().map(|project| project.name).unwrap_or_default();
                             view()
                                 .flex_row()
                                 .items_center()
                                 .gap_1()
                                 .child(view().size(px(7.0)).rounded_full().bg(theme().primary))
-                                .child(text(project.name).text_size(px(11.0)).text_color(tokens::fg_muted()))
+                                .child(text(name).text_size(px(11.0)).text_color(tokens::fg_muted()))
                         }))
-                        .child(when(total_subs > 0, move || {
-                            text(format!("子任务 {done_subs}/{total_subs}"))
-                                .text_size(px(11.0))
-                                .text_color(tokens::fg_muted())
+                        .child(when(move || !subtasks().is_empty(), move || {
+                            text(move || {
+                                let subtasks = subtasks();
+                                let done = subtasks.iter().filter(|subtask| subtask.done).count();
+                                format!("子任务 {done}/{}", subtasks.len())
+                            })
+                            .text_size(px(11.0))
+                            .text_color(tokens::fg_muted())
                         }))
-                        .child(when(priority == crate::domain::Priority::High, || {
+                        .child(when(high_priority, || {
                             text("高优先级").text_size(px(11.0)).text_color(tokens::warning())
                         }))
-                        .children(
-                            tags.iter()
-                                .map(|tag| chip(format!("#{}", tag.name)).into_element())
-                                .collect::<Vec<_>>(),
-                        ),
+                        .child(dynamic(move || {
+                            view().flex_row().items_center().gap_1().children(
+                                tags()
+                                    .into_iter()
+                                    .map(|tag| chip(format!("#{}", tag.name)).into_element())
+                                    .collect::<Vec<_>>(),
+                            )
+                        })),
                 ),
         )
 }

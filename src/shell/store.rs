@@ -19,7 +19,8 @@ pub const PREF_SIDEBAR_COLLAPSED: &str = "sidebar_collapsed";
 pub const PREF_PANEL_OPEN: &str = "context_panel_open";
 
 /// The single-editor lock (issue #6): at most one workbench tab holds
-/// edit ownership at a time, for any Document.
+/// edit ownership FOR a given document_id; locks for different
+/// Documents coexist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EditorLock {
     pub tab_id: u64,
@@ -61,9 +62,11 @@ pub struct Store {
     pub panel_open: Signal<bool>,
     /// The Task shown in the right context panel's Task Detail.
     pub selected_task: Signal<Option<i64>>,
-    /// Which tab (if any) currently owns the single editor lock, and for
-    /// which Document.
-    pub editor_lock: Signal<Option<EditorLock>>,
+    /// Which tab (if any) currently owns the single editor lock for
+    /// which Document. One entry per editing tab: ownership is scoped
+    /// to a `document_id`, so an edit session for one Document never
+    /// blocks editing another.
+    pub editor_lock: Signal<Vec<EditorLock>>,
     /// The reading tab's latest outline-jump request.
     pub outline_request: Signal<Option<OutlineRequest>>,
 }
@@ -88,7 +91,7 @@ impl Store {
             sidebar_temp_expand: signal(false),
             panel_open: signal(panel_open),
             selected_task: signal(None),
-            editor_lock: signal(None),
+            editor_lock: signal(Vec::new()),
             outline_request: signal(None),
         }
     }
@@ -102,30 +105,36 @@ impl Store {
     }
 
     pub fn tasks_for_date(&self, date: LocalDate) -> Vec<TaskAggregate> {
+        self.bump.get();
         self.workspace
             .with(|ws| ws.tasks_for_date(date).unwrap_or_default())
     }
 
     pub fn task(&self, id: i64) -> Option<TaskAggregate> {
+        self.bump.get();
         self.workspace.with(|ws| ws.task(id).unwrap_or_default())
     }
 
     pub fn task_groups(&self) -> TaskGroups {
+        self.bump.get();
         self.workspace
             .with(|ws| ws.task_groups().unwrap_or_default())
     }
 
     pub fn inbox_count(&self) -> usize {
+        self.bump.get();
         self.workspace
             .with(|ws| ws.inbox_count().unwrap_or_default())
     }
 
     pub fn upcoming_tasks(&self) -> Vec<TaskAggregate> {
+        self.bump.get();
         self.workspace
             .with(|ws| ws.upcoming_tasks().unwrap_or_default())
     }
 
     pub fn projects(&self) -> Vec<crate::domain::Project> {
+        self.bump.get();
         self.workspace.with(|ws| ws.projects().unwrap_or_default())
     }
 
@@ -224,6 +233,7 @@ impl Store {
     }
 
     pub fn carryover_count(&self) -> usize {
+        self.bump.get();
         self.workspace
             .with(|ws| ws.carryover_count().unwrap_or_default())
     }
@@ -571,7 +581,15 @@ impl Store {
                     _ => false,
                 };
                 if stale {
+                    let open_doc = match &tab.current {
+                        Route::Document(doc) => Some(*doc),
+                        _ => None,
+                    };
                     tab.navigate(Route::KnowledgeBases);
+                    tab.purge_route(&Route::Book(id));
+                    if let Some(doc) = open_doc {
+                        tab.purge_route(&Route::Document(doc));
+                    }
                 }
             }
         });
@@ -748,7 +766,12 @@ impl Store {
                     if visible == Some(false)
                         && let Some(book_id) = book
                     {
+                        let doc_id = *doc_id;
                         tab.navigate(Route::Book(book_id));
+                        // The fallback targets the book home, and the
+                        // trashed document's own route must not lurk in
+                        // Back.
+                        tab.purge_route(&Route::Document(doc_id));
                     }
                 }
             }
@@ -801,6 +824,9 @@ impl Store {
                     && let Some(tab) = strip.tabs.iter_mut().find(|tab| tab.id == tab_id)
                 {
                     tab.navigate(Route::Book(book_id));
+                    // The deleted document's route must not resurface
+                    // through Back.
+                    tab.purge_route(&Route::Document(doc_id));
                 }
             }
         });
@@ -870,6 +896,8 @@ impl Store {
                     || matches!(tab.current, Route::ProjectEditor(Some(project)) if project == id);
                 if stale {
                     tab.navigate(Route::Tasks);
+                    tab.purge_route(&Route::Project(id));
+                    tab.purge_route(&Route::ProjectEditor(Some(id)));
                 }
             }
         });
@@ -1111,49 +1139,59 @@ impl Store {
 
     /// The Document's history, newest first.
     pub fn document_revisions(&self, id: i64) -> Vec<DocumentRevision> {
+        self.bump.get();
         self.workspace
             .with(|ws| ws.document_revisions(id).unwrap_or_default())
     }
 
     /// Answers a tab's Edit request under the single-editor invariant:
-    /// grant the lock when it is free or already this tab's, otherwise
-    /// name the tab the requester must focus.
+    /// at most one tab holds edit ownership FOR THIS DOCUMENT (issue
+    /// #6). Grant the lock when it is free or already this tab's; when
+    /// another tab edits this Document, name the tab the requester must
+    /// focus. A lock on a different Document never blocks this request.
     pub fn request_edit(&self, tab_id: u64, document_id: i64) -> EditOutcome {
-        match self.editor_lock.get_untracked() {
-            Some(lock) if lock.tab_id == tab_id && lock.document_id == document_id => {
-                EditOutcome::Granted
-            }
+        match self
+            .editor_lock
+            .get_untracked()
+            .iter()
+            .find(|lock| lock.document_id == document_id)
+        {
+            Some(lock) if lock.tab_id == tab_id => EditOutcome::Granted,
             Some(lock) => EditOutcome::FocusOther(lock.tab_id),
             None => {
-                self.editor_lock.set(Some(EditorLock {
-                    tab_id,
-                    document_id,
-                }));
+                self.editor_lock
+                    .update(|locks| locks.push(EditorLock { tab_id, document_id }));
                 EditOutcome::Granted
             }
         }
     }
 
-    /// Whether any tab is editing right now (reading tabs lock their
-    /// Checklist Items while this holds).
-    pub fn editing_locked(&self) -> bool {
-        self.editor_lock.get_untracked().is_some()
+    /// Whether an edit session for this Document is active. Reading
+    /// tabs of the same Document lock their Checklist Items while it
+    /// holds; other Documents' sessions are irrelevant to them.
+    pub fn editing_locked(&self, document_id: i64) -> bool {
+        self.editor_lock
+            .get()
+            .iter()
+            .any(|lock| lock.document_id == document_id)
     }
 
     /// Ends the tab's edit session: records the finish-to-read transition
     /// as an automatic history snapshot, then frees the lock. No-op when
-    /// the tab does not hold the lock.
+    /// the tab does not hold a lock.
     pub fn release_editor(&self, tab_id: u64, snapshot: bool) {
-        let Some(lock) = self.editor_lock.get_untracked() else {
-            return;
-        };
-        if lock.tab_id != tab_id {
-            return;
-        }
+        let lock = self
+            .editor_lock
+            .get_untracked()
+            .iter()
+            .copied()
+            .find(|lock| lock.tab_id == tab_id);
+        let Some(lock) = lock else { return };
         if snapshot {
             self.take_snapshot(lock.document_id);
         }
-        self.editor_lock.set(None);
+        self.editor_lock
+            .update(|locks| locks.retain(|held| held.tab_id != tab_id));
     }
 
     /// The unmount cleanup of `editing_view`: the edit session ends only
@@ -1161,12 +1199,13 @@ impl Store {
     /// to another tab unmounts the view too, but the lock belongs to the
     /// tab — it must survive so the editor keeps ownership.
     pub fn release_editor_if_route_left(&self, tab_id: u64, snapshot: bool) {
-        let Some(lock) = self.editor_lock.get_untracked() else {
-            return;
-        };
-        if lock.tab_id != tab_id {
-            return;
-        }
+        let lock = self
+            .editor_lock
+            .get_untracked()
+            .iter()
+            .copied()
+            .find(|lock| lock.tab_id == tab_id);
+        let Some(lock) = lock else { return };
         let still_on_document = self.strip.with_untracked(|strip| {
             strip.tabs.iter().any(|tab| {
                 tab.id == tab_id

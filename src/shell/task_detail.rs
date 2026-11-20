@@ -39,7 +39,8 @@ pub fn task_detail(store: Store, id: i64) -> impl IntoElement {
             .child(status_segmented(store, id, aggregate))
             .child(priority_segmented(store, id, aggregate))
             .child(scheduling_section(store, id, aggregate))
-            .child(project_row(aggregate))
+            .child(project_section(store, id, aggregate))
+            .child(milestone_section(store, id, aggregate))
             .child(subtasks_section(store, id, aggregate))
             .child(tags_section(store, id, aggregate))
             .child(memo_field(store, id, aggregate))
@@ -175,28 +176,31 @@ fn segmented(
 }
 
 /// Scheduled and Due editors: independent date and optional time fields.
+/// The drafts follow external writes (Carryover, another view) unless
+/// the user has diverged from the last committed value.
 fn scheduling_section(store: Store, id: i64, aggregate: Detail) -> impl IntoElement {
-    let initial = aggregate.get();
     view()
         .flex_col()
         .gap_3()
         .child(date_time_editor(
             store,
             id,
+            aggregate,
             "排期",
             "排期日 (YYYY-MM-DD)",
-            initial.as_ref().and_then(|a| a.task.scheduled_date),
-            initial.as_ref().and_then(|a| a.task.scheduled_time),
+            |task| task.scheduled_date,
+            |task| task.scheduled_time,
             |date| TaskPatch { scheduled_date: Some(date), ..Default::default() },
             |time| TaskPatch { scheduled_time: Some(time), ..Default::default() },
         ))
         .child(date_time_editor(
             store,
             id,
+            aggregate,
             "截止",
             "截止日 (YYYY-MM-DD)",
-            initial.as_ref().and_then(|a| a.task.due_date),
-            initial.as_ref().and_then(|a| a.task.due_time),
+            |task| task.due_date,
+            |task| task.due_time,
             |date| TaskPatch { due_date: Some(date), ..Default::default() },
             |time| TaskPatch { due_time: Some(time), ..Default::default() },
         ))
@@ -206,18 +210,51 @@ fn scheduling_section(store: Store, id: i64, aggregate: Detail) -> impl IntoElem
 fn date_time_editor(
     store: Store,
     id: i64,
+    aggregate: Detail,
     label: &'static str,
     date_placeholder: &'static str,
-    date: Option<LocalDate>,
-    time: Option<LocalTime>,
+    date_of: fn(&crate::domain::Task) -> Option<LocalDate>,
+    time_of: fn(&crate::domain::Task) -> Option<LocalTime>,
     date_patch: fn(Option<LocalDate>) -> TaskPatch,
     time_patch: fn(Option<LocalTime>) -> TaskPatch,
 ) -> impl IntoElement {
     // Drafts keep partial typing ("2026-11-") editable; a valid value
     // commits, an invalid one waits for more input. The clear button
     // rewrites both drafts alongside the store.
-    let date_draft = signal(date.map(|d| d.to_string()).unwrap_or_default());
-    let time_draft = signal(time.map(|t| t.to_string()).unwrap_or_default());
+    let initial = aggregate.get();
+    let date_draft = signal(initial.as_ref().map(|a| date_of(&a.task)).unwrap_or_default().map(|d| d.to_string()).unwrap_or_default());
+    let time_draft = signal(initial.as_ref().map(|a| time_of(&a.task)).unwrap_or_default().map(|t| t.to_string()).unwrap_or_default());
+    // External writes refresh the drafts while they still agree with the
+    // previously committed value; a draft the user diverged from (a
+    // partial edit) is left alone.
+    let date_seen = signal(initial.as_ref().map(|a| date_of(&a.task)).unwrap_or_default());
+    let time_seen = signal(initial.as_ref().map(|a| time_of(&a.task)).unwrap_or_default());
+    effect(move || {
+        let committed = store.task(id).map(|a| date_of(&a.task)).unwrap_or_default();
+        if committed == date_seen.get() {
+            return;
+        }
+        let draft = date_draft.get_untracked();
+        let matches_seen = LocalDate::parse(draft.trim()) == date_seen.get()
+            || (draft.trim().is_empty() && date_seen.get().is_none());
+        date_seen.set(committed);
+        if matches_seen {
+            date_draft.set(committed.map(|d| d.to_string()).unwrap_or_default());
+        }
+    });
+    effect(move || {
+        let committed = store.task(id).map(|a| time_of(&a.task)).unwrap_or_default();
+        if committed == time_seen.get() {
+            return;
+        }
+        let draft = time_draft.get_untracked();
+        let matches_seen = LocalTime::parse(draft.trim()) == time_seen.get()
+            || (draft.trim().is_empty() && time_seen.get().is_none());
+        time_seen.set(committed);
+        if matches_seen {
+            time_draft.set(committed.map(|t| t.to_string()).unwrap_or_default());
+        }
+    });
     let date_label = format!("{label}日");
     let time_label = format!("{label}时间");
     view()
@@ -292,24 +329,111 @@ fn date_time_editor(
         )
 }
 
-fn project_row(aggregate: Detail) -> impl IntoElement {
+/// The Project selector: assigning a Project moves the Task out of the
+/// Inbox (issue #4); `无项目` returns it there.
+fn project_section(store: Store, id: i64, aggregate: Detail) -> impl IntoElement {
+    let options = move || {
+        store.bump.get();
+        let mut options = vec![("无项目".to_owned(), None)];
+        options.extend(store.projects().into_iter().map(|project| (project.name, Some(project.id))));
+        options
+    };
     view()
         .flex_col()
         .gap_1()
         .child(section_heading("项目"))
-        .child(dynamic(move || {
-            let project = aggregate.get().and_then(|a| a.project);
-            match project {
-                Some(project) => view()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .child(view().size(px(8.0)).rounded_full().bg(theme().primary))
-                    .child(text(project.name).text_size(px(13.0)).text_color(tokens::fg_body()))
-                    .into_element(),
-                None => view().into_element(),
-            }
-        }))
+        .child(each(
+            options,
+            |(_, project): &(String, Option<i64>)| *project,
+            move |option, _index| {
+                let current = aggregate.get().and_then(|a| a.task.project_id);
+                let name = option.with(|(name, _)| name.clone());
+                let project = option.with(|(_, project)| *project);
+                let selected = current == project;
+                option_chip(name, selected, move || {
+                    store.update_task(id, &TaskPatch { project_id: Some(project), ..Default::default() });
+                })
+                .into_element()
+            },
+        ))
+}
+
+/// The Milestone selector: the Milestones of the Task's current
+/// Project; `无里程碑` clears the reference.
+fn milestone_section(store: Store, id: i64, aggregate: Detail) -> impl IntoElement {
+    let options = move || {
+        store.bump.get();
+        let mut options = vec![("无里程碑".to_owned(), None)];
+        let project_id = aggregate.get().and_then(|a| a.task.project_id);
+        if let Some(project_id) = project_id {
+            options.extend(
+                store
+                    .milestones(project_id)
+                    .into_iter()
+                    .map(|milestone| (milestone.title, Some(milestone.id))),
+            );
+        }
+        options
+    };
+    view()
+        .flex_col()
+        .gap_1()
+        .child(section_heading("里程碑"))
+        .child(when(
+            move || aggregate.get().and_then(|a| a.task.project_id).is_none(),
+            move || {
+                text("先关联项目，再选择里程碑")
+                    .text_size(px(11.0))
+                    .text_color(tokens::fg_muted())
+            },
+        ))
+        .child(when(
+            move || aggregate.get().and_then(|a| a.task.project_id).is_some(),
+            move || {
+                each(
+                    options,
+                    |(_, milestone): &(String, Option<i64>)| *milestone,
+                    move |option, _index| {
+                        let current = aggregate.get().and_then(|a| a.task.milestone_id);
+                        let title = option.with(|(title, _)| title.clone());
+                        let milestone = option.with(|(_, milestone)| *milestone);
+                        let selected = current == milestone;
+                        option_chip(title, selected, move || {
+                            store.update_task(
+                                id,
+                                &TaskPatch { milestone_id: Some(milestone), ..Default::default() },
+                            );
+                        })
+                        .into_element()
+                    },
+                )
+            },
+        ))
+}
+
+/// One option of the Project/Milestone selectors: a small toggle chip.
+fn option_chip(
+    name: String,
+    selected: bool,
+    on_press: impl Fn() + 'static,
+) -> nsh_base::ButtonElement {
+    button()
+        .on_press(move |_: &()| on_press())
+        .accessibility_label(Some(format!("选择 {name}").into()))
+        .h(px(26.0))
+        .px_2()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .border_1()
+        .border_color(move || if selected { tokens::accent() } else { tokens::border_default() })
+        .bg(move || {
+            if selected { tokens::accent_soft() } else { theme().background.opacity(0.0) }
+        })
+        .text_color(move || if selected { tokens::accent() } else { tokens::fg_body() })
+        .hover(|s| s.bg(tokens::control_bg()))
+        .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
+        .child(text(name).text_size(px(12.0)))
 }
 
 fn subtasks_section(store: Store, id: i64, aggregate: Detail) -> impl IntoElement {

@@ -73,7 +73,7 @@ pub fn reading_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
         .flex_1()
         .min_h(px(0.0))
         .flex_col()
-        .child(lock_banner(store, tab_id))
+        .child(lock_banner(store, tab_id, document_id))
         .child(reading_header(store, tab_id, document_id, history_open))
         .child(
             view()
@@ -106,7 +106,7 @@ pub fn reading_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
                                     let session = build_session(
                                         &body,
                                         NodeViews::new()
-                                            .with("taskItem", Arc::new(ReadingTaskItem { store }))
+                                            .with("taskItem", Arc::new(ReadingTaskItem { store, document_id }))
                                             .with(CARD_NODE, Arc::new(TaskCardView { store }))
                                             .with(
                                                 super::kanon::MENTION_NODE,
@@ -145,14 +145,17 @@ pub fn reading_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
         .into_element()
 }
 
-/// The slim notice while another tab edits: reading tabs stay synced but
-/// their Checklist Items lock read-only, with the jump to the editor.
-fn lock_banner(store: Store, tab_id: u64) -> impl IntoElement {
+/// The slim notice while another tab edits this Document: reading tabs
+/// stay synced but their Checklist Items lock read-only, with the jump
+/// to the editor. Edit sessions for OTHER Documents do not lock this
+/// tab (ownership is per document_id, issue #6).
+fn lock_banner(store: Store, tab_id: u64, document_id: i64) -> impl IntoElement {
     let locked_elsewhere = move || {
         store
             .editor_lock
             .get()
-            .is_some_and(|lock| lock.tab_id != tab_id)
+            .iter()
+            .any(|lock| lock.tab_id != tab_id && lock.document_id == document_id)
     };
     when(locked_elsewhere, move || {
         view()
@@ -169,7 +172,12 @@ fn lock_banner(store: Store, tab_id: u64) -> impl IntoElement {
             )
             .child(
                 app_button(ButtonKind::Ghost, "跳到编辑标签", move || {
-                    if let Some(lock) = store.editor_lock.get_untracked() {
+                    let editor = store
+                        .editor_lock
+                        .get_untracked()
+                        .into_iter()
+                        .find(|lock| lock.document_id == document_id);
+                    if let Some(lock) = editor {
                         store.activate_tab_by_id(lock.tab_id);
                     }
                 })
@@ -279,18 +287,22 @@ fn word_count_bar(store: Store, document_id: i64) -> impl IntoElement {
 
 struct ReadingTaskItem {
     store: Store,
+    document_id: i64,
 }
 
 impl NodeView for ReadingTaskItem {
     fn create(&self, cx: &NodeViewCx, _node: &Node) -> AnyElement {
         let store = self.store;
+        let document_id = self.document_id;
         let session = cx.session.clone();
         let pos = cx.get_pos();
         let node = cx.node();
         let checked = move || {
             node.with(|node| node.attrs().get("checked").and_then(Value::as_bool) == Some(true))
         };
-        let locked = move || store.editing_locked();
+        // Only an edit session of THIS Document locks the Checklist
+        // Items (single-editor ownership is per document_id, issue #6).
+        let locked = move || store.editing_locked(document_id);
         view()
             .flex_row()
             .items_start()
@@ -301,7 +313,7 @@ impl NodeView for ReadingTaskItem {
                     .checked(checked)
                     .disabled(locked)
                     .on_change(move |next: &bool| {
-                        if store.editing_locked() {
+                        if store.editing_locked(document_id) {
                             return;
                         }
                         let Some(pos) = pos() else { return };

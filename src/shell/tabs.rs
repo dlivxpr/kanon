@@ -186,6 +186,15 @@ impl Tab {
     pub fn can_forward(&self) -> bool {
         !self.future.is_empty()
     }
+
+    /// Drops every back/forward entry pointing at `route`. Trash and
+    /// permanent-delete fallbacks navigate away from the doomed
+    /// destination; without the purge, Back would happily reopen it
+    /// (spec: a trashed Project cannot be opened).
+    pub fn purge_route(&mut self, route: &Route) {
+        self.past.retain(|entry| entry != route);
+        self.future.retain(|entry| entry != route);
+    }
 }
 
 /// The tab-strip rules: opening, closing, pinning, and the sidebar's

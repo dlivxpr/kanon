@@ -730,12 +730,11 @@ pub fn catalog_sidebar(
                         .child(each(
                             visible,
                             |entry: &CatalogEntry| entry.node.id,
-                            move |entry, index| {
+                            move |entry, _index| {
                                 catalog_row(
                                     CatalogCtx { store, focus, nav, filter, pending, located },
                                     entry,
-                                    index,
-                                    move || visible.get(),
+                                    move || outline(),
                                 )
                             },
                         )),
@@ -958,17 +957,18 @@ fn book_switcher(store: Store, book_id: i64) -> nsh_base::MenuElement {
 fn catalog_row(
     ctx: CatalogCtx,
     entry: ReadSignal<CatalogEntry>,
-    index: ReadSignal<usize>,
-    visible: impl Fn() -> Vec<CatalogEntry> + Copy + 'static,
+    outline: impl Fn() -> Vec<CatalogEntry> + Copy + 'static,
 ) -> impl IntoElement {
     let CatalogCtx { store, focus, nav, filter, pending, located } = ctx;
     let node_id = move || entry.with(|entry| entry.node.id);
     let is_document = move || entry.with(|entry| entry.node.document_id.is_some());
     let depth = move || entry.with(|entry| entry.depth);
+    // Children exist in the FULL outline. `visible` hides collapsed
+    // subtrees, so judging by it drops the caret the moment a node
+    // collapses — and then it can never re-expand.
     let has_children = move || {
-        let list = visible();
-        let index = index.get();
-        matches!((list.get(index), list.get(index + 1)), (Some(a), Some(b)) if b.depth == a.depth + 1)
+        let id = node_id();
+        outline().iter().any(|entry| entry.node.parent_id == Some(id))
     };
     let filtering = move || !filter.get().is_empty();
     let expanded = move || entry.with(|entry| entry.node.expanded);

@@ -39,7 +39,8 @@ pub fn document_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEl
         store
             .editor_lock
             .get()
-            .is_some_and(|lock| lock.tab_id == tab_id && lock.document_id == document_id)
+            .iter()
+            .any(|lock| lock.tab_id == tab_id && lock.document_id == document_id)
     };
     dynamic(move || {
         // Only the lock selects the chrome; building the content reads

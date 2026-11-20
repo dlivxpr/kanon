@@ -312,6 +312,44 @@ fn inbox_badge_counts_strict_inbox_tasks_and_triage_updates_it() -> Result<(), S
 }
 
 #[test]
+fn assigning_a_project_from_task_detail_empties_the_inbox_and_milestones_follow() -> Result<(), String> {
+    use nsh_app_kanon::domain::NewTask;
+    let path = temp_db("project-assign-ui");
+    seed(&path, "2026-11-20 09:00", |ws| {
+        let project = ws.create_project("Kanon", "#547093", "🚀", None, None).expect("project");
+        ws.create_milestone(project.id, "首发", None).expect("milestone");
+        ws.create_task(&NewTask { title: "整理发票".to_owned(), ..Default::default() }).unwrap();
+    });
+    let mut app = start(&path, "2026-11-20 09:00");
+    app.wait_for("今天")?;
+    app.wait_for("label:收件箱 1 项任务")?;
+
+    // Assign the Project from Task Detail: the Task leaves the Inbox
+    // (issue #4), and the Project's Milestones become selectable.
+    app.press("打开任务 整理发票")?;
+    app.wait_for("任务详情")?;
+    app.wait_for("选择 Kanon")?;
+    app.press("选择 Kanon")?;
+    app.wait_for("label:收件箱 0 项任务")?;
+    app.wait_for("选择 首发")?;
+    app.press("选择 首发")?;
+
+    // The assignments survive a restart.
+    drop(app);
+    let mut app = start(&path, "2026-11-20 09:30");
+    app.wait_for("今天")?;
+    app.press("id:sidebar-project >> nth=0")?;
+    app.wait_for("id:project-view")?;
+    app.press("任务列表")?;
+    app.wait_for("打开任务 整理发票")?;
+    app.press("打开任务 整理发票")?;
+    app.wait_for("任务详情")?;
+    app.wait_for("选择 首发")?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[test]
 fn catalog_inserts_at_the_top_nests_children_and_filters() -> Result<(), String> {
     let path = temp_db("kb-catalog");
     let mut app = start_sized(&path, "2026-11-20 09:00", 1440.0);
@@ -570,6 +608,32 @@ fn catalog_locates_the_current_document() -> Result<(), String> {
         "locate expanded the chain to the current document"
     );
 
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[test]
+fn collapsing_a_catalog_node_keeps_the_caret_for_reexpanding() -> Result<(), String> {
+    let path = temp_db("catalog-reexpand-ui");
+    let mut app = start_sized(&path, "2026-11-20 09:00", 1440.0);
+    create_book(&mut app, "折叠规则")?;
+    create_top_document(&mut app, "父文档")?;
+
+    // Nest a child under it.
+    app.press("新建子文档 >> nth=0")?;
+    app.type_text("text:在「父文档」下新建文档，回车创建", "子文档")?;
+    app.press("id:catalog-create")?;
+    app.wait_for("id:catalog-tree >> text:子文档")?;
+
+    // Collapse: the child hides but the caret must stay — otherwise the
+    // node can never re-expand.
+    app.press("收起 父文档")?;
+    app.wait_for_gone("id:catalog-tree >> text:子文档", Duration::from_secs(2))?;
+    app.wait_for("展开 父文档")?;
+
+    // Re-expand: the child comes back.
+    app.press("展开 父文档")?;
+    app.wait_for("id:catalog-tree >> text:子文档")?;
     let _ = std::fs::remove_file(path);
     Ok(())
 }
@@ -1403,6 +1467,52 @@ fn mention_chips_degrade_while_the_target_sits_in_trash_and_recover_on_restore(
     Ok(())
 }
 
+#[test]
+fn edit_ownership_is_per_document_and_does_not_lock_other_reading_tabs() -> Result<(), String> {
+    let path = temp_db("lock-per-doc-ui");
+    seed(&path, "2026-11-20 09:00", |ws| {
+        let book = ws.create_knowledge_base("手册").expect("kb");
+        ws.create_document(book.id, None, "文档一").expect("d1");
+        ws.create_document(book.id, None, "文档二").expect("d2");
+    });
+    let mut app = start(&path, "2026-11-20 09:00");
+
+    // Tab 1 edits 文档一.
+    app.wait_for("今天")?;
+    app.press("id:nav-知识库")?;
+    app.wait_for("全部知识库")?;
+    app.press("打开知识库 手册")?;
+    app.wait_for("id:catalog-tree")?;
+    app.press("id:catalog-tree >> text:文档一")?;
+    app.wait_for("编辑")?;
+    app.press("编辑")?;
+    app.wait_for("完成")?;
+
+    // Pin it, then open 文档二 in a second tab.
+    app.press("固定标签页 >> nth=0")?;
+    app.press("id:catalog-tree >> text:文档二")?;
+    app.wait_for("编辑")?;
+
+    // 文档二's reading tab is NOT locked by 文档一's edit session: the
+    // banner stays away (ownership is per document_id, issue #6).
+    assert!(
+        !tree_shows(&app, "此文档正在其他标签页编辑 · 清单项已锁定"),
+        "another document's edit session does not lock this reading tab"
+    );
+
+    // Requesting Edit for 文档二 is granted instead of focusing tab 1:
+    // the editing chrome of 文档二 shows in this tab.
+    app.press("编辑")?;
+    app.wait_for("完成")?;
+    let texts = visible_texts(&app);
+    assert!(
+        texts.iter().any(|text| text == "文档二"),
+        "the second tab edits its own document: {texts:?}"
+    );
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------
 // Projects (issue #8, ADR-0001)
 // ---------------------------------------------------------------------
@@ -1603,6 +1713,38 @@ fn documents_created_from_linked_documents_land_in_the_linked_scope() -> Result<
 }
 
 #[test]
+fn switching_linked_documents_replaces_the_canvas() -> Result<(), String> {
+    let path = temp_db("proj-doc-switch-ui");
+    seed(&path, "2026-11-20 09:00", |ws| {
+        let book = ws.create_knowledge_base("手册").expect("kb");
+        let group = ws.create_catalog_node(book.id, None, "第一章").expect("group");
+        let first = ws.create_document(book.id, Some(group.id), "文档甲").expect("d1");
+        let second = ws.create_document(book.id, Some(group.id), "文档乙").expect("d2");
+        ws.save_document(first.id, "文档甲", "甲的正文内容").expect("body");
+        ws.save_document(second.id, "文档乙", "乙的正文内容").expect("body");
+        ws.create_project("分组项目", "#547093", "📌", Some(book.id), Some(group.id))
+            .expect("project");
+    });
+    let mut app = start_sized(&path, "2026-11-20 09:00", 1440.0);
+
+    app.wait_for("今天")?;
+    app.press("id:sidebar-project >> nth=0")?;
+    app.wait_for("id:project-view")?;
+    app.press("关联文档")?;
+    app.wait_for("id:catalog-tree")?;
+
+    // Open 文档甲 inside the sub-view, then switch to 文档乙: the
+    // canvas follows (a `when` branch would have kept the first one).
+    app.press("id:catalog-tree >> text:文档甲")?;
+    app.wait_for("甲的正文内容")?;
+    app.press("id:catalog-tree >> text:文档乙")?;
+    app.wait_for("乙的正文内容")?;
+    app.wait_for_gone("text:甲的正文内容", Duration::from_secs(2))?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[test]
 fn trashing_a_project_keeps_its_tasks_visible_and_restore_is_lossless() -> Result<(), String> {
     let path = temp_db("proj-trash-ui");
     seed(&path, "2026-11-20 09:00", |ws| {
@@ -1625,6 +1767,11 @@ fn trashing_a_project_keeps_its_tasks_visible_and_restore_is_lossless() -> Resul
 
     // The task stays visible in the regular task views (ADR-0001).
     app.wait_for("收尾任务")?;
+
+    // Back cannot reopen the trashed Project: its route was purged from
+    // the tab history, so the step lands on the previous destination.
+    app.press("←")?;
+    app.wait_for_gone("项目菜单", Duration::from_secs(2))?;
 
     // Restore from the Trash screen; the task never lost its assignment.
     app.press("id:nav-回收站")?;

@@ -288,12 +288,11 @@ fn task_list(store: Store, day: Memo<LocalDate>) -> impl IntoElement {
                 )
             },
         ))
-        .child(dynamic(move || {
-            view().flex_col().gap(px(2.0)).children(
-                list.get()
-                    .into_iter()
-                    .map(|aggregate| super::shell::task_row::task_row(store, aggregate).into_element())
-                    .collect::<Vec<_>>(),
-            )
-        }))
+        .child(each(
+            list,
+            |aggregate: &crate::domain::TaskAggregate| aggregate.task.id,
+            move |aggregate, _index| {
+                super::shell::task_row::task_row(store, aggregate.with(|a| a.clone())).into_element()
+            },
+        ))
 }

@@ -292,14 +292,13 @@ fn group_section(
                                 .text_color(tokens::fg_muted()),
                         ),
                 )
-                .child(dynamic(move || {
-                    view().flex_col().gap(px(2.0)).children(
-                        items()
-                            .into_iter()
-                            .map(|aggregate| task_row(store, aggregate).into_element())
-                            .collect::<Vec<_>>(),
-                    )
-                }))
+                .child(each(
+                    items,
+                    |aggregate: &crate::domain::TaskAggregate| aggregate.task.id,
+                    move |aggregate, _index| {
+                        task_row(store, aggregate.with(|a| a.clone())).into_element()
+                    },
+                ))
         },
     ))
 }

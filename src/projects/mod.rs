@@ -138,7 +138,11 @@ fn project_header(store: Store, project_id: i64) -> impl IntoElement {
                 .flex_row()
                 .items_center()
                 .gap_3()
-                .child(
+                .child(dynamic(move || {
+                    // A `when` branch is built only when its condition flips;
+                    // the filled width must re-derive from `progress()` on every
+                    // workspace change, so the bar is a dynamic region.
+                    let (done, total) = progress();
                     view()
                         .flex_1()
                         .min_w(px(0.0))
@@ -148,9 +152,8 @@ fn project_header(store: Store, project_id: i64) -> impl IntoElement {
                         .rounded_full()
                         .bg(tokens::control_bg())
                         .child(when(
-                            move || progress().0 > 0,
+                            move || done > 0,
                             move || {
-                                let (done, total) = progress();
                                 view()
                                     .h_full()
                                     .rounded_full()
@@ -158,8 +161,8 @@ fn project_header(store: Store, project_id: i64) -> impl IntoElement {
                                     .flex_grow(done as f32)
                                     .child(view().flex_grow((total - done) as f32))
                             },
-                        )),
-                )
+                        ))
+                }))
                 .child(
                     text(move || {
                         let (done, total) = progress();
@@ -1014,10 +1017,6 @@ fn linked_documents(store: Store, tab_id: u64, project_id: i64) -> impl IntoElem
     let narrow = move || window().width.0 < NARROW_BREAKPOINT;
     let drawer = signal(false);
     let on_close = move || drawer.set(false);
-    let focus = move || match visible_document(store, tab_id) {
-        Some(doc_id) => CatalogFocus::Document(doc_id),
-        None => CatalogFocus::Home,
-    };
     view()
         .flex_1()
         .min_w(px(0.0))
@@ -1026,16 +1025,27 @@ fn linked_documents(store: Store, tab_id: u64, project_id: i64) -> impl IntoElem
         .child(when(
             move || !narrow(),
             move || {
-                kb::catalog_sidebar(
-                    store,
-                    target_book(store, project_id),
-                    focus(),
-                    false,
-                    on_close,
-                    nav(store, project_id),
+                each(
+                    move || vec![linked_catalog_key(store, tab_id, project_id)],
+                    |key: &(i64, Option<i64>, Option<i64>)| *key,
+                    move |key, _index| {
+                        let (book_id, group_node, doc) = key.get();
+                        kb::catalog_sidebar(
+                            store,
+                            book_id,
+                            match doc {
+                                Some(doc) => CatalogFocus::Document(doc),
+                                None => CatalogFocus::Home,
+                            },
+                            false,
+                            on_close,
+                            CatalogNav::Project { linked_node: group_node },
+                        )
+                        .w(px(kb::CATALOG_W))
+                        .test_id("catalog-inline")
+                        .into_element()
+                    },
                 )
-                .w(px(kb::CATALOG_W))
-                .test_id("catalog-inline")
             },
         ))
         .child(
@@ -1056,11 +1066,11 @@ fn linked_documents(store: Store, tab_id: u64, project_id: i64) -> impl IntoElem
                             drawer.set(true);
                         }))
                 }))
-                .child(when(
-                    move || visible_document(store, tab_id).is_some(),
-                    move || match visible_document(store, tab_id) {
-                        Some(doc_id) => kb::document_view(store, tab_id, doc_id).into_element(),
-                        None => view().into_element(),
+                .child(each(
+                    move || visible_document(store, tab_id).into_iter().collect::<Vec<_>>(),
+                    |doc_id: &i64| *doc_id,
+                    move |doc_id, _index| {
+                        kb::document_view(store, tab_id, doc_id.get()).into_element()
                     },
                 ))
                 .child(when(
@@ -1082,21 +1092,49 @@ fn linked_documents(store: Store, tab_id: u64, project_id: i64) -> impl IntoElem
                                     .accessibility_label("关闭目录"),
                             )
                             .child(
-                                kb::catalog_sidebar(
-                                    store,
-                                    target_book(store, project_id),
-                                    focus(),
-                                    true,
-                                    on_close,
-                                    nav(store, project_id),
+                                each(
+                                    move || vec![linked_catalog_key(store, tab_id, project_id)],
+                                    |key: &(i64, Option<i64>, Option<i64>)| *key,
+                                    move |key, _index| {
+                                        let (book_id, group_node, doc) = key.get();
+                                        kb::catalog_sidebar(
+                                            store,
+                                            book_id,
+                                            match doc {
+                                                Some(doc) => CatalogFocus::Document(doc),
+                                                None => CatalogFocus::Home,
+                                            },
+                                            true,
+                                            on_close,
+                                            CatalogNav::Project { linked_node: group_node },
+                                        )
+                                        .w(px(kb::CATALOG_W))
+                                        .shadow_lg()
+                                        .test_id("catalog-overlay")
+                                        .into_element()
+                                    },
                                 )
-                                .w(px(kb::CATALOG_W))
-                                .shadow_lg()
-                                .test_id("catalog-overlay"),
                             )
                     },
                 )),
         )
+}
+
+/// The keyed identity of the Linked Documents chrome: the binding
+/// target (book + grouping node) and the open document. The sidebar and
+/// the canvas rebuild when — and only when — this identity changes
+/// (switching documents inside the sub-view, rebinding): a `when`
+/// branch would bake the first visible document until the condition
+/// flips back.
+fn linked_catalog_key(
+    store: Store,
+    tab_id: u64,
+    project_id: i64,
+) -> (i64, Option<i64>, Option<i64>) {
+    let target = store.project_document_target(project_id);
+    let book_id = target.map(|target| target.book_id).unwrap_or_default();
+    let group_node = target.and_then(|target| target.group_node_id);
+    (book_id, group_node, visible_document(store, tab_id))
 }
 
 /// The document open in this tab's Linked Documents sub-view, when it
@@ -1109,20 +1147,6 @@ fn visible_document(store: Store, tab_id: u64) -> Option<i64> {
         return None;
     }
     Some(doc_id)
-}
-
-fn target_book(store: Store, project_id: i64) -> i64 {
-    store
-        .project_document_target(project_id)
-        .map(|target| target.book_id)
-        .unwrap_or_default()
-}
-
-fn nav(store: Store, project_id: i64) -> CatalogNav {
-    match store.project_document_target(project_id) {
-        Some(target) => CatalogNav::Project { linked_node: target.group_node_id },
-        None => CatalogNav::Book,
-    }
 }
 
 /// The Linked Documents landing: where new documents land and a button
