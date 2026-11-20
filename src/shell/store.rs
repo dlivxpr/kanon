@@ -138,12 +138,14 @@ impl Store {
 
     /// A Project's Milestones in display order.
     pub fn milestones(&self, project_id: i64) -> Vec<crate::domain::Milestone> {
+        self.bump.get();
         self.workspace
             .with(|ws| ws.milestones(project_id).unwrap_or_default())
     }
 
     /// Every non-trashed Task assigned to the Project, in status order.
     pub fn project_tasks(&self, project_id: i64) -> Vec<TaskAggregate> {
+        self.bump.get();
         self.workspace
             .with(|ws| ws.project_tasks(project_id).unwrap_or_default())
     }

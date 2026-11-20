@@ -35,7 +35,10 @@ const EMOJIS: &[&str] = &["📌", "🚀", "🎯", "🛠", "🌱", "📦"];
 
 /// The Project page: header, sub-view switch, and the active sub-view.
 pub fn project_view(store: Store, tab_id: u64, project_id: i64) -> impl IntoElement {
-    let section = move || store.project_section_of(tab_id);
+    // The sub-view lives on the tab; the computed re-runs on every strip
+    // change and the dynamic rebuilds the content only when the section
+    // actually changes (docs/ui-design.md §4.3).
+    let section = computed(move || store.project_section_of(tab_id));
     view()
         .flex_1()
         .min_w(px(0.0))
@@ -58,19 +61,19 @@ pub fn project_view(store: Store, tab_id: u64, project_id: i64) -> impl IntoElem
                     .min_h(px(0.0))
                     .flex_col()
                     .child(project_header(store, project_id))
-                    .child(sub_view_switch(store, section))
+                    .child(sub_view_switch(store, move || section.get()))
                     .child(
                         view()
                             .flex_1()
                             .min_h(px(0.0))
-                            .child(match section() {
+                            .child(dynamic(move || match section.get() {
                                 ProjectSection::Overview => overview(store, project_id).into_element(),
                                 ProjectSection::Tasks => task_list(store, project_id).into_element(),
                                 ProjectSection::Board => board(store, project_id).into_element(),
                                 ProjectSection::Documents => {
                                     documents(store, tab_id, project_id).into_element()
                                 }
-                            }),
+                            })),
                     )
             },
         ))
@@ -774,7 +777,7 @@ fn board_card(
                                 .number_of_lines(2),
                         ),
                 )
-                .child(card_move_menu(store, id, current)),
+                .child(card_move_menu(store, id, current, title)),
         )
         .child(
             view()
@@ -806,7 +809,12 @@ fn board_card(
 }
 
 /// The card's move menu: every status but the current one.
-fn card_move_menu(store: Store, task_id: i64, current: TaskStatus) -> impl IntoElement {
+fn card_move_menu(
+    store: Store,
+    task_id: i64,
+    current: TaskStatus,
+    title: String,
+) -> impl IntoElement {
     let targets = [
         TaskStatus::Todo,
         TaskStatus::Doing,
@@ -825,7 +833,20 @@ fn card_move_menu(store: Store, task_id: i64, current: TaskStatus) -> impl IntoE
                 .shadow_md()
                 .w(px(160.0))
         })
-        .trigger(panel_icon_button("⋯", "移动卡片", || {}))
+        .trigger(
+            nsh_base::button()
+                .accessibility_label(Some(format!("移动 {}", title).into()))
+                .size(px(26.0))
+                .items_center()
+                .justify_center()
+                .rounded(move || theme().radius)
+                .bg(move || theme().background.opacity(0.0))
+                .text_color(tokens::fg_muted())
+                .hover(|s| s.bg(tokens::control_hover()).text_color(tokens::fg_primary()))
+                .active(|s| s.opacity(0.7))
+                .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
+                .child(text("⋯").text_size(px(13.0))),
+        )
         .children(
             targets
                 .into_iter()
@@ -1039,7 +1060,7 @@ fn linked_documents(store: Store, tab_id: u64, project_id: i64) -> impl IntoElem
                     move || visible_document(store, tab_id).is_some(),
                     move || match visible_document(store, tab_id) {
                         Some(doc_id) => kb::document_view(store, tab_id, doc_id).into_element(),
-                        None => landing(store, project_id).into_element(),
+                        None => view().into_element(),
                     },
                 ))
                 .child(when(
@@ -1396,7 +1417,6 @@ fn binding_section(
 
 /// The book dropdown for the WholeBook/Node modes.
 fn book_picker(store: Store, book_sel: Signal<Option<i64>>) -> impl IntoElement {
-    let books = move || store.knowledge_bases();
     let label = move || {
         book_sel
             .get()
@@ -1431,30 +1451,29 @@ fn book_picker(store: Store, book_sel: Signal<Option<i64>>) -> impl IntoElement 
                     .child(text(label).text_size(px(13.0)).flex_1())
                     .child(text("▾").text_size(px(11.0)).text_color(tokens::fg_muted())),
             )
-            .children(
-                books()
-                    .into_iter()
-                    .map(|kb| {
-                        let id = kb.id;
-                        menu_item()
-                            .on_select(move || book_sel.set(Some(id)))
-                            .px_3()
-                            .py_2()
-                            .rounded(tokens::radius_row())
-                            .hover(|s| s.bg(tokens::control_hover()))
-                            .child(
-                                text(kb.name)
-                                    .text_size(px(13.0))
-                                    .text_color(tokens::fg_primary()),
-                            )
-                    })
-                    .collect::<Vec<_>>(),
-            ),
+            .child(each(
+                move || store.knowledge_bases(),
+                |kb: &crate::domain::KnowledgeBase| kb.id,
+                move |kb, _index| {
+                    menu_item()
+                        .on_select(move || book_sel.set(Some(kb.with(|kb| kb.id))))
+                        .px_3()
+                        .py_2()
+                        .rounded(tokens::radius_row())
+                        .hover(|s| s.bg(tokens::control_hover()))
+                        .child(
+                            text(move || kb.with(|kb| kb.name.clone()))
+                                .text_size(px(13.0))
+                                .text_color(tokens::fg_primary()),
+                        )
+                },
+            )),
     )
 }
 
 /// The grouping-node dropdown of the chosen book (flattened with depth
-/// indentation; only pure grouping nodes can bind a Project).
+/// indentation; only pure grouping nodes can bind a Project). The list
+/// binds to `book_sel` so choosing a book refreshes the popup.
 fn node_picker(
     store: Store,
     book_sel: Signal<Option<i64>>,
@@ -1516,32 +1535,29 @@ fn node_picker(
                         .py_2()
                 },
             ))
-            .children(
-                nodes()
-                    .into_iter()
-                    .map(|entry| {
-                        let id = entry.node.id;
-                        let indent = entry.depth;
-                        menu_item()
-                            .on_select(move || node_sel.set(Some(id)))
-                            .px_3()
-                            .py_2()
-                            .rounded(tokens::radius_row())
-                            .hover(|s| s.bg(tokens::control_hover()))
-                            .child(
-                                view()
-                                    .flex_row()
-                                    .items_center()
-                                    .pl(move || px(indent as f32 * 12.0))
-                                    .child(
-                                        text(entry.node.title)
-                                            .text_size(px(13.0))
-                                            .text_color(tokens::fg_primary()),
-                                    ),
-                            )
-                    })
-                    .collect::<Vec<_>>(),
-            ),
+            .child(each(
+                nodes,
+                |entry: &crate::domain::CatalogEntry| entry.node.id,
+                move |entry, _index| {
+                    menu_item()
+                        .on_select(move || node_sel.set(Some(entry.with(|entry| entry.node.id))))
+                        .px_3()
+                        .py_2()
+                        .rounded(tokens::radius_row())
+                        .hover(|s| s.bg(tokens::control_hover()))
+                        .child(
+                            view()
+                                .flex_row()
+                                .items_center()
+                                .pl(move || px(entry.with(|entry| entry.depth as f32 * 12.0)))
+                                .child(
+                                    text(move || entry.with(|entry| entry.node.title.clone()))
+                                        .text_size(px(13.0))
+                                        .text_color(tokens::fg_primary()),
+                                ),
+                        )
+                },
+            )),
     )
 }
 

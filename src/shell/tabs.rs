@@ -138,7 +138,10 @@ impl Tab {
 
     /// Navigates to a new destination, pushing the current one on the
     /// back stack and clearing the forward stack. Navigating to the
-    /// current destination is a no-op (no history noise).
+    /// current destination is a no-op (no history noise). The per-tab
+    /// Project state belongs to the Project the tab was showing; any
+    /// real navigation resets it (the focus-or-reuse rule keeps it when
+    /// a sidebar click re-selects the same Project).
     pub fn navigate(&mut self, route: Route) {
         if route == self.current {
             return;
@@ -146,6 +149,8 @@ impl Tab {
         self.past.push(self.current.clone());
         self.current = route;
         self.future.clear();
+        self.project_section = ProjectSection::default();
+        self.project_doc = None;
     }
 
     /// Steps back in this tab's own history. Returns false at the oldest
@@ -413,6 +418,12 @@ mod tests {
         assert_eq!(strip.active, 0);
         assert_eq!(strip.active_tab().project_section, ProjectSection::Documents);
         assert_eq!(strip.active_tab().project_doc, Some(9));
+
+        // Navigating away (or to another Project) resets the per-tab
+        // state: it belonged to the Project the tab was showing.
+        strip.navigate_active(Route::Project(7));
+        assert_eq!(strip.active_tab().project_section, ProjectSection::Overview);
+        assert_eq!(strip.active_tab().project_doc, None);
     }
 
     #[test]
