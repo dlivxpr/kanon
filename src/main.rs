@@ -11,9 +11,13 @@ use nsh_platform_windows as platform;
 fn main() -> impl std::process::Termination {
     env_logger::init();
     platform::run_app(
-        platform::AppSource::Rust(platform::Root::new::<nsh_app_kanon::App>(|| {
-            nsh_app_kanon::AppProps::desktop()
-        })),
+        platform::AppSource::Rust(
+            platform::Root::new::<nsh_app_kanon::App>(nsh_app_kanon::AppProps::desktop).tokens(
+                nsh_base::Theme::from_json(include_str!("../theme.json"))
+                    .expect("nsh.json: theme")
+                    .into_tokens(),
+            ),
+        ),
         platform::AppOptions {
             title: "kanon".to_owned(),
             #[cfg(target_os = "windows")]

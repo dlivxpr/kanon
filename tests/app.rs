@@ -312,13 +312,21 @@ fn inbox_badge_counts_strict_inbox_tasks_and_triage_updates_it() -> Result<(), S
 }
 
 #[test]
-fn assigning_a_project_from_task_detail_empties_the_inbox_and_milestones_follow() -> Result<(), String> {
+fn assigning_a_project_from_task_detail_empties_the_inbox_and_milestones_follow()
+-> Result<(), String> {
     use nsh_app_kanon::domain::NewTask;
     let path = temp_db("project-assign-ui");
     seed(&path, "2026-11-20 09:00", |ws| {
-        let project = ws.create_project("Kanon", "#547093", "🚀", None, None).expect("project");
-        ws.create_milestone(project.id, "首发", None).expect("milestone");
-        ws.create_task(&NewTask { title: "整理发票".to_owned(), ..Default::default() }).unwrap();
+        let project = ws
+            .create_project("Kanon", "#547093", "🚀", None, None)
+            .expect("project");
+        ws.create_milestone(project.id, "首发", None)
+            .expect("milestone");
+        ws.create_task(&NewTask {
+            title: "整理发票".to_owned(),
+            ..Default::default()
+        })
+        .unwrap();
     });
     let mut app = start(&path, "2026-11-20 09:00");
     app.wait_for("今天")?;
@@ -1116,7 +1124,8 @@ fn checklist_item_promotes_to_a_linked_task_card_and_undo_keeps_the_task() -> Re
     seed(&path, "2026-11-20 09:00", |ws| {
         let book = ws.create_knowledge_base("手册").expect("kb");
         let doc = ws.create_document(book.id, None, "周报").expect("doc");
-        ws.save_document(doc.id, "周报", "- [ ] 写周报").expect("seed body");
+        ws.save_document(doc.id, "周报", "- [ ] 写周报")
+            .expect("seed body");
     });
     let mut app = start(&path, "2026-11-20 09:00");
     open_seeded_document(&mut app, "周报")?;
@@ -1133,7 +1142,10 @@ fn checklist_item_promotes_to_a_linked_task_card_and_undo_keeps_the_task() -> Re
     // The Linked Task Card renders the created Task live; the Inbox
     // badge counts it.
     app.wait_for("打开任务 写周报")?;
-    assert!(!circle_checked(&app, "完成 写周报"), "the card starts unchecked");
+    assert!(
+        !circle_checked(&app, "完成 写周报"),
+        "the card starts unchecked"
+    );
     app.wait_for("label:收件箱 1 项任务")?;
 
     // Editor Undo after the promotion: the card reverts to a Checklist
@@ -1172,7 +1184,10 @@ fn linked_task_card_syncs_from_today_detail_and_survives_restart() -> Result<(),
         ws.save_document(
             doc.id,
             "周报",
-            &format!("{}\n\n- [ ] 普通项", nsh_app_kanon::domain::task_card_marker(task.id)),
+            &format!(
+                "{}\n\n- [ ] 普通项",
+                nsh_app_kanon::domain::task_card_marker(task.id)
+            ),
         )
         .expect("seed body");
     });
@@ -1235,7 +1250,10 @@ fn reading_tab_card_stays_checkable_while_another_tab_edits() -> Result<(), Stri
         ws.save_document(
             doc.id,
             "方案",
-            &format!("{}\n\n- [ ] 锁定项", nsh_app_kanon::domain::task_card_marker(task.id)),
+            &format!(
+                "{}\n\n- [ ] 锁定项",
+                nsh_app_kanon::domain::task_card_marker(task.id)
+            ),
         )
         .expect("seed body");
     });
@@ -1265,7 +1283,10 @@ fn reading_tab_card_stays_checkable_while_another_tab_edits() -> Result<(), Stri
     // …but its Linked Task Card stays checkable — a Task write, not a
     // Document write.
     app.press("完成 评审方案")?;
-    assert!(circle_checked(&app, "完成 评审方案"), "the card toggles from the reading tab");
+    assert!(
+        circle_checked(&app, "完成 评审方案"),
+        "the card toggles from the reading tab"
+    );
     app.wait_for("此文档正在其他标签页编辑 · 清单项已锁定")?;
 
     // The editing tab agrees without any document write of its own.
@@ -1279,17 +1300,25 @@ fn reading_tab_card_stays_checkable_while_another_tab_edits() -> Result<(), Stri
 }
 
 #[test]
-fn trashed_linked_task_card_degrades_recovers_and_stays_invalid_after_delete() -> Result<(), String> {
+fn trashed_linked_task_card_degrades_recovers_and_stays_invalid_after_delete() -> Result<(), String>
+{
     let path = temp_db("card-trash-ui");
     seed(&path, "2026-11-20 09:00", |ws| {
         let book = ws.create_knowledge_base("手册").expect("kb");
         let doc = ws.create_document(book.id, None, "周报").expect("doc");
         let task = ws
-            .create_task(&nsh_app_kanon::domain::NewTask { title: "写周报".to_owned(), ..Default::default() })
+            .create_task(&nsh_app_kanon::domain::NewTask {
+                title: "写周报".to_owned(),
+                ..Default::default()
+            })
             .expect("task")
             .task;
-        ws.save_document(doc.id, "周报", &nsh_app_kanon::domain::task_card_marker(task.id))
-            .expect("seed body");
+        ws.save_document(
+            doc.id,
+            "周报",
+            &nsh_app_kanon::domain::task_card_marker(task.id),
+        )
+        .expect("seed body");
     });
     let mut app = start(&path, "2026-11-20 09:00");
     open_seeded_document(&mut app, "周报")?;
@@ -1313,7 +1342,10 @@ fn trashed_linked_task_card_degrades_recovers_and_stays_invalid_after_delete() -
     app.wait_for("id:catalog-tree")?;
     app.press("id:catalog-tree >> text:周报")?;
     app.wait_for("完成 写周报")?;
-    assert!(!circle_checked(&app, "完成 写周报"), "the restored card is live and unchecked");
+    assert!(
+        !circle_checked(&app, "完成 写周报"),
+        "the restored card is live and unchecked"
+    );
 
     // Trash again and delete permanently: the invalid placeholder stays.
     app.press("打开任务 写周报")?;
@@ -1346,7 +1378,9 @@ fn inline_mentions_flow_and_feed_the_backlinks_panel() -> Result<(), String> {
     let path = temp_db("mention-ui");
     let (source_id, target_id) = seed(&path, "2026-11-20 09:00", |ws| {
         let book = ws.create_knowledge_base("手册").expect("kb");
-        let target = ws.create_document(book.id, None, "手册正文").expect("target");
+        let target = ws
+            .create_document(book.id, None, "手册正文")
+            .expect("target");
         let source = ws.create_document(book.id, None, "计划").expect("source");
         let body = format!(
             "前文{}后文{}",
@@ -1355,7 +1389,8 @@ fn inline_mentions_flow_and_feed_the_backlinks_panel() -> Result<(), String> {
         );
         // The editor save path indexes the references; use it in the seed
         // so the backlinks panel has rows from the start.
-        ws.update_document_body_and_references(source.id, "计划", &body, None).expect("seed body");
+        ws.update_document_body_and_references(source.id, "计划", &body, None)
+            .expect("seed body");
         (source.id, target.id)
     });
     let _ = (source_id, target_id);
@@ -1376,9 +1411,18 @@ fn inline_mentions_flow_and_feed_the_backlinks_panel() -> Result<(), String> {
         .iter()
         .find(|text| text.contains("前文") && text.contains("后文"))
         .expect("前文 and 后文 stay in one paragraph run");
-    assert!(!paragraph.contains('\n'), "no line break inside the paragraph: {paragraph:?}");
-    assert!(texts.iter().any(|text| text == "手册正文"), "the document chip shows its label: {texts:?}");
-    assert!(texts.iter().any(|text| text == "2026-11-21"), "the date chip shows its label: {texts:?}");
+    assert!(
+        !paragraph.contains('\n'),
+        "no line break inside the paragraph: {paragraph:?}"
+    );
+    assert!(
+        texts.iter().any(|text| text == "手册正文"),
+        "the document chip shows its label: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|text| text == "2026-11-21"),
+        "the date chip shows its label: {texts:?}"
+    );
     assert!(
         !texts.iter().any(|text| text.contains("已失效")),
         "live targets do not render the invalid placeholder: {texts:?}"
@@ -1416,18 +1460,21 @@ fn inline_mentions_flow_and_feed_the_backlinks_panel() -> Result<(), String> {
 }
 
 #[test]
-fn mention_chips_degrade_while_the_target_sits_in_trash_and_recover_on_restore(
-) -> Result<(), String> {
+fn mention_chips_degrade_while_the_target_sits_in_trash_and_recover_on_restore()
+-> Result<(), String> {
     let path = temp_db("mention-degrade-ui");
     seed(&path, "2026-11-20 09:00", |ws| {
         let book = ws.create_knowledge_base("手册").expect("kb");
-        let target = ws.create_document(book.id, None, "手册正文").expect("target");
+        let target = ws
+            .create_document(book.id, None, "手册正文")
+            .expect("target");
         let source = ws.create_document(book.id, None, "计划").expect("source");
         let body = format!(
             "前文{}后文",
             nsh_app_kanon::domain::mention_marker("document", &target.id.to_string(), "手册正文"),
         );
-        ws.update_document_body_and_references(source.id, "计划", &body, None).expect("seed body");
+        ws.update_document_body_and_references(source.id, "计划", &body, None)
+            .expect("seed body");
     });
     let mut app = start(&path, "2026-11-20 09:00");
 
@@ -1552,7 +1599,8 @@ fn creating_a_project_with_a_same_named_knowledge_base_lists_both() -> Result<()
     // The project view opens, bound to the fresh book.
     app.wait_for("id:project-view")?;
     app.wait_for("📚 发布会")?;
-    app.wait_for("还没有关联知识库").expect_err("bound projects skip the unbound state");
+    app.wait_for("还没有关联知识库")
+        .expect_err("bound projects skip the unbound state");
 
     // The same-named Knowledge Base exists on the shelf.
     app.press("id:nav-知识库")?;
@@ -1566,11 +1614,15 @@ fn project_sub_views_show_metrics_quick_add_milestones_and_kanban_moves() -> Res
     let path = temp_db("proj-subviews");
     seed(&path, "2026-11-20 09:00", |ws| {
         let book = ws.create_knowledge_base("手册").expect("kb");
-        let group = ws.create_catalog_node(book.id, None, "第一章").expect("group");
+        let group = ws
+            .create_catalog_node(book.id, None, "第一章")
+            .expect("group");
         let project = ws
             .create_project("改版", "#547093", "🚀", Some(book.id), Some(group.id))
             .expect("project");
-        let milestone = ws.create_milestone(project.id, "阶段一", None).expect("milestone");
+        let milestone = ws
+            .create_milestone(project.id, "阶段一", None)
+            .expect("milestone");
         let task = ws
             .create_task(&nsh_app_kanon::domain::NewTask {
                 title: "画稿".to_owned(),
@@ -1631,7 +1683,9 @@ fn project_sub_views_show_metrics_quick_add_milestones_and_kanban_moves() -> Res
 fn kanban_shows_the_cancel_column_only_while_it_holds_cards() -> Result<(), String> {
     let path = temp_db("proj-kanban-cancel");
     seed(&path, "2026-11-20 09:00", |ws| {
-        let project = ws.create_project("小项目", "#547093", "📌", None, None).expect("project");
+        let project = ws
+            .create_project("小项目", "#547093", "📌", None, None)
+            .expect("project");
         ws.create_task(&nsh_app_kanon::domain::NewTask {
             title: "任务甲".to_owned(),
             project_id: Some(project.id),
@@ -1653,7 +1707,8 @@ fn kanban_shows_the_cancel_column_only_while_it_holds_cards() -> Result<(), Stri
     app.wait_for("id:kanban-todo")?;
     app.wait_for("任务甲")?;
     app.wait_for("任务乙")?;
-    app.wait_for("id:kanban-cancel").expect_err("the cancel lane hides while empty");
+    app.wait_for("id:kanban-cancel")
+        .expect_err("the cancel lane hides while empty");
 
     // Move one card to cancel: the optional column appears with it.
     app.press("移动 任务乙")?;
@@ -1676,7 +1731,9 @@ fn documents_created_from_linked_documents_land_in_the_linked_scope() -> Result<
     let path = temp_db("proj-doc-scope");
     seed(&path, "2026-11-20 09:00", |ws| {
         let book = ws.create_knowledge_base("手册").expect("kb");
-        let group = ws.create_catalog_node(book.id, None, "第一章").expect("group");
+        let group = ws
+            .create_catalog_node(book.id, None, "第一章")
+            .expect("group");
         ws.create_project("分组项目", "#547093", "📌", Some(book.id), Some(group.id))
             .expect("project");
         ws.create_project("整本项目", "#547093", "📌", Some(book.id), None)
@@ -1717,11 +1774,19 @@ fn switching_linked_documents_replaces_the_canvas() -> Result<(), String> {
     let path = temp_db("proj-doc-switch-ui");
     seed(&path, "2026-11-20 09:00", |ws| {
         let book = ws.create_knowledge_base("手册").expect("kb");
-        let group = ws.create_catalog_node(book.id, None, "第一章").expect("group");
-        let first = ws.create_document(book.id, Some(group.id), "文档甲").expect("d1");
-        let second = ws.create_document(book.id, Some(group.id), "文档乙").expect("d2");
-        ws.save_document(first.id, "文档甲", "甲的正文内容").expect("body");
-        ws.save_document(second.id, "文档乙", "乙的正文内容").expect("body");
+        let group = ws
+            .create_catalog_node(book.id, None, "第一章")
+            .expect("group");
+        let first = ws
+            .create_document(book.id, Some(group.id), "文档甲")
+            .expect("d1");
+        let second = ws
+            .create_document(book.id, Some(group.id), "文档乙")
+            .expect("d2");
+        ws.save_document(first.id, "文档甲", "甲的正文内容")
+            .expect("body");
+        ws.save_document(second.id, "文档乙", "乙的正文内容")
+            .expect("body");
         ws.create_project("分组项目", "#547093", "📌", Some(book.id), Some(group.id))
             .expect("project");
     });
@@ -1748,7 +1813,9 @@ fn switching_linked_documents_replaces_the_canvas() -> Result<(), String> {
 fn trashing_a_project_keeps_its_tasks_visible_and_restore_is_lossless() -> Result<(), String> {
     let path = temp_db("proj-trash-ui");
     seed(&path, "2026-11-20 09:00", |ws| {
-        let project = ws.create_project("过渡项目", "#547093", "📌", None, None).expect("project");
+        let project = ws
+            .create_project("过渡项目", "#547093", "📌", None, None)
+            .expect("project");
         ws.create_task(&nsh_app_kanon::domain::NewTask {
             title: "收尾任务".to_owned(),
             project_id: Some(project.id),
@@ -1787,12 +1854,15 @@ fn trashing_a_project_keeps_its_tasks_visible_and_restore_is_lossless() -> Resul
 }
 
 #[test]
-fn permanent_project_deletion_detaches_tasks_but_preserves_the_knowledge_base() -> Result<(), String> {
+fn permanent_project_deletion_detaches_tasks_but_preserves_the_knowledge_base() -> Result<(), String>
+{
     let path = temp_db("proj-delete-ui");
     seed(&path, "2026-11-20 09:00", |ws| {
         let book = ws.create_knowledge_base("沉淀").expect("kb");
         ws.create_document(book.id, None, "纪要").expect("doc");
-        let project = ws.create_project("短项目", "#547093", "📌", Some(book.id), None).expect("project");
+        let project = ws
+            .create_project("短项目", "#547093", "📌", Some(book.id), None)
+            .expect("project");
         ws.create_task(&nsh_app_kanon::domain::NewTask {
             title: "孤儿任务".to_owned(),
             project_id: Some(project.id),
@@ -1814,7 +1884,8 @@ fn permanent_project_deletion_detaches_tasks_but_preserves_the_knowledge_base() 
     // The task survives, now without a project…
     app.press("id:nav-待办")?;
     app.wait_for("孤儿任务")?;
-    app.wait_for("text:短项目").expect_err("the row no longer names a project");
+    app.wait_for("text:短项目")
+        .expect_err("the row no longer names a project");
 
     // …and the Knowledge Base with its document is intact.
     app.press("id:nav-知识库")?;
@@ -1831,7 +1902,9 @@ fn trashing_the_linked_grouping_node_shows_the_recoverable_notice() -> Result<()
     let path = temp_db("proj-node-trash-ui");
     seed(&path, "2026-11-20 09:00", |ws| {
         let book = ws.create_knowledge_base("手册").expect("kb");
-        let group = ws.create_catalog_node(book.id, None, "第一章").expect("group");
+        let group = ws
+            .create_catalog_node(book.id, None, "第一章")
+            .expect("group");
         ws.create_project("绑定项目", "#547093", "📌", Some(book.id), Some(group.id))
             .expect("project");
     });
@@ -1861,11 +1934,14 @@ fn trashing_the_linked_grouping_node_shows_the_recoverable_notice() -> Result<()
 }
 
 #[test]
-fn permanently_deleting_the_linked_grouping_node_resets_the_project_to_unbound() -> Result<(), String> {
+fn permanently_deleting_the_linked_grouping_node_resets_the_project_to_unbound()
+-> Result<(), String> {
     let path = temp_db("proj-node-delete-ui");
     seed(&path, "2026-11-20 09:00", |ws| {
         let book = ws.create_knowledge_base("手册").expect("kb");
-        let group = ws.create_catalog_node(book.id, None, "第一章").expect("group");
+        let group = ws
+            .create_catalog_node(book.id, None, "第一章")
+            .expect("group");
         ws.create_project("绑定项目", "#547093", "📌", Some(book.id), Some(group.id))
             .expect("project");
     });
@@ -1897,8 +1973,10 @@ fn rebinding_a_project_to_a_grouping_node_scopes_new_documents() -> Result<(), S
     let path = temp_db("proj-rebind-ui");
     seed(&path, "2026-11-20 09:00", |ws| {
         let book = ws.create_knowledge_base("手册").expect("kb");
-        ws.create_catalog_node(book.id, None, "第一章").expect("group");
-        ws.create_project("未绑定", "#547093", "📌", None, None).expect("project");
+        ws.create_catalog_node(book.id, None, "第一章")
+            .expect("group");
+        ws.create_project("未绑定", "#547093", "📌", None, None)
+            .expect("project");
     });
     let mut app = start_sized(&path, "2026-11-20 09:00", 1440.0);
     open_project(&mut app)?;

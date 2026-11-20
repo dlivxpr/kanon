@@ -12,7 +12,7 @@ use nsh_core::prelude::*;
 
 use crate::domain::{LocalDate, LocalTime, Priority, TaskAggregate, TaskPatch, TaskStatus};
 use crate::ui::controls::{
-    app_button, panel_icon_button, section_heading, task_circle, ButtonKind,
+    ButtonKind, app_button, panel_icon_button, section_heading, task_circle,
 };
 use crate::ui::theme as tokens;
 
@@ -54,7 +54,11 @@ fn detail_header(store: Store, id: i64, aggregate: Detail, title: String) -> imp
         .items_center()
         .gap_2()
         .child(task_circle(
-            move || aggregate.get().is_some_and(|a| a.task.status == TaskStatus::Done),
+            move || {
+                aggregate
+                    .get()
+                    .is_some_and(|a| a.task.status == TaskStatus::Done)
+            },
             format!("完成 {title}"),
             move || store.toggle_circle(id),
         ))
@@ -69,14 +73,22 @@ fn detail_header(store: Store, id: i64, aggregate: Detail, title: String) -> imp
             .text_color(tokens::fg_muted()),
         )
         .child(view().flex_1())
-        .child(panel_icon_button("✕", "关闭任务详情", move || store.close_task()))
+        .child(panel_icon_button("✕", "关闭任务详情", move || {
+            store.close_task()
+        }))
 }
 
 fn title_field(store: Store, id: i64, aggregate: Detail) -> impl IntoElement {
     input()
         .value(move || aggregate.get().map(|a| a.task.title).unwrap_or_default())
         .on_change(move |text: &str| {
-            store.update_task(id, &TaskPatch { title: Some(text.to_owned()), ..Default::default() });
+            store.update_task(
+                id,
+                &TaskPatch {
+                    title: Some(text.to_owned()),
+                    ..Default::default()
+                },
+            );
         })
         .placeholder("任务标题")
         .placeholder_color(|| color(theme().muted_foreground))
@@ -102,12 +114,25 @@ fn status_segmented(store: Store, id: i64, aggregate: Detail) -> impl IntoElemen
                 (TaskStatus::Todo.label(), current == TaskStatus::Todo),
                 (TaskStatus::Doing.label(), current == TaskStatus::Doing),
                 (TaskStatus::Done.label(), current == TaskStatus::Done),
-                (TaskStatus::Cancelled.label(), current == TaskStatus::Cancelled),
+                (
+                    TaskStatus::Cancelled.label(),
+                    current == TaskStatus::Cancelled,
+                ),
             ],
             move |index| {
-                let status =
-                    [TaskStatus::Todo, TaskStatus::Doing, TaskStatus::Done, TaskStatus::Cancelled][index];
-                store.update_task(id, &TaskPatch { status: Some(status), ..Default::default() });
+                let status = [
+                    TaskStatus::Todo,
+                    TaskStatus::Doing,
+                    TaskStatus::Done,
+                    TaskStatus::Cancelled,
+                ][index];
+                store.update_task(
+                    id,
+                    &TaskPatch {
+                        status: Some(status),
+                        ..Default::default()
+                    },
+                );
             },
         )
         .into_element()
@@ -126,8 +151,19 @@ fn priority_segmented(store: Store, id: i64, aggregate: Detail) -> impl IntoElem
                 (Priority::High.label(), current == Priority::High),
             ],
             move |index| {
-                let priority = [Priority::None, Priority::Low, Priority::Medium, Priority::High][index];
-                store.update_task(id, &TaskPatch { priority: Some(priority), ..Default::default() });
+                let priority = [
+                    Priority::None,
+                    Priority::Low,
+                    Priority::Medium,
+                    Priority::High,
+                ][index];
+                store.update_task(
+                    id,
+                    &TaskPatch {
+                        priority: Some(priority),
+                        ..Default::default()
+                    },
+                );
             },
         )
         .into_element()
@@ -160,13 +196,25 @@ fn segmented(
                         .rounded_full()
                         .border_1()
                         .border_color(move || {
-                            if selected { tokens::accent() } else { tokens::border_default() }
+                            if selected {
+                                tokens::accent()
+                            } else {
+                                tokens::border_default()
+                            }
                         })
                         .bg(move || {
-                            if selected { tokens::accent_soft() } else { theme().background.opacity(0.0) }
+                            if selected {
+                                tokens::accent_soft()
+                            } else {
+                                theme().background.opacity(0.0)
+                            }
                         })
                         .text_color(move || {
-                            if selected { tokens::accent() } else { tokens::fg_body() }
+                            if selected {
+                                tokens::accent()
+                            } else {
+                                tokens::fg_body()
+                            }
                         })
                         .hover(|s| s.bg(tokens::control_bg()))
                         .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
@@ -190,8 +238,14 @@ fn scheduling_section(store: Store, id: i64, aggregate: Detail) -> impl IntoElem
             "排期日 (YYYY-MM-DD)",
             |task| task.scheduled_date,
             |task| task.scheduled_time,
-            |date| TaskPatch { scheduled_date: Some(date), ..Default::default() },
-            |time| TaskPatch { scheduled_time: Some(time), ..Default::default() },
+            |date| TaskPatch {
+                scheduled_date: Some(date),
+                ..Default::default()
+            },
+            |time| TaskPatch {
+                scheduled_time: Some(time),
+                ..Default::default()
+            },
         ))
         .child(date_time_editor(
             store,
@@ -201,8 +255,14 @@ fn scheduling_section(store: Store, id: i64, aggregate: Detail) -> impl IntoElem
             "截止日 (YYYY-MM-DD)",
             |task| task.due_date,
             |task| task.due_time,
-            |date| TaskPatch { due_date: Some(date), ..Default::default() },
-            |time| TaskPatch { due_time: Some(time), ..Default::default() },
+            |date| TaskPatch {
+                due_date: Some(date),
+                ..Default::default()
+            },
+            |time| TaskPatch {
+                due_time: Some(time),
+                ..Default::default()
+            },
         ))
 }
 
@@ -222,13 +282,37 @@ fn date_time_editor(
     // commits, an invalid one waits for more input. The clear button
     // rewrites both drafts alongside the store.
     let initial = aggregate.get();
-    let date_draft = signal(initial.as_ref().map(|a| date_of(&a.task)).unwrap_or_default().map(|d| d.to_string()).unwrap_or_default());
-    let time_draft = signal(initial.as_ref().map(|a| time_of(&a.task)).unwrap_or_default().map(|t| t.to_string()).unwrap_or_default());
+    let date_draft = signal(
+        initial
+            .as_ref()
+            .map(|a| date_of(&a.task))
+            .unwrap_or_default()
+            .map(|d| d.to_string())
+            .unwrap_or_default(),
+    );
+    let time_draft = signal(
+        initial
+            .as_ref()
+            .map(|a| time_of(&a.task))
+            .unwrap_or_default()
+            .map(|t| t.to_string())
+            .unwrap_or_default(),
+    );
     // External writes refresh the drafts while they still agree with the
     // previously committed value; a draft the user diverged from (a
     // partial edit) is left alone.
-    let date_seen = signal(initial.as_ref().map(|a| date_of(&a.task)).unwrap_or_default());
-    let time_seen = signal(initial.as_ref().map(|a| time_of(&a.task)).unwrap_or_default());
+    let date_seen = signal(
+        initial
+            .as_ref()
+            .map(|a| date_of(&a.task))
+            .unwrap_or_default(),
+    );
+    let time_seen = signal(
+        initial
+            .as_ref()
+            .map(|a| time_of(&a.task))
+            .unwrap_or_default(),
+    );
     effect(move || {
         let committed = store.task(id).map(|a| date_of(&a.task)).unwrap_or_default();
         if committed == date_seen.get() {
@@ -316,7 +400,9 @@ fn date_time_editor(
                         .label(time_label),
                 )
                 .child(when(
-                    move || !date_draft.get().trim().is_empty() || !time_draft.get().trim().is_empty(),
+                    move || {
+                        !date_draft.get().trim().is_empty() || !time_draft.get().trim().is_empty()
+                    },
                     move || {
                         panel_icon_button("✕", "清除日期", move || {
                             date_draft.set(String::new());
@@ -331,11 +417,16 @@ fn date_time_editor(
 
 /// The Project selector: assigning a Project moves the Task out of the
 /// Inbox (issue #4); `无项目` returns it there.
-fn project_section(store: Store, id: i64, aggregate: Detail) -> impl IntoElement {
+fn project_section(store: Store, id: i64, _aggregate: Detail) -> impl IntoElement {
     let options = move || {
         store.bump.get();
         let mut options = vec![("无项目".to_owned(), None)];
-        options.extend(store.projects().into_iter().map(|project| (project.name, Some(project.id))));
+        options.extend(
+            store
+                .projects()
+                .into_iter()
+                .map(|project| (project.name, Some(project.id))),
+        );
         options
     };
     view()
@@ -346,12 +437,19 @@ fn project_section(store: Store, id: i64, aggregate: Detail) -> impl IntoElement
             options,
             |(_, project): &(String, Option<i64>)| *project,
             move |option, _index| {
-                let current = aggregate.get().and_then(|a| a.task.project_id);
+                let current = store;
                 let name = option.with(|(name, _)| name.clone());
                 let project = option.with(|(_, project)| *project);
-                let selected = current == project;
+                // `selected` must stay a binding: the each row body runs once.
+                let selected = move || current.task(id).and_then(|a| a.task.project_id) == project;
                 option_chip(name, selected, move || {
-                    store.update_task(id, &TaskPatch { project_id: Some(project), ..Default::default() });
+                    store.update_task(
+                        id,
+                        &TaskPatch {
+                            project_id: Some(project),
+                            ..Default::default()
+                        },
+                    );
                 })
                 .into_element()
             },
@@ -360,11 +458,11 @@ fn project_section(store: Store, id: i64, aggregate: Detail) -> impl IntoElement
 
 /// The Milestone selector: the Milestones of the Task's current
 /// Project; `无里程碑` clears the reference.
-fn milestone_section(store: Store, id: i64, aggregate: Detail) -> impl IntoElement {
+fn milestone_section(store: Store, id: i64, _aggregate: Detail) -> impl IntoElement {
     let options = move || {
         store.bump.get();
         let mut options = vec![("无里程碑".to_owned(), None)];
-        let project_id = aggregate.get().and_then(|a| a.task.project_id);
+        let project_id = store.task(id).and_then(|a| a.task.project_id);
         if let Some(project_id) = project_id {
             options.extend(
                 store
@@ -380,7 +478,7 @@ fn milestone_section(store: Store, id: i64, aggregate: Detail) -> impl IntoEleme
         .gap_1()
         .child(section_heading("里程碑"))
         .child(when(
-            move || aggregate.get().and_then(|a| a.task.project_id).is_none(),
+            move || store.task(id).and_then(|a| a.task.project_id).is_none(),
             move || {
                 text("先关联项目，再选择里程碑")
                     .text_size(px(11.0))
@@ -388,20 +486,24 @@ fn milestone_section(store: Store, id: i64, aggregate: Detail) -> impl IntoEleme
             },
         ))
         .child(when(
-            move || aggregate.get().and_then(|a| a.task.project_id).is_some(),
+            move || store.task(id).and_then(|a| a.task.project_id).is_some(),
             move || {
                 each(
                     options,
                     |(_, milestone): &(String, Option<i64>)| *milestone,
                     move |option, _index| {
-                        let current = aggregate.get().and_then(|a| a.task.milestone_id);
+                        let current = store;
                         let title = option.with(|(title, _)| title.clone());
                         let milestone = option.with(|(_, milestone)| *milestone);
-                        let selected = current == milestone;
+                        let selected =
+                            move || current.task(id).and_then(|a| a.task.milestone_id) == milestone;
                         option_chip(title, selected, move || {
                             store.update_task(
                                 id,
-                                &TaskPatch { milestone_id: Some(milestone), ..Default::default() },
+                                &TaskPatch {
+                                    milestone_id: Some(milestone),
+                                    ..Default::default()
+                                },
                             );
                         })
                         .into_element()
@@ -414,9 +516,10 @@ fn milestone_section(store: Store, id: i64, aggregate: Detail) -> impl IntoEleme
 /// One option of the Project/Milestone selectors: a small toggle chip.
 fn option_chip(
     name: String,
-    selected: bool,
+    selected: impl Fn() -> bool + 'static,
     on_press: impl Fn() + 'static,
 ) -> nsh_base::ButtonElement {
+    let selected = computed(selected);
     button()
         .on_press(move |_: &()| on_press())
         .accessibility_label(Some(format!("选择 {name}").into()))
@@ -426,11 +529,27 @@ fn option_chip(
         .justify_center()
         .rounded_full()
         .border_1()
-        .border_color(move || if selected { tokens::accent() } else { tokens::border_default() })
-        .bg(move || {
-            if selected { tokens::accent_soft() } else { theme().background.opacity(0.0) }
+        .border_color(move || {
+            if selected.get() {
+                tokens::accent()
+            } else {
+                tokens::border_default()
+            }
         })
-        .text_color(move || if selected { tokens::accent() } else { tokens::fg_body() })
+        .bg(move || {
+            if selected.get() {
+                tokens::accent_soft()
+            } else {
+                theme().background.opacity(0.0)
+            }
+        })
+        .text_color(move || {
+            if selected.get() {
+                tokens::accent()
+            } else {
+                tokens::fg_body()
+            }
+        })
         .hover(|s| s.bg(tokens::control_bg()))
         .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
         .child(text(name).text_size(px(12.0)))
@@ -508,10 +627,18 @@ fn subtask_row(store: Store, subtask: crate::domain::Subtask) -> impl IntoElemen
                 .rounded(px(5.0))
                 .border_1()
                 .border_color(move || {
-                    if subtask.done { tokens::positive() } else { tokens::border_default() }
+                    if subtask.done {
+                        tokens::positive()
+                    } else {
+                        tokens::border_default()
+                    }
                 })
                 .bg(move || {
-                    if subtask.done { tokens::positive() } else { theme().background.opacity(0.0) }
+                    if subtask.done {
+                        tokens::positive()
+                    } else {
+                        theme().background.opacity(0.0)
+                    }
                 })
                 .text_color(theme().primary_foreground)
                 .child(text(move || if subtask.done { "✓" } else { "" }).text_size(px(11.0))),
@@ -537,40 +664,38 @@ fn tags_section(store: Store, id: i64, aggregate: Detail) -> impl IntoElement {
         .child(section_heading("标签"))
         .child(dynamic(move || {
             let tags = aggregate.get().map(|a| a.tags).unwrap_or_default();
-            view()
-                .flex_row()
-                .flex_wrap()
-                .gap_1()
-                .children(
-                    tags.iter()
-                        .map(|tag| {
-                            let tag = tag.clone();
-                            view()
-                                .flex_row()
-                                .items_center()
-                                .gap_1()
-                                .px_1p5()
-                                .py(px(2.0))
-                                .rounded(px(6.0))
-                                .bg(tokens::info_soft())
-                                .child(
-                                    text(format!("#{}", tag.name))
-                                        .text_size(px(11.0))
-                                        .text_color(tokens::info()),
-                                )
-                                .child(
-                                    button()
-                                        .on_press(move || store.remove_tag(id, tag.id))
-                                        .accessibility_label(Some(format!("移除标签 {}", tag.name).into()))
-                                        .items_center()
-                                        .justify_center()
-                                        .text_color(tokens::fg_muted())
-                                        .child(text("✕").text_size(px(9.0))),
-                                )
-                                .into_element()
-                        })
-                        .collect::<Vec<_>>(),
-                )
+            view().flex_row().flex_wrap().gap_1().children(
+                tags.iter()
+                    .map(|tag| {
+                        let tag = tag.clone();
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .px_1p5()
+                            .py(px(2.0))
+                            .rounded(px(6.0))
+                            .bg(tokens::info_soft())
+                            .child(
+                                text(format!("#{}", tag.name))
+                                    .text_size(px(11.0))
+                                    .text_color(tokens::info()),
+                            )
+                            .child(
+                                button()
+                                    .on_press(move || store.remove_tag(id, tag.id))
+                                    .accessibility_label(Some(
+                                        format!("移除标签 {}", tag.name).into(),
+                                    ))
+                                    .items_center()
+                                    .justify_center()
+                                    .text_color(tokens::fg_muted())
+                                    .child(text("✕").text_size(px(9.0))),
+                            )
+                            .into_element()
+                    })
+                    .collect::<Vec<_>>(),
+            )
         }))
         .child(
             view()
@@ -609,7 +734,13 @@ fn memo_field(store: Store, id: i64, aggregate: Detail) -> impl IntoElement {
     input()
         .value(move || aggregate.get().map(|a| a.task.memo).unwrap_or_default())
         .on_change(move |text: &str| {
-            store.update_task(id, &TaskPatch { memo: Some(text.to_owned()), ..Default::default() });
+            store.update_task(
+                id,
+                &TaskPatch {
+                    memo: Some(text.to_owned()),
+                    ..Default::default()
+                },
+            );
         })
         .placeholder("备注")
         .placeholder_color(|| color(theme().muted_foreground))
@@ -627,7 +758,11 @@ fn memo_field(store: Store, id: i64, aggregate: Detail) -> impl IntoElement {
 }
 
 fn trash_row(store: Store, id: i64) -> impl IntoElement {
-    view().pt_2().child(app_button(ButtonKind::Danger, "移入回收站", move || {
-        store.trash_task(id);
-    }))
+    view().pt_2().child(app_button(
+        ButtonKind::Danger,
+        "移入回收站",
+        move || {
+            store.trash_task(id);
+        },
+    ))
 }
