@@ -167,6 +167,7 @@ pub struct TaskPatch {
     pub priority: Option<Priority>,
     pub memo: Option<String>,
     pub project_id: Option<Option<i64>>,
+    pub milestone_id: Option<Option<i64>>,
     pub scheduled_date: Option<Option<LocalDate>>,
     pub scheduled_time: Option<Option<LocalTime>>,
     pub due_date: Option<Option<LocalDate>>,

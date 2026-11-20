@@ -78,7 +78,13 @@ fn main_panel(store: Store) -> impl IntoElement {
                 Route::Upcoming => crate::upcoming::upcoming_view(store).into_element(),
                 Route::KnowledgeBases => crate::kb::kb_shelf(store).into_element(),
                 Route::Trash => crate::kb::trash_view(store).into_element(),
-                Route::Book(book_id) => crate::kb::book_shell(store, tab_id, book_id, crate::kb::CatalogFocus::Home)
+                Route::Book(book_id) => crate::kb::book_shell(
+                    store,
+                    tab_id,
+                    book_id,
+                    crate::kb::CatalogFocus::Home,
+                    crate::kb::CatalogNav::Book,
+                )
                     .into_element(),
                 Route::Document(doc_id) => match store.document(doc_id) {
                     Some(document) => crate::kb::book_shell(
@@ -86,10 +92,15 @@ fn main_panel(store: Store) -> impl IntoElement {
                         tab_id,
                         document.book_id,
                         crate::kb::CatalogFocus::Document(doc_id),
+                        crate::kb::CatalogNav::Book,
                     )
-                    .into_element(),
+                        .into_element(),
                     None => crate::kb::kb_shelf(store).into_element(),
                 },
+                Route::Project(project_id) => crate::projects::project_view(store, tab_id, project_id)
+                    .into_element(),
+                Route::ProjectEditor(editing) => crate::projects::project_editor_view(store, editing)
+                    .into_element(),
                 other => unreleased_view(other).into_element(),
             }))
             .key(format!("tab-{tab_id}"))

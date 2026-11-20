@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use nsh_app_kanon::domain::{
     FixedClock, KnowledgeBasePatch, LocalDate, LocalDateTime, LocalTime, NewTask, Priority,
-    ProjectFilter, TaskFilter, TaskPatch, TaskSort, TaskStatus, Workspace, WorkspaceError,
-    count_words,
+    ProjectBinding, ProjectFilter, ProjectPatch, TaskFilter, TaskPatch, TaskSort, TaskStatus,
+    Workspace, WorkspaceError, count_words,
 };
 
 fn at(text: &str) -> Arc<FixedClock> {
@@ -1014,6 +1014,39 @@ fn promote_checklist_item_creates_task_replaces_body_and_indexes_reference_atomi
     let _ = std::fs::remove_file(path);
 }
 
+// ---------------------------------------------------------------------
+// Projects and Milestones (issue #8, ADR-0001)
+// ---------------------------------------------------------------------
+
+#[test]
+fn project_trash_keeps_task_assignment_and_restore_is_lossless() {
+    let (mut ws, path, _clock) = workspace_at("proj-trash", "2026-11-20 09:00");
+    let project = ws.create_project("网站改版", "#547093", "📌", None, None).expect("project");
+    let task = ws
+        .create_task(&NewTask { title: "改首页".to_owned(), project_id: Some(project.id), ..Default::default() })
+        .expect("task");
+
+    // Trash: the Project leaves the list but its Tasks stay assigned.
+    ws.trash_project(project.id).expect("trash");
+    assert!(ws.projects().expect("active").is_empty(), "trashed project leaves the active list");
+    assert_eq!(ws.trashed_projects().expect("trashed").len(), 1, "the row remains for restore");
+    let kept = ws.task(task.task.id).expect("task").expect("present");
+    assert_eq!(kept.task.project_id, Some(project.id), "trashing keeps the task assignment (ADR-0001)");
+    assert!(ws.task_groups().expect("groups").unscheduled.iter().any(|a| a.task.id == task.task.id),
+        "the task stays visible in the regular task views");
+
+    // Restore is lossless: the task never lost its assignment.
+    ws.restore_project(project.id).expect("restore");
+    assert_eq!(ws.projects().expect("active").len(), 1);
+    let restored = ws.task(task.task.id).expect("task").expect("present");
+    assert_eq!(restored.task.project_id, Some(project.id));
+    drop(ws);
+
+    let ws = Workspace::open(&path, at("2026-11-20 10:00")).expect("reopen");
+    assert_eq!(ws.projects().expect("active").len(), 1, "the project persisted across restart");
+    let _ = std::fs::remove_file(path);
+}
+
 #[test]
 fn promotion_rolls_back_everything_on_stale_base_or_missing_placeholder() {
     let (mut ws, _path, _clock) = workspace_at("promote-rollback", "2026-11-20 09:00");
@@ -1216,4 +1249,240 @@ fn document_backlinks_track_source_trash_and_recover_on_restore() {
     ws.trash_knowledge_base(book_id).expect("trash the book");
     ws.delete_knowledge_base_permanent(book_id).expect("delete the book");
     assert!(ws.documents_referencing("document", target.id).expect("backlinks").is_empty());
+}
+
+#[test]
+fn project_permanent_delete_detaches_tasks_but_preserves_knowledge_bases() {
+    let (mut ws, path, _clock) = workspace_at("proj-delete", "2026-11-20 09:00");
+    let book = ws.create_knowledge_base("沉淀").expect("book");
+    let doc = ws.create_document(book.id, None, "纪要").expect("doc");
+    let project = ws.create_project("短项目", "#547093", "📌", Some(book.id), None).expect("project");
+    let milestone = ws.create_milestone(project.id, "收尾", Some(date("2026-11-25"))).expect("milestone");
+    let task = ws
+        .create_task(&NewTask { title: "收尾工作".to_owned(), project_id: Some(project.id), ..Default::default() })
+        .expect("task");
+    ws.update_task(task.task.id, &TaskPatch { milestone_id: Some(Some(milestone.id)), ..Default::default() }).expect("assign milestone");
+
+    ws.trash_project(project.id).expect("trash");
+    ws.delete_project_permanent(project.id).expect("permanent delete");
+
+    // The task survives, detached; the milestone is gone with the project.
+    let after = ws.task(task.task.id).expect("task").expect("present");
+    assert_eq!(after.task.project_id, None, "permanent delete detaches tasks (ADR-0001)");
+    assert_eq!(after.task.milestone_id, None, "the milestone went away with the project");
+    assert!(ws.milestones(project.id).expect("milestones").is_empty());
+    assert!(ws.trashed_projects().expect("trashed").is_empty());
+
+    // The Knowledge Base and its Document are untouched.
+    assert_eq!(ws.knowledge_bases().expect("shelf").len(), 1);
+    assert!(ws.document(doc.id).expect("doc").is_some(), "documents are preserved");
+
+    drop(ws);
+    let ws = Workspace::open(&path, at("2026-11-20 10:00")).expect("reopen");
+    assert_eq!(ws.task(task.task.id).expect("task").expect("present").task.project_id, None);
+    assert_eq!(ws.knowledge_bases().expect("shelf").len(), 1);
+}
+
+#[test]
+fn milestone_delete_clears_task_references_without_deleting_tasks() {
+    let (mut ws, _path, _clock) = workspace_at("milestone-delete", "2026-11-20 09:00");
+    let project = ws.create_project("项目", "#547093", "📌", None, None).expect("project");
+    let keep = ws.create_milestone(project.id, "保留", None).expect("milestone");
+    let gone = ws.create_milestone(project.id, "删除", Some(date("2026-12-01"))).expect("milestone");
+    let task = ws
+        .create_task(&NewTask { title: "任务".to_owned(), project_id: Some(project.id), ..Default::default() })
+        .expect("task");
+    ws.update_task(task.task.id, &TaskPatch { milestone_id: Some(Some(gone.id)), ..Default::default() }).expect("assign");
+
+    assert_eq!(ws.milestones(project.id).expect("list").len(), 2);
+    ws.delete_milestone(gone.id).expect("delete");
+    assert_eq!(ws.milestones(project.id).expect("list").len(), 1);
+    assert_eq!(ws.milestones(project.id).expect("list")[0].id, keep.id);
+    let after = ws.task(task.task.id).expect("task").expect("present");
+    assert_eq!(after.task.milestone_id, None, "the task survives, its milestone reference cleared");
+}
+
+#[test]
+fn document_created_for_a_project_lands_under_the_linked_grouping_node() {
+    let (mut ws, _path, _clock) = workspace_at("proj-doc-placement", "2026-11-20 09:00");
+    let book = ws.create_knowledge_base("手册").expect("book");
+    let group = ws.create_catalog_node(book.id, None, "第一章").expect("group");
+    let bound = ws.create_project("绑定分组", "#547093", "📌", Some(book.id), Some(group.id)).expect("project");
+    let whole = ws.create_project("绑定整本", "#547093", "📌", Some(book.id), None).expect("project");
+    let free = ws.create_project("未关联", "#547093", "📌", None, None).expect("project");
+
+    // Bound to a grouping node: the new document lands inside it.
+    let doc = ws.create_document_for_project(bound.id, "项目文档").expect("doc");
+    let node = ws.catalog_node_of_document(doc.id).expect("lookup").expect("node");
+    assert_eq!(node.parent_id, Some(group.id), "created under the linked grouping node");
+    assert_eq!(node.book_id, book.id);
+
+    // Bound to the whole book: the new document lands at the top of the root.
+    let root_doc = ws.create_document_for_project(whole.id, "全书文档").expect("doc");
+    let root_node = ws.catalog_node_of_document(root_doc.id).expect("lookup").expect("node");
+    assert_eq!(root_node.parent_id, None, "created at the book root");
+    let outline = ws.catalog_outline(book.id).expect("outline");
+    assert_eq!(outline[0].node.document_id, Some(root_doc.id), "inserted at the TOP of the root");
+
+    // Unbound: creation is refused (the UI offers binding first).
+    assert!(ws.create_document_for_project(free.id, "无处安放").is_err());
+}
+
+#[test]
+fn document_for_project_refuses_a_trashed_grouping_node() {
+    let (mut ws, _path, _clock) = workspace_at("proj-doc-trashed", "2026-11-20 09:00");
+    let book = ws.create_knowledge_base("手册").expect("book");
+    let group = ws.create_catalog_node(book.id, None, "第一章").expect("group");
+    let project = ws.create_project("项目", "#547093", "📌", Some(book.id), Some(group.id)).expect("project");
+
+    ws.trash_catalog_node(group.id).expect("trash the linked node");
+    // The binding is kept (notice state) but placement must not silently
+    // widen to the whole book.
+    assert!(ws.create_document_for_project(project.id, "新文档").is_err());
+}
+
+#[test]
+fn trashing_a_linked_grouping_node_keeps_binding_and_permanent_delete_resets_unbound() {
+    let (mut ws, path, _clock) = workspace_at("proj-node-lifecycle", "2026-11-20 09:00");
+    let book = ws.create_knowledge_base("手册").expect("book");
+    let group = ws.create_catalog_node(book.id, None, "第一章").expect("group");
+    let project = ws.create_project("项目", "#547093", "📌", Some(book.id), Some(group.id)).expect("project");
+
+    // Trash the linked node: the project keeps the binding (recoverable notice).
+    ws.trash_catalog_node(group.id).expect("trash node");
+    let found = ws.project(project.id).expect("project").expect("present");
+    assert_eq!(found.linked_group_node_id, Some(group.id), "trashing keeps the binding");
+    assert_eq!(found.linked_book_id, Some(book.id));
+    assert!(ws.catalog_node_is_trashed(group.id).expect("state"), "the notice reads the node's trash state");
+
+    // Restore brings the binding back to life.
+    ws.restore_catalog_node(group.id).expect("restore node");
+    assert!(!ws.catalog_node_is_trashed(group.id).expect("state"));
+    let target = ws.project_document_target(project.id).expect("target").expect("bound");
+    assert_eq!(target.book_id, book.id);
+    assert_eq!(target.group_node_id, Some(group.id));
+
+    // Permanent delete: the project resets cleanly to unbound — never
+    // widening to the whole Knowledge Base.
+    ws.trash_catalog_node(group.id).expect("trash again");
+    ws.delete_catalog_node_permanent(group.id).expect("permanent delete");
+    let after = ws.project(project.id).expect("project").expect("present");
+    assert_eq!(after.linked_group_node_id, None, "reset to unbound");
+    assert_eq!(after.linked_book_id, None, "not widened to the whole book");
+
+    drop(ws);
+    let ws = Workspace::open(&path, at("2026-11-20 10:00")).expect("reopen");
+    let after = ws.project(project.id).expect("project").expect("present");
+    assert_eq!(after.linked_book_id, None);
+}
+
+#[test]
+fn permanent_delete_of_a_catalog_node_removes_its_subtree_and_documents() {
+    let (mut ws, path, _clock) = workspace_at("node-permanent", "2026-11-20 09:00");
+    let book = ws.create_knowledge_base("手册").expect("book");
+    let group = ws.create_catalog_node(book.id, None, "第一章").expect("group");
+    let child = ws.create_document(book.id, Some(group.id), "子文档").expect("child");
+    let lone = ws.create_document(book.id, None, "独立文档").expect("lone");
+    ws.save_document(child.id, "子文档", "内容").expect("body");
+    ws.save_document_revision(child.id, None).expect("revision");
+
+    ws.trash_catalog_node(group.id).expect("trash");
+    ws.delete_catalog_node_permanent(group.id).expect("permanent delete");
+
+    assert!(ws.catalog_node(group.id).expect("gone").is_none(), "the node row is gone");
+    assert!(ws.document(child.id).expect("gone").is_none(), "the subtree's document is gone");
+    assert!(ws.document_revisions(child.id).expect("revisions").is_empty());
+    let remaining = ws.catalog_outline(book.id).expect("outline");
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].node.document_id, Some(lone.id), "siblings survive");
+
+    drop(ws);
+    let ws = Workspace::open(&path, at("2026-11-20 10:00")).expect("reopen");
+    assert_eq!(ws.catalog_outline(book.id).expect("outline").len(), 1);
+}
+
+#[test]
+fn project_update_rebinds_and_edits_without_touching_tasks() {
+    let (mut ws, _path, _clock) = workspace_at("proj-rebind", "2026-11-20 09:00");
+    let book = ws.create_knowledge_base("手册").expect("book");
+    let group = ws.create_catalog_node(book.id, None, "第一章").expect("group");
+    let project = ws.create_project("项目", "#547093", "📌", None, None).expect("project");
+    let task = ws
+        .create_task(&NewTask { title: "任务".to_owned(), project_id: Some(project.id), ..Default::default() })
+        .expect("task");
+
+    ws.update_project(project.id, &ProjectPatch {
+        description: Some("新目标".to_owned()),
+        linked_book_id: Some(Some(book.id)),
+        linked_group_node_id: Some(Some(group.id)),
+        ..Default::default()
+    })
+    .expect("rebind");
+    let found = ws.project(project.id).expect("project").expect("present");
+    assert_eq!(found.description, "新目标");
+    assert_eq!(found.linked_book_id, Some(book.id));
+    assert_eq!(found.linked_group_node_id, Some(group.id));
+
+    // Rebind back to unbound clears both columns.
+    ws.update_project(project.id, &ProjectPatch {
+        linked_book_id: Some(None),
+        linked_group_node_id: Some(None),
+        ..Default::default()
+    })
+    .expect("unbind");
+    let found = ws.project(project.id).expect("project").expect("present");
+    assert_eq!(found.linked_book_id, None);
+    assert_eq!(found.linked_group_node_id, None);
+
+    // Tasks never move on a rebind.
+    assert_eq!(ws.task(task.task.id).expect("task").expect("present").task.project_id, Some(project.id));
+}
+
+#[test]
+fn project_tasks_lists_every_assignment_in_status_order() {
+    let (mut ws, _path, _clock) = workspace_at("proj-tasks", "2026-11-20 09:00");
+    let project = ws.create_project("项目", "#547093", "📌", None, None).expect("project");
+    let other = ws.create_project("别的项目", "#547093", "📌", None, None).expect("other");
+    let milestone = ws.create_milestone(project.id, "阶段一", None).expect("milestone");
+    let doing = ws
+        .create_task(&NewTask { title: "进行中".to_owned(), project_id: Some(project.id), status: Some(TaskStatus::Doing), ..Default::default() })
+        .expect("task");
+    ws.create_task(&NewTask { title: "待办".to_owned(), project_id: Some(project.id), ..Default::default() }).expect("task");
+    ws.create_task(&NewTask { title: "别的".to_owned(), project_id: Some(other.id), ..Default::default() }).expect("task");
+    ws.update_task(doing.task.id, &TaskPatch { milestone_id: Some(Some(milestone.id)), ..Default::default() }).expect("assign");
+
+    let tasks = ws.project_tasks(project.id).expect("tasks");
+    let titles = tasks.iter().map(|a| a.task.title.as_str()).collect::<Vec<_>>();
+    assert_eq!(titles, vec!["待办", "进行中"], "status order, other projects excluded");
+    assert_eq!(tasks[1].task.milestone_id, Some(milestone.id));
+    assert_eq!(tasks.len(), 2);
+}
+
+#[test]
+fn create_project_with_binding_resolves_the_node_book_and_creates_a_same_named_book() {
+    let (mut ws, _path, _clock) = workspace_at("proj-create-binding", "2026-11-20 09:00");
+    let book = ws.create_knowledge_base("手册").expect("book");
+    let group = ws.create_catalog_node(book.id, None, "第一章").expect("group");
+
+    // Binding a node stores the node's book alongside.
+    let bound = ws
+        .create_project_with_binding("节点项目", "#547093", "📌", ProjectBinding::Node(group.id))
+        .expect("project");
+    assert_eq!(bound.linked_book_id, Some(book.id));
+    assert_eq!(bound.linked_group_node_id, Some(group.id));
+
+    // One-click: the same-named Knowledge Base is created with the project.
+    let made = ws
+        .create_project_with_binding("同名项目", "#547093", "📌", ProjectBinding::NewBook)
+        .expect("project");
+    let named = ws.knowledge_bases().expect("shelf").into_iter().find(|kb| kb.name == "同名项目");
+    assert!(named.is_some(), "the same-named book exists");
+    assert_eq!(made.linked_book_id, named.map(|kb| kb.id));
+    assert_eq!(ws.knowledge_bases().expect("shelf").len(), 2);
+
+    // Refused bindings: missing book, trashed book, trashed node.
+    assert!(ws.create_project_with_binding("坏", "#547093", "📌", ProjectBinding::Book(999)).is_err());
+    ws.trash_knowledge_base(book.id).expect("trash book");
+    assert!(ws.create_project_with_binding("坏", "#547093", "📌", ProjectBinding::Book(book.id)).is_err());
+    assert!(ws.create_project_with_binding("坏", "#547093", "📌", ProjectBinding::Node(group.id)).is_err());
 }

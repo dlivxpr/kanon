@@ -17,7 +17,7 @@ use crate::ui::controls::{
 use crate::ui::theme as tokens;
 
 /// The inner catalog sidebar's width (docs/ui-design.md §3.3).
-const CATALOG_W: f32 = 252.0;
+pub const CATALOG_W: f32 = 252.0;
 /// Below this the catalog overlays the main pane instead of sitting
 /// beside it (docs/ui-design.md §3.4).
 const NARROW_BREAKPOINT: f32 = 960.0;
@@ -29,6 +29,22 @@ pub enum CatalogFocus {
     Home,
     /// A document reading view is showing.
     Document(i64),
+}
+
+/// How the catalog's host view behaves (the book shell versus a
+/// Project's Linked Documents sub-view): where "首页" and document rows
+/// navigate, and where a root-level `新建文档` lands.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CatalogNav {
+    /// The book shell: 首页 opens the book home, documents open in
+    /// workbench tabs, root-level creations go to the top of the book
+    /// root.
+    Book,
+    /// A Project's Linked Documents sub-view: 首页 clears the open
+    /// document back to the view's landing, documents open inside the
+    /// sub-view (per tab), and root-level creations land under the
+    /// linked grouping node (`None` when bound to the whole book).
+    Project { linked_node: Option<i64> },
 }
 
 /// What the catalog's quick-create row is creating, and where.
@@ -43,6 +59,7 @@ enum PendingCreate {
 struct CatalogCtx {
     store: Store,
     focus: CatalogFocus,
+    nav: CatalogNav,
     filter: Signal<String>,
     pending: Signal<Option<PendingCreate>>,
     located: Signal<Option<i64>>,
@@ -377,7 +394,13 @@ fn book_edit_form(store: Store, id: i64, editing: Signal<Option<i64>>) -> impl I
 /// catalog sidebar beside the book home / reading view. Under
 /// [`NARROW_BREAKPOINT`] the catalog turns into an overlay drawer so
 /// the main pane keeps its width (docs/ui-design.md §3.4).
-pub fn book_shell(store: Store, tab_id: u64, book_id: i64, focus: CatalogFocus) -> impl IntoElement {
+pub fn book_shell(
+    store: Store,
+    tab_id: u64,
+    book_id: i64,
+    focus: CatalogFocus,
+    nav: CatalogNav,
+) -> impl IntoElement {
     let narrow = move || window().width.0 < NARROW_BREAKPOINT;
     let drawer = signal(false);
     let on_close = move || drawer.set(false);
@@ -389,7 +412,7 @@ pub fn book_shell(store: Store, tab_id: u64, book_id: i64, focus: CatalogFocus) 
         .child(when(
             move || !narrow(),
             move || {
-                catalog_sidebar(store, book_id, focus, false, on_close)
+                catalog_sidebar(store, book_id, focus, false, on_close, nav)
                     .w(px(CATALOG_W))
                     .test_id("catalog-inline")
             },
@@ -431,7 +454,7 @@ pub fn book_shell(store: Store, tab_id: u64, book_id: i64, focus: CatalogFocus) 
                                     .accessibility_label("关闭目录"),
                             )
                             .child(
-                                catalog_sidebar(store, book_id, focus, true, on_close)
+                                catalog_sidebar(store, book_id, focus, true, on_close, nav)
                                     .w(px(CATALOG_W))
                                     .shadow_lg()
                                     .test_id("catalog-overlay"),
@@ -454,6 +477,7 @@ pub fn catalog_sidebar(
     focus: CatalogFocus,
     overlay: bool,
     on_close: impl Fn() + Copy + 'static,
+    nav: CatalogNav,
 ) -> View {
     let filter = signal(String::new());
     let pending = signal(None::<PendingCreate>);
@@ -465,6 +489,13 @@ pub fn catalog_sidebar(
     let all_expanded = move || {
         let entries = outline();
         !entries.is_empty() && entries.iter().all(|entry| entry.node.expanded)
+    };
+    // Where a root-level `新建文档` lands: the top of the book root in a
+    // book shell, the linked grouping node in a Project's Linked
+    // Documents sub-view (ADR-0001).
+    let root_parent: Option<i64> = match nav {
+        CatalogNav::Book => None,
+        CatalogNav::Project { linked_node } => linked_node,
     };
 
     view()
@@ -497,9 +528,9 @@ pub fn catalog_sidebar(
                 move || {
                     let kind = pending.get().expect("pending");
                     let (label, placeholder): (String, String) = match kind {
-                        PendingCreate::Document { parent } => match parent {
+                        PendingCreate::Document { parent } => match parent.or(root_parent) {
                             Some(parent) => (
-                                "新建子文档".to_owned(),
+                                "新建文档".to_owned(),
                                 format!(
                                     "在「{}」下新建文档，回车创建",
                                     node_title(&outline(), parent)
@@ -538,14 +569,14 @@ pub fn catalog_sidebar(
                                     move || draft.get(),
                                     move |text: &str| draft.set(text.to_owned()),
                                     move |text: &str| {
-                                        commit_create(store, book_id, kind, text);
+                                        commit_create(store, book_id, kind, text, root_parent);
                                         draft.set(String::new());
                                         pending.set(None);
                                     },
                                 ))
                                 .child(
                                     app_button(ButtonKind::Positive, "创建", move || {
-                                        commit_create(store, book_id, kind, &draft.get());
+                                        commit_create(store, book_id, kind, &draft.get(), root_parent);
                                         draft.set(String::new());
                                         pending.set(None);
                                     })
@@ -579,7 +610,7 @@ pub fn catalog_sidebar(
                         .flex_row()
                         .items_center()
                         .gap_1()
-                        .child(home_row(store, book_id, focus).flex_1().min_w(px(0.0)))
+                        .child(home_row(store, book_id, focus, nav).flex_1().min_w(px(0.0)))
                         .child(
                             when(
                                 move || focus != CatalogFocus::Home,
@@ -701,7 +732,7 @@ pub fn catalog_sidebar(
                             |entry: &CatalogEntry| entry.node.id,
                             move |entry, index| {
                                 catalog_row(
-                                    CatalogCtx { store, focus, filter, pending, located },
+                                    CatalogCtx { store, focus, nav, filter, pending, located },
                                     entry,
                                     index,
                                     move || visible.get(),
@@ -773,9 +804,18 @@ pub fn catalog_sidebar(
         ))
 }
 
-fn commit_create(store: Store, book_id: i64, kind: PendingCreate, text: &str) {
+fn commit_create(
+    store: Store,
+    book_id: i64,
+    kind: PendingCreate,
+    text: &str,
+    root_parent: Option<i64>,
+) {
     let parent = match kind {
         PendingCreate::Document { parent } => {
+            // A Project's Linked Documents view retargets the root-level
+            // creation into its linked grouping node (ADR-0001).
+            let parent = parent.or(root_parent);
             if let Some(parent) = parent {
                 store.create_document_in(book_id, Some(parent), text);
             } else {
@@ -801,10 +841,18 @@ fn node_title(outline: &[CatalogEntry], id: i64) -> String {
         .unwrap_or_default()
 }
 
-fn home_row(store: Store, book_id: i64, focus: CatalogFocus) -> nsh_base::ButtonElement {
+fn home_row(
+    store: Store,
+    book_id: i64,
+    focus: CatalogFocus,
+    nav: CatalogNav,
+) -> nsh_base::ButtonElement {
     let active = focus == CatalogFocus::Home;
     nsh_base::button()
-        .on_press(move || store.open_book(book_id))
+        .on_press(move || match nav {
+            CatalogNav::Book => store.open_book(book_id),
+            CatalogNav::Project { .. } => store.set_project_document(None),
+        })
         .accessibility_label("首页")
         .h(px(30.0))
         .w_full()
@@ -913,7 +961,7 @@ fn catalog_row(
     index: ReadSignal<usize>,
     visible: impl Fn() -> Vec<CatalogEntry> + Copy + 'static,
 ) -> impl IntoElement {
-    let CatalogCtx { store, focus, filter, pending, located } = ctx;
+    let CatalogCtx { store, focus, nav, filter, pending, located } = ctx;
     let node_id = move || entry.with(|entry| entry.node.id);
     let is_document = move || entry.with(|entry| entry.node.document_id.is_some());
     let depth = move || entry.with(|entry| entry.depth);
@@ -969,7 +1017,10 @@ fn catalog_row(
                     let (doc, id, was_expanded) =
                         entry.with(|entry| (entry.node.document_id, entry.node.id, entry.node.expanded));
                     if let Some(doc_id) = doc {
-                        store.open_document(doc_id);
+                        match nav {
+                            CatalogNav::Book => store.open_document(doc_id),
+                            CatalogNav::Project { .. } => store.set_project_document(Some(doc_id)),
+                        }
                     } else {
                         store.set_node_expanded(id, !was_expanded);
                     }
@@ -1310,18 +1361,24 @@ pub fn document_view(store: Store, tab_id: u64, doc_id: i64) -> impl IntoElement
     crate::document::document_view(store, tab_id, doc_id)
 }
 
-/// The Trash screen: trashed Knowledge Bases with restore and
-/// permanent-delete actions. Catalog node trash/restore is exercised
-/// through the workspace and drives the same subtree rules; the full
-/// Trash milestone polishes this screen further.
+/// The Trash screen: trashed Knowledge Bases, Projects and catalog node
+/// subtrees, each with restore and permanent-delete actions. Permanent
+/// deletion applies the ADR-0001 scope rules: a Project's Tasks are
+/// detached (never deleted), and a catalog node's subtree deletion
+/// resets bound Projects to unbound.
 pub fn trash_view(store: Store) -> impl IntoElement {
-    let rows = move || store.trashed_knowledge_bases();
+    let books = move || store.trashed_knowledge_bases();
+    let projects = move || store.trashed_projects();
+    let nodes = move || store.trashed_catalog_nodes_all();
     let task_rows = move || store.trashed_tasks();
+    let empty = move || {
+        books().is_empty() && projects().is_empty() && nodes().is_empty() && task_rows().is_empty()
+    };
     view().flex_1().min_h(px(0.0)).child(
         scroll().flex_1().child(
             view()
                 .flex_col()
-                .gap_3()
+                .gap_4()
                 .p_5()
                 .max_w(px(860.0))
                 .w_full()
@@ -1333,99 +1390,226 @@ pub fn trash_view(store: Store) -> impl IntoElement {
                         .text_color(tokens::fg_primary()),
                 )
                 .child(when(
-                    move || rows().is_empty() && task_rows().is_empty(),
-                    move || empty_state("回收站是空的", "移入回收站的知识库和任务会在这里出现"),
+                    empty,
+                    move || empty_state("回收站是空的", "移入回收站的知识库、项目、目录和任务会在这里出现"),
                 ))
-                .child(dynamic(move || {
-                    view().flex_col().gap_2().children(
-                        rows()
-                            .into_iter()
-                            .map(|kb| {
-                                let id = kb.id;
-                                let title = kb.name.clone();
-                                view()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_3()
-                                    .px_3()
-                                    .py_2()
-                                    .rounded(tokens::radius_row())
-                                    .border_1()
-                                    .border_color(tokens::border_subtle())
-                                    .child(text(kb.icon.clone()).text_size(px(18.0)))
-                                    .child(
-                                        text(title)
-                                            .text_size(px(14.0))
-                                            .text_color(tokens::fg_primary())
-                                            .flex_1()
-                                            .number_of_lines(1),
-                                    )
-                                    .child(
-                                        app_button(ButtonKind::Soft, "恢复", move || {
-                                            store.restore_knowledge_base(id);
+                .child(when(
+                    move || !books().is_empty(),
+                    move || {
+                        view()
+                            .flex_col()
+                            .gap_2()
+                            .child(section_heading("知识库"))
+                            .child(dynamic(move || {
+                                view().flex_col().gap_2().children(
+                                    books()
+                                        .into_iter()
+                                        .map(|kb| {
+                                            let id = kb.id;
+                                            let title = kb.name.clone();
+                                            view()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_3()
+                                                .px_3()
+                                                .py_2()
+                                                .rounded(tokens::radius_row())
+                                                .border_1()
+                                                .border_color(tokens::border_subtle())
+                                                .child(text(kb.icon.clone()).text_size(px(18.0)))
+                                                .child(
+                                                    text(title)
+                                                        .text_size(px(14.0))
+                                                        .text_color(tokens::fg_primary())
+                                                        .flex_1()
+                                                        .number_of_lines(1),
+                                                )
+                                                .child(
+                                                    app_button(ButtonKind::Soft, "恢复", move || {
+                                                        store.restore_knowledge_base(id);
+                                                    })
+                                                    .test_id(&format!("kb-restore-{id}")),
+                                                )
+                                                .child(
+                                                    app_button(ButtonKind::Danger, "彻底删除", move || {
+                                                        store.delete_knowledge_base_permanent(id);
+                                                    })
+                                                    .test_id(&format!("kb-delete-{id}")),
+                                                )
+                                                .into_element()
                                         })
-                                        .test_id(&format!("kb-restore-{id}")),
-                                    )
-                                    .child(
-                                        app_button(ButtonKind::Danger, "彻底删除", move || {
-                                            store.delete_knowledge_base_permanent(id);
+                                        .collect::<Vec<_>>(),
+                                )
+                            }))
+                    },
+                ))
+                .child(when(
+                    move || !projects().is_empty(),
+                    move || {
+                        view()
+                            .flex_col()
+                            .gap_2()
+                            .child(section_heading("项目"))
+                            .child(
+                                text("彻底删除项目会解除任务归属，但不会删除任务、知识库或文档。")
+                                    .text_size(px(11.0))
+                                    .text_color(tokens::fg_muted()),
+                            )
+                            .child(dynamic(move || {
+                                view().flex_col().gap_2().children(
+                                    projects()
+                                        .into_iter()
+                                        .map(|project| {
+                                            let id = project.id;
+                                            let title = project.name.clone();
+                                            let emoji = project.emoji.clone();
+                                            view()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_3()
+                                                .px_3()
+                                                .py_2()
+                                                .rounded(tokens::radius_row())
+                                                .border_1()
+                                                .border_color(tokens::border_subtle())
+                                                .child(text(emoji).text_size(px(18.0)))
+                                                .child(
+                                                    text(title)
+                                                        .text_size(px(14.0))
+                                                        .text_color(tokens::fg_primary())
+                                                        .flex_1()
+                                                        .number_of_lines(1),
+                                                )
+                                                .child(
+                                                    app_button(ButtonKind::Soft, "恢复", move || {
+                                                        store.restore_project(id);
+                                                    })
+                                                    .test_id(&format!("project-restore-{id}")),
+                                                )
+                                                .child(
+                                                    app_button(ButtonKind::Danger, "彻底删除", move || {
+                                                        store.delete_project_permanent(id);
+                                                    })
+                                                    .test_id(&format!("project-delete-{id}")),
+                                                )
+                                                .into_element()
                                         })
-                                        .test_id(&format!("kb-delete-{id}")),
-                                    )
-                                    .into_element()
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                }))
+                                        .collect::<Vec<_>>(),
+                                )
+                            }))
+                    },
+                ))
                 .child(when(
                     move || !task_rows().is_empty(),
-                    move || section_heading("任务"),
+                    move || {
+                        view()
+                            .flex_col()
+                            .gap_2()
+                            .child(section_heading("任务"))
+                            .child(dynamic(move || {
+                                view().flex_col().gap_2().children(
+                                    task_rows()
+                                        .into_iter()
+                                        .map(|aggregate| {
+                                            let id = aggregate.task.id;
+                                            let title = aggregate.task.title.clone();
+                                            view()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_3()
+                                                .px_3()
+                                                .py_2()
+                                                .rounded(tokens::radius_row())
+                                                .border_1()
+                                                .border_color(tokens::border_subtle())
+                                                .child(
+                                                    text("☑".to_owned())
+                                                        .text_size(px(16.0))
+                                                        .text_color(tokens::fg_muted()),
+                                                )
+                                                .child(
+                                                    text(title)
+                                                        .text_size(px(14.0))
+                                                        .text_color(tokens::fg_primary())
+                                                        .flex_1()
+                                                        .number_of_lines(1),
+                                                )
+                                                .child(
+                                                    app_button(ButtonKind::Soft, "恢复", move || {
+                                                        store.restore_task(id);
+                                                    })
+                                                    .test_id(&format!("task-restore-{id}")),
+                                                )
+                                                .child(
+                                                    app_button(ButtonKind::Danger, "彻底删除", move || {
+                                                        store.delete_task_permanent(id);
+                                                    })
+                                                    .test_id(&format!("task-delete-{id}")),
+                                                )
+                                                .into_element()
+                                        })
+                                        .collect::<Vec<_>>(),
+                                )
+                            }))
+                    },
                 ))
-                .child(dynamic(move || {
-                    view().flex_col().gap_2().children(
-                        task_rows()
-                            .into_iter()
-                            .map(|aggregate| {
-                                let id = aggregate.task.id;
-                                let title = aggregate.task.title.clone();
-                                view()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_3()
-                                    .px_3()
-                                    .py_2()
-                                    .rounded(tokens::radius_row())
-                                    .border_1()
-                                    .border_color(tokens::border_subtle())
-                                    .child(
-                                        text("☑".to_owned())
-                                            .text_size(px(16.0))
-                                            .text_color(tokens::fg_muted()),
-                                    )
-                                    .child(
-                                        text(title)
-                                            .text_size(px(14.0))
-                                            .text_color(tokens::fg_primary())
-                                            .flex_1()
-                                            .number_of_lines(1),
-                                    )
-                                    .child(
-                                        app_button(ButtonKind::Soft, "恢复", move || {
-                                            store.restore_task(id);
+                .child(when(
+                    move || !nodes().is_empty(),
+                    move || {
+                        view()
+                            .flex_col()
+                            .gap_2()
+                            .child(section_heading("目录"))
+                            .child(
+                                text("彻底删除目录会同时删除其子树与文档；绑定它的项目将解除绑定。")
+                                    .text_size(px(11.0))
+                                    .text_color(tokens::fg_muted()),
+                            )
+                            .child(dynamic(move || {
+                                view().flex_col().gap_2().children(
+                                    nodes()
+                                        .into_iter()
+                                        .map(|node| {
+                                            let id = node.id;
+                                            view()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_3()
+                                                .px_3()
+                                                .py_2()
+                                                .rounded(tokens::radius_row())
+                                                .border_1()
+                                                .border_color(tokens::border_subtle())
+                                                .child(
+                                                    text(if node.document_id.is_some() { "📄" } else { "📁" })
+                                                        .text_size(px(18.0)),
+                                                )
+                                                .child(
+                                                    text(node.title.clone())
+                                                        .text_size(px(14.0))
+                                                        .text_color(tokens::fg_primary())
+                                                        .flex_1()
+                                                        .number_of_lines(1),
+                                                )
+                                                .child(
+                                                    app_button(ButtonKind::Soft, "恢复", move || {
+                                                        store.restore_catalog_node(id);
+                                                    })
+                                                    .test_id(&format!("node-restore-{id}")),
+                                                )
+                                                .child(
+                                                    app_button(ButtonKind::Danger, "彻底删除", move || {
+                                                        store.delete_catalog_node_permanent(id);
+                                                    })
+                                                    .test_id(&format!("node-delete-{id}")),
+                                                )
+                                                .into_element()
                                         })
-                                        .test_id(&format!("task-restore-{id}")),
-                                    )
-                                    .child(
-                                        app_button(ButtonKind::Danger, "彻底删除", move || {
-                                            store.delete_task_permanent(id);
-                                        })
-                                        .test_id(&format!("task-delete-{id}")),
-                                    )
-                                    .into_element()
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                })),
+                                        .collect::<Vec<_>>(),
+                                )
+                            }))
+                    },
+                )),
         ),
     )
 }

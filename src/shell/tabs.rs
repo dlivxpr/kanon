@@ -25,8 +25,38 @@ pub enum Route {
     /// Base's catalog focuses the tab already showing this Document
     /// instead of opening a duplicate.
     Document(i64),
+    /// One open Project (docs/ui-design.md §4.3): the payload is the
+    /// project id. The sub-view and the open Document of its Linked
+    /// Documents sub-view live per tab (see [`Tab::project_section`]).
+    Project(i64),
+    /// The Project editor: `None` creates a new Project (with its
+    /// optional Knowledge Base / grouping-node binding), `Some(id)`
+    /// edits an existing one (the rebind flow).
+    ProjectEditor(Option<i64>),
     Trash,
     Settings,
+}
+
+/// A Project view's sub-view (docs/ui-design.md §4.3), remembered per
+/// tab like the Today view's selected date.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProjectSection {
+    #[default]
+    Overview,
+    Tasks,
+    Board,
+    Documents,
+}
+
+impl ProjectSection {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "概览与里程碑",
+            Self::Tasks => "任务列表",
+            Self::Board => "看板",
+            Self::Documents => "关联文档",
+        }
+    }
 }
 
 impl Route {
@@ -44,16 +74,11 @@ impl Route {
             Self::KnowledgeBases => "知识库".to_owned(),
             Self::Book(_) => "知识库".to_owned(),
             Self::Document(_) => "文档".to_owned(),
+            Self::Project(_) => "项目".to_owned(),
+            Self::ProjectEditor(_) => "项目".to_owned(),
             Self::Trash => "回收站".to_owned(),
             Self::Settings => "设置".to_owned(),
         }
-    }
-
-    /// Whether the destination embeds the inner catalog sidebar
-    /// (docs/ui-design.md §3.3): the book home and document reading
-    /// views do.
-    pub fn has_inner_catalog(&self) -> bool {
-        matches!(self, Self::Book(_) | Self::Document(_))
     }
 
     /// A short glyph for the tab and the sidebar.
@@ -70,6 +95,8 @@ impl Route {
             Self::KnowledgeBases => "📚",
             Self::Book(_) => "📕",
             Self::Document(_) => "📄",
+            Self::Project(_) => "🗂",
+            Self::ProjectEditor(_) => "🗂",
             Self::Trash => "🗑",
             Self::Settings => "⚙",
         }
@@ -77,7 +104,8 @@ impl Route {
 }
 
 /// One workbench tab: its current destination, independent back/forward
-/// history, pin state, and the date the Today view has selected.
+/// history, pin state, the date the Today view has selected, and the
+/// Project view's sub-view state.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tab {
     pub id: u64,
@@ -86,16 +114,34 @@ pub struct Tab {
     pub future: Vec<Route>,
     pub pinned: bool,
     pub selected_date: LocalDate,
+    /// Which Project sub-view shows (Overview / Tasks / Board /
+    /// Documents).
+    pub project_section: ProjectSection,
+    /// The Document open inside the Linked Documents sub-view (None =
+    /// the view's landing).
+    pub project_doc: Option<i64>,
 }
 
 impl Tab {
     pub fn new(id: u64, route: Route, today: LocalDate) -> Self {
-        Self { id, current: route, past: Vec::new(), future: Vec::new(), pinned: false, selected_date: today }
+        Self {
+            id,
+            current: route,
+            past: Vec::new(),
+            future: Vec::new(),
+            pinned: false,
+            selected_date: today,
+            project_section: ProjectSection::default(),
+            project_doc: None,
+        }
     }
 
     /// Navigates to a new destination, pushing the current one on the
     /// back stack and clearing the forward stack. Navigating to the
-    /// current destination is a no-op (no history noise).
+    /// current destination is a no-op (no history noise). The per-tab
+    /// Project state belongs to the Project the tab was showing; any
+    /// real navigation resets it (the focus-or-reuse rule keeps it when
+    /// a sidebar click re-selects the same Project).
     pub fn navigate(&mut self, route: Route) {
         if route == self.current {
             return;
@@ -103,6 +149,8 @@ impl Tab {
         self.past.push(self.current.clone());
         self.current = route;
         self.future.clear();
+        self.project_section = ProjectSection::default();
+        self.project_doc = None;
     }
 
     /// Steps back in this tab's own history. Returns false at the oldest
@@ -207,6 +255,19 @@ impl TabStrip {
 
     pub fn navigate_active(&mut self, route: Route) {
         self.tabs[self.active].navigate(route);
+    }
+
+    /// Remembers the Project sub-view for the active tab.
+    pub fn set_project_section(&mut self, section: ProjectSection) {
+        self.tabs[self.active].project_section = section;
+    }
+
+    /// Opens (or closes, with `None`) a Document inside the active tab's
+    /// Linked Documents sub-view, switching to that sub-view.
+    pub fn set_project_document(&mut self, document: Option<i64>) {
+        let tab = &mut self.tabs[self.active];
+        tab.project_section = ProjectSection::Documents;
+        tab.project_doc = document;
     }
 
     pub fn back(&mut self) -> bool {
@@ -336,6 +397,33 @@ mod tests {
         let last = strip.tabs[1].id;
         assert!(strip.close_tab(last));
         assert_eq!(strip.active, 0);
+    }
+
+    #[test]
+    fn project_sub_view_state_is_per_tab_and_opens_documents_inside_it() {
+        let mut strip = TabStrip::new(Route::Project(3), today());
+        assert_eq!(strip.active_tab().project_section, ProjectSection::Overview);
+        strip.set_project_section(ProjectSection::Board);
+        strip.set_project_document(Some(9));
+        assert_eq!(strip.active_tab().project_section, ProjectSection::Documents);
+        assert_eq!(strip.active_tab().project_doc, Some(9));
+
+        // Another tab keeps its own project state.
+        strip.open_tab(Route::Project(4), today());
+        assert_eq!(strip.active_tab().project_section, ProjectSection::Overview);
+        assert_eq!(strip.active_tab().project_doc, None);
+
+        // Focusing the first project tab restores its state.
+        strip.open_or_focus(Route::Project(3), today());
+        assert_eq!(strip.active, 0);
+        assert_eq!(strip.active_tab().project_section, ProjectSection::Documents);
+        assert_eq!(strip.active_tab().project_doc, Some(9));
+
+        // Navigating away (or to another Project) resets the per-tab
+        // state: it belonged to the Project the tab was showing.
+        strip.navigate_active(Route::Project(7));
+        assert_eq!(strip.active_tab().project_section, ProjectSection::Overview);
+        assert_eq!(strip.active_tab().project_doc, None);
     }
 
     #[test]

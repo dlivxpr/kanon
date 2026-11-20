@@ -1297,15 +1297,14 @@ fn inline_mentions_flow_and_feed_the_backlinks_panel() -> Result<(), String> {
     let _ = (source_id, target_id);
     let mut app = start(&path, "2026-11-20 09:00");
 
-    // The mentions flow inline: the paragraph's pieces stay in order.
+    // The mentions flow inline: the whole paragraph reads as one run —
+    // no line breaks around the chips.
     app.wait_for("今天")?;
     app.press("id:nav-知识库")?;
     app.wait_for("全部知识库")?;
     app.press("打开知识库 手册")?;
     app.wait_for("id:catalog-tree")?;
     app.press("id:catalog-tree >> text:计划")?;
-    // The mentions flow inline: the whole paragraph reads as one run —
-    // no line breaks around the chips.
     app.wait_for("前文@手册正文后文@2026-11-21")?;
     let texts = visible_texts(&app);
     assert!(
@@ -1339,6 +1338,384 @@ fn inline_mentions_flow_and_feed_the_backlinks_panel() -> Result<(), String> {
     app.wait_for("label:打开文档 计划")?;
     app.press("label:打开文档 计划")?;
     app.wait_for("前文@手册正文后文@2026-11-21")?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Projects (issue #8, ADR-0001)
+// ---------------------------------------------------------------------
+
+/// Opens the only project's page through the sidebar.
+fn open_project(app: &mut Headless) -> Result<(), String> {
+    app.wait_for("今天")?;
+    app.press("id:sidebar-project")?;
+    app.wait_for("id:project-view")?;
+    Ok(())
+}
+
+/// Trashes the project's linked grouping node through the book's catalog
+/// row menu.
+fn trash_linked_group(app: &mut Headless) -> Result<(), String> {
+    app.press("id:catalog-tree >> label:第一章")?;
+    app.wait_for("节点菜单")?;
+    app.press("id:catalog-tree >> label:节点菜单")?;
+    app.wait_for("移入回收站")?;
+    app.press("移入回收站")?;
+    Ok(())
+}
+
+#[test]
+fn creating_a_project_with_a_same_named_knowledge_base_lists_both() -> Result<(), String> {
+    let path = temp_db("proj-create");
+    let mut app = start_sized(&path, "2026-11-20 09:00", 1440.0);
+
+    // Create from the sidebar with the one-click same-named binding.
+    app.wait_for("今天")?;
+    app.press("id:project-new")?;
+    app.wait_for("新建项目")?;
+    app.type_text("text:项目名称", "发布会")?;
+    app.press("新建同名知识库")?;
+    app.press("id:project-save")?;
+
+    // The project view opens, bound to the fresh book.
+    app.wait_for("id:project-view")?;
+    app.wait_for("📚 发布会")?;
+    app.wait_for("还没有关联知识库").expect_err("bound projects skip the unbound state");
+
+    // The same-named Knowledge Base exists on the shelf.
+    app.press("id:nav-知识库")?;
+    app.wait_for("打开知识库 发布会")?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[test]
+fn project_sub_views_show_metrics_quick_add_milestones_and_kanban_moves() -> Result<(), String> {
+    let path = temp_db("proj-subviews");
+    seed(&path, "2026-11-20 09:00", |ws| {
+        let book = ws.create_knowledge_base("手册").expect("kb");
+        let group = ws.create_catalog_node(book.id, None, "第一章").expect("group");
+        let project = ws
+            .create_project("改版", "#547093", "🚀", Some(book.id), Some(group.id))
+            .expect("project");
+        let milestone = ws.create_milestone(project.id, "阶段一", None).expect("milestone");
+        let task = ws
+            .create_task(&nsh_app_kanon::domain::NewTask {
+                title: "画稿".to_owned(),
+                project_id: Some(project.id),
+                ..Default::default()
+            })
+            .expect("task");
+        ws.update_task(
+            task.task.id,
+            &nsh_app_kanon::domain::TaskPatch {
+                milestone_id: Some(Some(milestone.id)),
+                ..Default::default()
+            },
+        )
+        .expect("assign milestone");
+    });
+    let mut app = start_sized(&path, "2026-11-20 09:00", 1440.0);
+    open_project(&mut app)?;
+
+    // Overview: metrics and the milestone with its live progress.
+    app.wait_for("总任务")?;
+    app.wait_for("关联文档")?;
+    app.wait_for("阶段一")?;
+    app.wait_for("0/1 项完成")?;
+
+    // Add a milestone inline.
+    app.type_text("text:里程碑名称，回车添加", "上线")?;
+    app.press("id:milestone-add")?;
+    app.wait_for("上线")?;
+
+    // Task List: the inline quick-add lands in the project.
+    app.press("任务列表")?;
+    app.type_text("text:添加项目任务，回车创建", "走查")?;
+    app.press("id:project-quick-add")?;
+    app.wait_for("走查")?;
+
+    // Kanban: move the new card across lanes.
+    app.press("看板")?;
+    app.wait_for("id:kanban-todo")?;
+    app.press("移动 走查")?;
+    app.wait_for("移到进行中")?;
+    app.press("移到进行中")?;
+    app.wait_for("id:kanban-doing >> text:走查")?;
+
+    // Deleting the milestone clears the reference without deleting the
+    // task: the progress line is gone, and 画稿 still lists in the Task
+    // List sub-view.
+    app.press("概览与里程碑")?;
+    app.press("删除里程碑 >> nth=0")?;
+    app.wait_for_gone("0/1 项完成", Duration::from_secs(2))?;
+    app.press("任务列表")?;
+    app.wait_for("画稿")?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[test]
+fn kanban_shows_the_cancel_column_only_while_it_holds_cards() -> Result<(), String> {
+    let path = temp_db("proj-kanban-cancel");
+    seed(&path, "2026-11-20 09:00", |ws| {
+        let project = ws.create_project("小项目", "#547093", "📌", None, None).expect("project");
+        ws.create_task(&nsh_app_kanon::domain::NewTask {
+            title: "任务甲".to_owned(),
+            project_id: Some(project.id),
+            ..Default::default()
+        })
+        .expect("task");
+        ws.create_task(&nsh_app_kanon::domain::NewTask {
+            title: "任务乙".to_owned(),
+            project_id: Some(project.id),
+            ..Default::default()
+        })
+        .expect("task");
+    });
+    let mut app = start_sized(&path, "2026-11-20 09:00", 1440.0);
+    open_project(&mut app)?;
+    app.press("看板")?;
+
+    // Two todo cards, no cancel column yet.
+    app.wait_for("id:kanban-todo")?;
+    app.wait_for("任务甲")?;
+    app.wait_for("任务乙")?;
+    app.wait_for("id:kanban-cancel").expect_err("the cancel lane hides while empty");
+
+    // Move one card to cancel: the optional column appears with it.
+    app.press("移动 任务乙")?;
+    app.wait_for("移到已取消")?;
+    app.press("移到已取消")?;
+    app.wait_for("id:kanban-cancel >> text:任务乙")?;
+
+    // Move it back: the column disappears again.
+    app.press("移动 任务乙")?;
+    app.wait_for("移到待办")?;
+    app.press("移到待办")?;
+    app.wait_for("id:kanban-todo >> text:任务乙")?;
+    app.wait_for_gone("id:kanban-cancel", Duration::from_secs(2))?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[test]
+fn documents_created_from_linked_documents_land_in_the_linked_scope() -> Result<(), String> {
+    let path = temp_db("proj-doc-scope");
+    seed(&path, "2026-11-20 09:00", |ws| {
+        let book = ws.create_knowledge_base("手册").expect("kb");
+        let group = ws.create_catalog_node(book.id, None, "第一章").expect("group");
+        ws.create_project("分组项目", "#547093", "📌", Some(book.id), Some(group.id))
+            .expect("project");
+        ws.create_project("整本项目", "#547093", "📌", Some(book.id), None)
+            .expect("project");
+    });
+    let mut app = start_sized(&path, "2026-11-20 09:00", 1440.0);
+
+    // Bound to a grouping node: the landing names it, and the new
+    // document appears inside it.
+    app.wait_for("今天")?;
+    app.press("id:sidebar-project >> nth=0")?;
+    app.wait_for("id:project-view")?;
+    app.press("关联文档")?;
+    app.wait_for("新建文档将落在关联目录「第一章」下")?;
+    app.press("id:project-doc-create")?;
+    app.wait_for("未命名文档")?;
+    assert!(
+        tree_shows(&app, "未命名文档"),
+        "the project document renders in the reused catalog tree"
+    );
+    // The document opened inside the project tab (the sub-view switch
+    // stays visible next to the canvas).
+    app.wait_for("概览与里程碑")?;
+
+    // Bound to the whole book: the document lands at the root top.
+    app.press("id:sidebar-project >> nth=1")?;
+    app.wait_for("整本项目")?;
+    app.press("关联文档")?;
+    app.wait_for("新建文档将落在知识库「手册」的目录顶部")?;
+    app.press("id:project-doc-create")?;
+    app.wait_for("未命名文档")?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[test]
+fn trashing_a_project_keeps_its_tasks_visible_and_restore_is_lossless() -> Result<(), String> {
+    let path = temp_db("proj-trash-ui");
+    seed(&path, "2026-11-20 09:00", |ws| {
+        let project = ws.create_project("过渡项目", "#547093", "📌", None, None).expect("project");
+        ws.create_task(&nsh_app_kanon::domain::NewTask {
+            title: "收尾任务".to_owned(),
+            project_id: Some(project.id),
+            ..Default::default()
+        })
+        .expect("task");
+    });
+    let mut app = start_sized(&path, "2026-11-20 09:00", 1440.0);
+    open_project(&mut app)?;
+
+    // Trash it from the project menu; the tab falls back to 待办.
+    app.press("项目菜单")?;
+    app.wait_for("移入回收站")?;
+    app.press("移入回收站")?;
+    app.wait_for("id:tasks-group-未排期")?;
+
+    // The task stays visible in the regular task views (ADR-0001).
+    app.wait_for("收尾任务")?;
+
+    // Restore from the Trash screen; the task never lost its assignment.
+    app.press("id:nav-回收站")?;
+    app.wait_for("过渡项目")?;
+    app.press("id:project-restore-1")?;
+    app.wait_for("回收站是空的")?;
+    app.press("id:sidebar-project")?;
+    app.wait_for("过渡项目")?;
+    app.press("任务列表")?;
+    app.wait_for("收尾任务")?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[test]
+fn permanent_project_deletion_detaches_tasks_but_preserves_the_knowledge_base() -> Result<(), String> {
+    let path = temp_db("proj-delete-ui");
+    seed(&path, "2026-11-20 09:00", |ws| {
+        let book = ws.create_knowledge_base("沉淀").expect("kb");
+        ws.create_document(book.id, None, "纪要").expect("doc");
+        let project = ws.create_project("短项目", "#547093", "📌", Some(book.id), None).expect("project");
+        ws.create_task(&nsh_app_kanon::domain::NewTask {
+            title: "孤儿任务".to_owned(),
+            project_id: Some(project.id),
+            ..Default::default()
+        })
+        .expect("task");
+    });
+    let mut app = start_sized(&path, "2026-11-20 09:00", 1440.0);
+    open_project(&mut app)?;
+    app.press("项目菜单")?;
+    app.wait_for("移入回收站")?;
+    app.press("移入回收站")?;
+
+    app.press("id:nav-回收站")?;
+    app.wait_for("短项目")?;
+    app.press("id:project-delete-1")?;
+    app.wait_for_gone("短项目", Duration::from_secs(2))?;
+
+    // The task survives, now without a project…
+    app.press("id:nav-待办")?;
+    app.wait_for("孤儿任务")?;
+    app.wait_for("text:短项目").expect_err("the row no longer names a project");
+
+    // …and the Knowledge Base with its document is intact.
+    app.press("id:nav-知识库")?;
+    app.wait_for("打开知识库 沉淀")?;
+    app.press("打开知识库 沉淀")?;
+    app.wait_for("1 篇文档 · 0 字")?;
+    app.wait_for("纪要")?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[test]
+fn trashing_the_linked_grouping_node_shows_the_recoverable_notice() -> Result<(), String> {
+    let path = temp_db("proj-node-trash-ui");
+    seed(&path, "2026-11-20 09:00", |ws| {
+        let book = ws.create_knowledge_base("手册").expect("kb");
+        let group = ws.create_catalog_node(book.id, None, "第一章").expect("group");
+        ws.create_project("绑定项目", "#547093", "📌", Some(book.id), Some(group.id))
+            .expect("project");
+    });
+    let mut app = start_sized(&path, "2026-11-20 09:00", 1440.0);
+    open_project(&mut app)?;
+    app.press("关联文档")?;
+    app.wait_for("id:catalog-tree")?;
+
+    // Trash the linked node from the book's catalog.
+    trash_linked_group(&mut app)?;
+
+    // The project's binding survives with the recoverable notice (the
+    // Linked Documents sub-view explains the state and offers actions).
+    app.press("id:sidebar-project")?;
+    app.wait_for("id:project-view")?;
+    app.press("关联文档")?;
+    app.wait_for("关联目录「第一章」在回收站中")?;
+    app.wait_for("id:project-restore-node")?;
+    app.wait_for("id:project-rebind")?;
+
+    // One-click restore brings the linked tree back.
+    app.press("id:project-restore-node")?;
+    app.wait_for("id:catalog-tree")?;
+    app.wait_for("新建文档将落在关联目录「第一章」下")?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[test]
+fn permanently_deleting_the_linked_grouping_node_resets_the_project_to_unbound() -> Result<(), String> {
+    let path = temp_db("proj-node-delete-ui");
+    seed(&path, "2026-11-20 09:00", |ws| {
+        let book = ws.create_knowledge_base("手册").expect("kb");
+        let group = ws.create_catalog_node(book.id, None, "第一章").expect("group");
+        ws.create_project("绑定项目", "#547093", "📌", Some(book.id), Some(group.id))
+            .expect("project");
+    });
+    let mut app = start_sized(&path, "2026-11-20 09:00", 1440.0);
+    open_project(&mut app)?;
+    app.press("关联文档")?;
+    app.wait_for("id:catalog-tree")?;
+    trash_linked_group(&mut app)?;
+
+    // Permanently delete the node from the Trash screen (目录 section).
+    app.press("id:nav-回收站")?;
+    app.wait_for("第一章")?;
+    app.press("id:node-delete-1")?;
+    app.wait_for_gone("第一章", Duration::from_secs(2))?;
+
+    // The project is cleanly unbound — never widened to the whole book.
+    app.press("id:sidebar-project")?;
+    app.wait_for("id:project-view")?;
+    app.press("关联文档")?;
+    app.wait_for("还没有关联知识库")?;
+    app.wait_for("id:project-bind")?;
+    app.wait_for("id:project-bind-new-book")?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[test]
+fn rebinding_a_project_to_a_grouping_node_scopes_new_documents() -> Result<(), String> {
+    let path = temp_db("proj-rebind-ui");
+    seed(&path, "2026-11-20 09:00", |ws| {
+        let book = ws.create_knowledge_base("手册").expect("kb");
+        ws.create_catalog_node(book.id, None, "第一章").expect("group");
+        ws.create_project("未绑定", "#547093", "📌", None, None).expect("project");
+    });
+    let mut app = start_sized(&path, "2026-11-20 09:00", 1440.0);
+    open_project(&mut app)?;
+
+    // The unbound state offers the binding actions.
+    app.press("关联文档")?;
+    app.wait_for("还没有关联知识库")?;
+
+    // Rebind through the editor to the book's grouping node.
+    app.press("id:project-bind")?;
+    app.wait_for("编辑项目")?;
+    app.press("关联目录分组")?;
+    app.press("id:project-book-picker")?;
+    app.wait_for("手册")?;
+    app.press("手册")?;
+    app.press("id:project-node-picker")?;
+    app.wait_for("第一章")?;
+    app.press("第一章")?;
+    app.press("id:project-save")?;
+
+    // Back on the project, the linked scope names the node.
+    app.wait_for("id:project-view")?;
+    app.wait_for("📚 手册 / 第一章")?;
+    app.press("关联文档")?;
+    app.wait_for("新建文档将落在关联目录「第一章」下")?;
     let _ = std::fs::remove_file(path);
     Ok(())
 }

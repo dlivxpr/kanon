@@ -33,6 +33,10 @@ pub enum WorkspaceError {
     /// A Checklist Item promotion whose editor body holds no Linked Task
     /// Card placeholder (or otherwise cannot commit).
     InvalidPromotion(String),
+    /// A project-scoped operation whose precondition does not hold
+    /// (creating a Document for an unbound Project, or into a trashed
+    /// grouping node).
+    InvalidOperation(String),
 }
 
 impl fmt::Display for WorkspaceError {
@@ -43,6 +47,7 @@ impl fmt::Display for WorkspaceError {
             Self::StaleDocument => write!(f, "the document changed since this edit began"),
             Self::InvalidMove(value) => write!(f, "invalid catalog move: {value}"),
             Self::InvalidPromotion(value) => write!(f, "invalid checklist promotion: {value}"),
+            Self::InvalidOperation(value) => write!(f, "invalid operation: {value}"),
         }
     }
 }
@@ -196,6 +201,40 @@ pub struct Milestone {
     pub project_id: i64,
     pub title: String,
     pub target_date: Option<LocalDate>,
+}
+
+/// A partial edit of a Project. `Some(Some(v))` sets, `Some(None)`
+/// clears, `None` leaves the field untouched — clearing the binding
+/// columns is how a Project comes back to unbound (ADR-0001).
+#[derive(Debug, Clone, Default)]
+pub struct ProjectPatch {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub color: Option<String>,
+    pub emoji: Option<String>,
+    pub linked_book_id: Option<Option<i64>>,
+    pub linked_group_node_id: Option<Option<i64>>,
+}
+
+/// Where a Project's Documents live (ADR-0001): always inside one
+/// Knowledge Base, optionally narrowed to one grouping Catalog Node.
+/// `group_node_id` is `None` when the Project binds the whole book.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectDocsTarget {
+    pub book_id: i64,
+    pub group_node_id: Option<i64>,
+}
+
+/// How a new Project binds its Knowledge Base (ADR-0001): not at all, to
+/// a whole existing book, to one grouping Catalog Node (its book is
+/// resolved and stored alongside), or one-click to a brand-new
+/// same-named Knowledge Base created atomically with the Project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectBinding {
+    None,
+    Book(i64),
+    Node(i64),
+    NewBook,
 }
 
 /// A Quick Note (GLOSSARY).
@@ -526,6 +565,10 @@ impl Workspace {
         if let Some(project_id) = &patch.project_id {
             sets.push("project_id = ?");
             values.push(project_id.map(|id| id.to_string()));
+        }
+        if let Some(milestone_id) = &patch.milestone_id {
+            sets.push("milestone_id = ?");
+            values.push(milestone_id.map(|id| id.to_string()));
         }
         if let Some(scheduled_date) = &patch.scheduled_date {
             sets.push("scheduled_date = ?");
@@ -1118,6 +1161,96 @@ impl Workspace {
         Ok(stmt.query_map([], kb_from_row)?.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Every trashed Catalog Node subtree root across all books (the
+    /// Trash screen's rows), newest first — the same root-only filter as
+    /// the per-book restore section.
+    pub fn trashed_catalog_nodes_all(&self) -> Result<Vec<CatalogNode>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, book_id, parent_id, document_id, title, expanded, updated_at \
+             FROM catalog_nodes \
+             WHERE trashed_at IS NOT NULL \
+             AND (parent_id IS NULL OR parent_id NOT IN \
+                  (SELECT id FROM catalog_nodes WHERE trashed_at IS NOT NULL)) \
+             ORDER BY updated_at DESC, id",
+        )?;
+        Ok(stmt
+            .query_map([], catalog_node_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Whether a Catalog Node currently sits in Trash (the Linked
+    /// Documents view's recoverable-binding notice reads this).
+    pub fn catalog_node_is_trashed(&self, id: i64) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT trashed_at IS NOT NULL FROM catalog_nodes WHERE id = ?",
+            params![id],
+            |row| row.get::<_, bool>(0),
+        )?)
+    }
+
+    /// Permanently deletes a Catalog Node and its whole subtree — every
+    /// descendant node and their Documents (with revisions, references
+    /// and tag links) — and resets every Project bound to any node of
+    /// the subtree cleanly to unbound, never widening it to the whole
+    /// Knowledge Base (ADR-0001). One transaction; not undoable.
+    pub fn delete_catalog_node_permanent(&mut self, id: i64) -> Result<()> {
+        let now = self.stamp();
+        let tx = self.conn.transaction()?;
+        let mut stmt = tx.prepare(
+            "WITH RECURSIVE subtree(id) AS ( \
+                SELECT id FROM catalog_nodes WHERE id = :id \
+                UNION ALL \
+                SELECT child.id FROM catalog_nodes child JOIN subtree ON child.parent_id = subtree.id \
+            ) \
+            SELECT id FROM subtree",
+        )?;
+        let ids = stmt
+            .query_map(&[(":id", &id)], |row| row.get::<_, i64>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        if ids.is_empty() {
+            return Err(WorkspaceError::InvalidMove(format!("no catalog node {id}")));
+        }
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        // The subtree's documents go with it (their ids are collected
+        // before the tree rows go, which the FK ordering demands).
+        let doc_ids = tx
+            .prepare(&format!(
+                "SELECT document_id FROM catalog_nodes WHERE id IN ({placeholders}) AND document_id IS NOT NULL"
+            ))?
+            .query_map(rusqlite::params_from_iter(ids.iter()), |row| row.get::<_, i64>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let doc_placeholders = doc_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        if !doc_ids.is_empty() {
+            for table in ["document_references", "document_revisions", "document_tags"] {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE document_id IN ({doc_placeholders})"),
+                    rusqlite::params_from_iter(doc_ids.iter()),
+                )?;
+            }
+        }
+        // Projects bound to any node of the subtree reset to unbound.
+        for node_id in &ids {
+            tx.execute(
+                "UPDATE projects SET linked_book_id = NULL, linked_group_node_id = NULL, updated_at = ? \
+                 WHERE linked_group_node_id = ?",
+                params![now, node_id],
+            )?;
+        }
+        tx.execute(
+            &format!("DELETE FROM catalog_nodes WHERE id IN ({placeholders})"),
+            rusqlite::params_from_iter(ids.iter()),
+        )?;
+        if !doc_ids.is_empty() {
+            tx.execute(
+                &format!("DELETE FROM documents WHERE id IN ({doc_placeholders})"),
+                rusqlite::params_from_iter(doc_ids.iter()),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Moves a Catalog Node to `new_parent_id` (its own id's level when
     /// `None`) at `index` among the target level's children, renumbering
     /// both affected levels. Rejects a move into the node itself or any
@@ -1686,6 +1819,70 @@ impl Workspace {
         })
     }
 
+    /// Creates a Project together with its binding choice, atomically
+    /// (ADR-0001). `ProjectBinding::Node` resolves and stores the node's
+    /// book; `NewBook` creates the same-named Knowledge Base first, so a
+    /// failure cannot leave an orphaned book behind.
+    pub fn create_project_with_binding(
+        &mut self,
+        name: &str,
+        color: &str,
+        emoji: &str,
+        binding: ProjectBinding,
+    ) -> Result<Project> {
+        let (linked_book_id, linked_group_node_id) = match binding {
+            ProjectBinding::None => (None, None),
+            ProjectBinding::Book(book_id) => {
+                let trashed: Option<bool> = self
+                    .conn
+                    .query_row(
+                        "SELECT trashed_at IS NOT NULL FROM knowledge_bases WHERE id = ?",
+                        params![book_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                match trashed {
+                    None => {
+                        return Err(WorkspaceError::InvalidOperation(format!(
+                            "no knowledge base {book_id}"
+                        )));
+                    }
+                    Some(true) => {
+                        return Err(WorkspaceError::InvalidOperation(format!(
+                            "knowledge base {book_id} is in Trash"
+                        )));
+                    }
+                    Some(false) => {}
+                }
+                (Some(book_id), None)
+            }
+            ProjectBinding::Node(node_id) => {
+                let node = self.catalog_node(node_id)?.ok_or_else(|| {
+                    WorkspaceError::InvalidOperation(format!("no catalog node {node_id}"))
+                })?;
+                if self.catalog_node_is_trashed(node_id)? {
+                    return Err(WorkspaceError::InvalidOperation(format!(
+                        "catalog node {node_id} is in Trash"
+                    )));
+                }
+                (Some(node.book_id), Some(node_id))
+            }
+            ProjectBinding::NewBook => {
+                let now = self.stamp();
+                let tx = self.conn.transaction()?;
+                tx.execute(
+                    "INSERT INTO knowledge_bases (name, created_at, updated_at, sort_order) \
+                     VALUES (?, ?, ?, (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM knowledge_bases))",
+                    params![name, now, now],
+                )?;
+                let book_id = tx.last_insert_rowid();
+                tx.commit()?;
+                (Some(book_id), None)
+            }
+        };
+        self.create_project(name, color, emoji, linked_book_id, linked_group_node_id)
+    }
+
     /// All non-trashed Projects.
     pub fn projects(&self) -> Result<Vec<Project>> {
         let mut stmt = self
@@ -1695,6 +1892,218 @@ impl Workspace {
             .query_map([], project_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(projects)
+    }
+
+    /// Every trashed Project (the Trash screen's restore rows), newest
+    /// first.
+    pub fn trashed_projects(&self) -> Result<Vec<Project>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT * FROM projects WHERE trashed_at IS NOT NULL ORDER BY updated_at DESC, id")?;
+        let projects = stmt
+            .query_map([], project_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(projects)
+    }
+
+    /// Loads one Project regardless of its Trash state (route titles and
+    /// the Trash screen need the trashed rows too).
+    pub fn project(&self, id: i64) -> Result<Option<Project>> {
+        Ok(self
+            .conn
+            .query_row("SELECT * FROM projects WHERE id = ?", params![id], project_from_row)
+            .optional()?)
+    }
+
+    /// Applies a partial edit to a Project. Setting a binding to `None`
+    /// is how a Project becomes (or returns to) unbound; the Knowledge
+    /// Base and its Documents are never touched by a rebind (ADR-0001).
+    pub fn update_project(&mut self, id: i64, patch: &ProjectPatch) -> Result<Project> {
+        let mut sets: Vec<&str> = Vec::new();
+        let mut values: Vec<Option<String>> = Vec::new();
+        if let Some(name) = &patch.name {
+            sets.push("name = ?");
+            values.push(Some(name.clone()));
+        }
+        if let Some(description) = &patch.description {
+            sets.push("description = ?");
+            values.push(Some(description.clone()));
+        }
+        if let Some(color) = &patch.color {
+            sets.push("color = ?");
+            values.push(Some(color.clone()));
+        }
+        if let Some(emoji) = &patch.emoji {
+            sets.push("emoji = ?");
+            values.push(Some(emoji.clone()));
+        }
+        if let Some(linked_book_id) = &patch.linked_book_id {
+            sets.push("linked_book_id = ?");
+            values.push(linked_book_id.map(|book| book.to_string()));
+        }
+        if let Some(linked_group_node_id) = &patch.linked_group_node_id {
+            sets.push("linked_group_node_id = ?");
+            values.push(linked_group_node_id.map(|node| node.to_string()));
+        }
+        if !sets.is_empty() {
+            sets.push("updated_at = ?");
+            values.push(Some(self.stamp()));
+            let mut refs: Vec<&dyn rusqlite::ToSql> =
+                values.iter().map(|value| value as &dyn rusqlite::ToSql).collect();
+            let id_param: &dyn rusqlite::ToSql = &id;
+            refs.push(id_param);
+            let sql = format!("UPDATE projects SET {} WHERE id = ?", sets.join(", "));
+            let changed = self.conn.execute(&sql, &refs[..])?;
+            if changed == 0 {
+                return Err(WorkspaceError::InvalidDateTime(format!("no project {id}")));
+            }
+        }
+        self.project(id)?.ok_or_else(|| WorkspaceError::InvalidDateTime(format!("no project {id}")))
+    }
+
+    /// Every non-trashed Task assigned to the Project, in status order
+    /// (`todo > doing > done > cancel`), then shelf order.
+    pub fn project_tasks(&self, project_id: i64) -> Result<Vec<TaskAggregate>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM tasks WHERE trashed_at IS NULL AND project_id = ? \
+             ORDER BY CASE status WHEN 'todo' THEN 0 WHEN 'doing' THEN 1 WHEN 'done' THEN 2 ELSE 3 END, \
+             sort_order, id",
+        )?;
+        let tasks = stmt
+            .query_map(params![project_id], task_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        tasks.into_iter().map(|task| self.with_details(task)).collect()
+    }
+
+    /// Moves a Project into Trash. Its Tasks KEEP their `project_id` so
+    /// they stay visible in the regular task views and a restore is
+    /// lossless (ADR-0001); nothing else moves.
+    pub fn trash_project(&mut self, id: i64) -> Result<()> {
+        let now = self.stamp();
+        self.conn.execute(
+            "UPDATE projects SET trashed_at = ?, updated_at = ? WHERE id = ? AND trashed_at IS NULL",
+            params![now, now, id],
+        )?;
+        Ok(())
+    }
+
+    /// Restores a Project from Trash. The Tasks never lost their
+    /// assignment, so nothing has to be re-linked (ADR-0001).
+    pub fn restore_project(&mut self, id: i64) -> Result<()> {
+        let now = self.stamp();
+        self.conn.execute(
+            "UPDATE projects SET trashed_at = NULL, updated_at = ? WHERE id = ?",
+            params![now, id],
+        )?;
+        Ok(())
+    }
+
+    /// Permanently deletes a Project: its Tasks are detached (never
+    /// deleted) and its Milestones go away with it, while every Knowledge
+    /// Base and Document is preserved (ADR-0001). One transaction; not
+    /// undoable.
+    pub fn delete_project_permanent(&mut self, id: i64) -> Result<()> {
+        let now = self.stamp();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "UPDATE tasks SET project_id = NULL, milestone_id = NULL, updated_at = ? \
+             WHERE project_id = ?",
+            params![now, id],
+        )?;
+        tx.execute("DELETE FROM milestones WHERE project_id = ?", params![id])?;
+        tx.execute("DELETE FROM projects WHERE id = ?", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Binds an existing Project to a brand-new same-named Knowledge
+    /// Base, atomically (ADR-0001's one-click binding).
+    pub fn bind_new_book(&mut self, project_id: i64) -> Result<Project> {
+        let project = self
+            .project(project_id)?
+            .ok_or_else(|| WorkspaceError::InvalidDateTime(format!("no project {project_id}")))?;
+        let now = self.stamp();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT INTO knowledge_bases (name, created_at, updated_at, sort_order) \
+             VALUES (?, ?, ?, (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM knowledge_bases))",
+            params![project.name, now, now],
+        )?;
+        let book_id = tx.last_insert_rowid();
+        tx.execute(
+            "UPDATE projects SET linked_book_id = ?, linked_group_node_id = NULL, updated_at = ? WHERE id = ?",
+            params![book_id, now, project_id],
+        )?;
+        tx.commit()?;
+        self.project(project_id)?.ok_or_else(|| WorkspaceError::InvalidDateTime(format!("no project {project_id}")))
+    }
+
+    /// How many non-trashed Documents live in the Project's linked scope
+    /// (the whole book, or the grouping node's subtree) — the Overview's
+    /// 关联文档 metric.
+    pub fn project_document_count(&self, project_id: i64) -> Result<usize> {
+        let Some(target) = self.project_document_target(project_id)? else { return Ok(0) };
+        let count = match target.group_node_id {
+            Some(node_id) => self.conn.query_row(
+                "WITH RECURSIVE subtree(id) AS ( \
+                    SELECT id FROM catalog_nodes WHERE id = :id \
+                    UNION ALL \
+                    SELECT child.id FROM catalog_nodes child JOIN subtree ON child.parent_id = subtree.id \
+                 ) \
+                 SELECT COUNT(*) FROM documents \
+                 WHERE trashed_at IS NULL AND id IN \
+                 (SELECT document_id FROM catalog_nodes WHERE id IN (SELECT id FROM subtree) AND document_id IS NOT NULL)",
+                &[(":id", &node_id)],
+                |row| row.get::<_, i64>(0),
+            )?,
+            None => self.conn.query_row(
+                "SELECT COUNT(*) FROM documents WHERE book_id = ? AND trashed_at IS NULL",
+                params![target.book_id],
+                |row| row.get::<_, i64>(0),
+            )?,
+        };
+        Ok(count as usize)
+    }
+
+    /// Resolves where a Project's Documents live (ADR-0001): the linked
+    /// grouping Catalog Node when set, otherwise the whole linked book.
+    /// `Ok(None)` means unbound. The target is returned even while the
+    /// linked node sits in Trash — the binding survives, and the caller
+    /// surfaces the recoverable notice instead of a silent fallback.
+    pub fn project_document_target(&self, project_id: i64) -> Result<Option<ProjectDocsTarget>> {
+        let project = self
+            .project(project_id)?
+            .ok_or_else(|| WorkspaceError::InvalidDateTime(format!("no project {project_id}")))?;
+        if let Some(node_id) = project.linked_group_node_id {
+            let node = self.catalog_node(node_id)?.ok_or_else(|| {
+                WorkspaceError::InvalidOperation(format!("linked grouping node {node_id} is gone"))
+            })?;
+            return Ok(Some(ProjectDocsTarget { book_id: node.book_id, group_node_id: Some(node_id) }));
+        }
+        Ok(project.linked_book_id.map(|book_id| ProjectDocsTarget { book_id, group_node_id: None }))
+    }
+
+    /// Creates a Document for a Project's Linked Documents view (ADR-0001):
+    /// under the linked grouping node, or at the top of the linked book's
+    /// root when bound to the whole book. Refused while the linked node
+    /// sits in Trash (the UI offers restore or rebind first) and for
+    /// unbound Projects.
+    pub fn create_document_for_project(&mut self, project_id: i64, title: &str) -> Result<Document> {
+        let Some(target) = self.project_document_target(project_id)? else {
+            return Err(WorkspaceError::InvalidOperation(format!(
+                "project {project_id} has no Knowledge Base binding"
+            )));
+        };
+        if let Some(node_id) = target.group_node_id {
+            if self.catalog_node_is_trashed(node_id)? {
+                return Err(WorkspaceError::InvalidOperation(format!(
+                    "linked grouping node {node_id} is in Trash"
+                )));
+            }
+            self.create_document(target.book_id, Some(node_id), title)
+        } else {
+            self.create_document(target.book_id, None, title)
+        }
     }
 
     /// Adds a Milestone to a Project.
@@ -1712,6 +2121,24 @@ impl Workspace {
         )?;
         let id = self.conn.last_insert_rowid();
         Ok(Milestone { id, project_id, title: title.to_owned(), target_date })
+    }
+
+    /// A Project's Milestones in display order (the Overview's list).
+    pub fn milestones(&self, project_id: i64) -> Result<Vec<Milestone>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, title, target_date FROM milestones \
+             WHERE project_id = ? ORDER BY sort_order, id",
+        )?;
+        Ok(stmt
+            .query_map(params![project_id], |row| {
+                Ok(Milestone {
+                    id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    title: row.get(2)?,
+                    target_date: opt_date(row.get(3)?)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// Deletes a Milestone, clearing the milestone reference of its Tasks

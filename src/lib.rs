@@ -7,6 +7,7 @@
 pub mod domain;
 mod document;
 mod kb;
+mod projects;
 mod shell;
 mod tasks;
 mod today;
