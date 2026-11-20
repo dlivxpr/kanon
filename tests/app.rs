@@ -310,6 +310,32 @@ fn inbox_badge_counts_strict_inbox_tasks_and_triage_updates_it() -> Result<(), S
     let _ = std::fs::remove_file(path);
     Ok(())
 }
+#[test]
+fn completing_the_only_task_leaves_no_inbox_items_and_the_detail_stays_open() -> Result<(), String>
+{
+    let path = temp_db("detail-after-last-task");
+    seed(&path, "2026-11-20 09:00", |ws| {
+        ws.create_task(&nsh_app_kanon::domain::NewTask {
+            title: "唯一的任务".to_owned(),
+            ..Default::default()
+        })
+        .unwrap();
+    });
+    let mut app = start(&path, "2026-11-20 09:00");
+    app.wait_for("今天")?;
+    app.wait_for("label:收件箱 1 项任务")?;
+    app.press("label:收件箱 1 项任务")?;
+    app.wait_for("打开任务 唯一的任务")?;
+    app.press("label:打开任务 唯一的任务 >> nth=0")?;
+    app.wait_for("任务详情")?;
+    app.press("已完成")?;
+    app.wait_for("没有未完成的任务")?;
+    // The completed task still renders in the detail editor rather than
+    // dropping the panel or falling back to a stale project.
+    app.wait_for("唯一的任务")?;
+    app.wait_for("已完成")?;
+    Ok(())
+}
 
 #[test]
 fn assigning_a_project_from_task_detail_empties_the_inbox_and_milestones_follow()
