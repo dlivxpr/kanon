@@ -11,12 +11,14 @@ use nsh_platform_windows as platform;
 fn main() -> impl std::process::Termination {
     env_logger::init();
     platform::run_app(
-        platform::AppSource::Rust(platform::Root::of::<nsh_app_kanon::App>()),
+        platform::AppSource::Rust(platform::Root::new::<nsh_app_kanon::App>(|| {
+            nsh_app_kanon::AppProps::desktop()
+        })),
         platform::AppOptions {
             title: "kanon".to_owned(),
             #[cfg(target_os = "windows")]
             app_id: "com.example.kanon".to_owned(),
-            size: (480, 640),
+            size: (1200, 800),
             ..Default::default()
         },
     )
