@@ -54,15 +54,29 @@ fn fg_of(kind: ButtonKind) -> nsh_core::element::AdaptiveColor {
     }
 }
 
+fn bg_of(kind: ButtonKind) -> nsh_core::element::AdaptiveColor {
+    match kind {
+        ButtonKind::Primary => tokens::accent(),
+        ButtonKind::Positive => tokens::positive(),
+        ButtonKind::Soft => tokens::control_bg(),
+        ButtonKind::Ghost => theme().background.opacity(0.0),
+        ButtonKind::Danger => tokens::danger(),
+    }
+}
+
+/// The hovered background of the app's button, by variant.
+fn hover_bg_of(kind: ButtonKind) -> nsh_core::element::AdaptiveColor {
+    match kind {
+        ButtonKind::Primary => tokens::accent(),
+        ButtonKind::Positive => tokens::positive(),
+        ButtonKind::Soft => tokens::control_hover(),
+        ButtonKind::Ghost => tokens::control_hover(),
+        ButtonKind::Danger => tokens::danger(),
+    }
+}
+
 /// The shared chrome of the app's button (no label yet).
 fn button_base(kind: ButtonKind, on_press: impl Fn() + 'static) -> nsh_base::ButtonElement {
-    let (bg, hover_bg) = match kind {
-        ButtonKind::Primary => (tokens::accent(), tokens::accent()),
-        ButtonKind::Positive => (tokens::positive(), tokens::positive()),
-        ButtonKind::Soft => (tokens::control_bg(), tokens::control_hover()),
-        ButtonKind::Ghost => (theme().background.opacity(0.0), tokens::control_hover()),
-        ButtonKind::Danger => (tokens::danger(), tokens::danger()),
-    };
     button()
         .on_press(on_press)
         .h(px(32.0))
@@ -70,15 +84,18 @@ fn button_base(kind: ButtonKind, on_press: impl Fn() + 'static) -> nsh_base::But
         .items_center()
         .justify_center()
         .rounded_full()
-        .bg(bg)
+        .bg(move || bg_of(kind))
         .border_1()
         .border_color(theme().background.opacity(0.0))
-        .hover(|s| s.bg(hover_bg))
-        .active(|s| s.opacity(0.85))
+        .hover(move |s| s.bg(hover_bg_of(kind)))
+        // Press feedback per docs/ui-design.md §6.2: scale to 0.97 on
+        // the fast token (reduced motion: instant, wash only).
+        .active(move |s| s.opacity(0.85).scale(0.97))
         .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
         .disabled_style(|s| s.opacity(0.5))
         .transition_colors()
-        .duration(tokens::ms(tokens::MOTION_INSTANT_MS))
+        .transition_transform()
+        .duration(tokens::ms(tokens::MOTION_FAST_MS))
 }
 
 /// A 28 px square icon button for toolbars and tab chrome.
@@ -95,12 +112,13 @@ pub fn icon_button(
         .justify_center()
         .rounded(move || theme().radius)
         .bg(move || theme().background.opacity(0.0))
-        .text_color(tokens::shell_muted())
+        .text_color(tokens::shell_muted)
         .hover(|s| s.bg(tokens::shell_surface_active()).text_color(tokens::shell_fg()))
-        .active(|s| s.opacity(0.7))
+        .active(|s| s.opacity(0.7).scale(0.95))
         .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
         .transition_colors()
-        .duration(tokens::ms(tokens::MOTION_INSTANT_MS))
+        .transition_transform()
+        .duration(tokens::ms(tokens::MOTION_FAST_MS))
         .child(text(glyph).text_size(px(14.0)))
 }
 
@@ -118,12 +136,13 @@ pub fn panel_icon_button(
         .justify_center()
         .rounded(move || theme().radius)
         .bg(move || theme().background.opacity(0.0))
-        .text_color(tokens::fg_muted())
+        .text_color(tokens::fg_muted)
         .hover(|s| s.bg(tokens::control_hover()).text_color(tokens::fg_primary()))
-        .active(|s| s.opacity(0.7))
+        .active(|s| s.opacity(0.7).scale(0.95))
         .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
         .transition_colors()
-        .duration(tokens::ms(tokens::MOTION_INSTANT_MS))
+        .transition_transform()
+        .duration(tokens::ms(tokens::MOTION_FAST_MS))
         .child(text(glyph).text_size(px(13.0)))
 }
 
@@ -143,7 +162,7 @@ pub fn input_field(
         .px_3()
         .text_size(px(13.0))
         .rounded(move || theme().radius)
-        .bg(tokens::control_bg())
+        .bg(tokens::control_bg)
         .border_1()
         .border_color(move || theme().background.opacity(0.0))
         .focus(|s| s.border_color(tokens::accent()))
@@ -176,7 +195,7 @@ pub fn submit_field(
         .px_3()
         .text_size(px(13.0))
         .rounded(move || theme().radius)
-        .bg(tokens::control_bg())
+        .bg(tokens::control_bg)
         .border_1()
         .border_color(move || theme().background.opacity(0.0))
         .focus(|s| s.border_color(tokens::accent()))
@@ -239,6 +258,7 @@ pub fn task_circle(
         .active(|s| s.scale(0.9))
         .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
         .transition_colors()
+        .transition_transform()
         .duration(tokens::ms(tokens::MOTION_FAST_MS))
 }
 

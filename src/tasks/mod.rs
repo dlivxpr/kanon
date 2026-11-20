@@ -151,31 +151,24 @@ fn filter_bar(
         }))
         .child(dynamic(move || {
             let current = filter.get();
-            // `-1` marks 全部, `-2` marks 无项目, otherwise a Project id;
-            // each chip owns its scope so the row needs no shared borrow.
-            let mut options: Vec<(String, i64)> =
-                vec![("全部".to_owned(), -1), ("无项目".to_owned(), -2)];
-            options.extend(store.projects().into_iter().map(|project| (project.name, project.id)));
-            let names = options.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>();
-            let selected = options
-                .iter()
-                .map(|(_, id)| match *id {
-                    -1 => current.project == ProjectFilter::All,
-                    -2 => current.project == ProjectFilter::Unassigned,
-                    id => current.project == ProjectFilter::Project(id),
-                })
+            // One typed option per chip: the two fixed scopes and every
+            // Project (was the ("全部", -1)/("无项目", -2) sentinel
+            // tuples plus parallel arrays).
+            let options = std::iter::once(("全部".to_owned(), ProjectScope::All))
+                .chain(std::iter::once(("无项目".to_owned(), ProjectScope::Unassigned)))
+                .chain(
+                    store
+                        .projects()
+                        .into_iter()
+                        .map(|project| (project.name, ProjectScope::Project(project.id))),
+                )
+                .map(|(name, scope)| (name, scope, current.project == scope.to_filter()))
                 .collect::<Vec<_>>();
             chip_row_owned(
                 "项目",
-                names,
-                selected,
+                options,
                 "项目筛选",
-                options.iter().map(|(_, id)| *id).collect(),
-                move |scope| match scope {
-                    -1 => filter.update(|f| f.project = ProjectFilter::All),
-                    -2 => filter.update(|f| f.project = ProjectFilter::Unassigned),
-                    id => filter.update(|f| f.project = ProjectFilter::Project(id)),
-                },
+                move |scope| filter.update(|f| f.project = scope.to_filter()),
             )
             .into_element()
         }))
@@ -199,8 +192,7 @@ fn filter_bar(
         }))
 }
 
-/// A labelled row of small toggle chips (the Tasks view's filters); the
-/// option at `index` reports `scopes[index]` to `on_select`.
+/// A labelled row of small toggle chips (the Tasks view's filters).
 fn chip_row(
     label: &'static str,
     names: &[&str],
@@ -210,22 +202,24 @@ fn chip_row(
 ) -> impl IntoElement {
     chip_row_owned(
         label,
-        names.iter().map(|name| (*name).to_owned()).collect::<Vec<_>>(),
-        selected.to_vec(),
+        names
+            .iter()
+            .zip(selected)
+            .enumerate()
+            .map(|(index, (name, selected))| ((*name).to_owned(), index as i64, *selected))
+            .collect(),
         action,
-        (0..names.len() as i64).collect(),
         on_select,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn chip_row_owned(
+/// One chip option: its label, the scope it reports, and whether it is
+/// selected — a single pass, no parallel arrays.
+fn chip_row_owned<S: Copy + 'static>(
     label: &'static str,
-    names: Vec<String>,
-    selected: Vec<bool>,
+    options: Vec<(String, S, bool)>,
     action: &'static str,
-    scopes: Vec<i64>,
-    on_select: impl Fn(i64) + Copy + 'static,
+    on_select: impl Fn(S) + Copy + 'static,
 ) -> impl IntoElement {
     view()
         .flex_row()
@@ -237,10 +231,7 @@ fn chip_row_owned(
                 .flex_row()
                 .gap_1()
                 .flex_wrap()
-                .children(names.iter().enumerate().map(|(index, name)| {
-                    let selected = selected[index];
-                    let scope = scopes[index];
-                    let name = name.clone();
+                .children(options.into_iter().map(|(name, scope, selected)| {
                     button()
                         .on_press(move |_: &()| on_select(scope))
                         .accessibility_label(Some(format!("{action} {name}").into()))
@@ -265,6 +256,24 @@ fn chip_row_owned(
                         .into_element()
                 })),
         )
+}
+
+/// The Project filter's scopes: the two fixed ones and a real Project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectScope {
+    All,
+    Unassigned,
+    Project(i64),
+}
+
+impl ProjectScope {
+    fn to_filter(self) -> ProjectFilter {
+        match self {
+            Self::All => ProjectFilter::All,
+            Self::Unassigned => ProjectFilter::Unassigned,
+            Self::Project(id) => ProjectFilter::Project(id),
+        }
+    }
 }
 
 /// One group of the mutual-exclusion grouping: heading, count, rows.

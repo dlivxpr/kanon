@@ -7,7 +7,7 @@ use nsh_core::prelude::*;
 use crate::ui::theme as tokens;
 
 use super::store::{use_store, Store};
-use super::tabs::Route;
+use super::tabs::{ProjectSection, Route};
 
 /// The main navigation destinations, in display order.
 const NAV: &[Route] = &[
@@ -23,6 +23,32 @@ const NAV: &[Route] = &[
 
 const BOTTOM: &[Route] = &[Route::KnowledgeBases, Route::Trash, Route::Settings];
 
+/// Whether the responsive rules (docs/ui-design.md §3.4) currently
+/// force the outer sidebar into its icon rail: a window under
+/// 1440 px showing an inner-catalog destination. The strip read is
+/// tracked: bindings that ask re-run when the active tab changes.
+/// A Project counts only while its Linked Documents sub-view shows.
+pub(crate) fn sidebar_auto_collapsed(store: Store) -> bool {
+    let strip = store.strip.get();
+    window().width.0 < 1440.0
+        && strip.tabs.get(strip.active).is_some_and(|tab| match &tab.current {
+            Route::Book(_) | Route::Document(_) => true,
+            Route::Project(_) => tab.project_section == ProjectSection::Documents,
+            _ => false,
+        })
+}
+
+/// The sidebar's effective width state for the current window and
+/// tab: the auto rule wins unless manually expanded for a while.
+pub(crate) fn sidebar_effective_collapsed(store: Store) -> bool {
+    store.bump.get();
+    if sidebar_auto_collapsed(store) {
+        !store.sidebar_temp_expand.get()
+    } else {
+        store.sidebar_collapsed.get()
+    }
+}
+
 pub fn sidebar() -> impl IntoElement {
     let store = use_store();
     // The window width subscribes the binding: resizing across the
@@ -30,7 +56,7 @@ pub fn sidebar() -> impl IntoElement {
     // (docs/ui-design.md §3.4).
     let width = move || {
         let _ = window();
-        if store.sidebar_effective_collapsed() { px(64.0) } else { px(232.0) }
+        if sidebar_effective_collapsed(store) { px(64.0) } else { px(232.0) }
     };
     view()
         .w(width)
@@ -50,7 +76,7 @@ pub fn sidebar() -> impl IntoElement {
 /// projects with their emoji/color and the open-task badge, plus a `+`
 /// that quick-creates a Project. Rows collapse to icons in the rail.
 fn projects_section(store: Store) -> impl IntoElement {
-    let collapsed = move || store.sidebar_effective_collapsed();
+    let collapsed = move || sidebar_effective_collapsed(store);
     let projects = move || {
         store.bump.get();
         store.projects()
@@ -175,7 +201,7 @@ fn nav_row(store: Store, route: &'static Route) -> impl IntoElement {
         let strip = store.strip.get();
         strip.tabs.get(strip.active).is_some_and(|tab| tab.current == *route)
     };
-    let collapsed = move || store.sidebar_effective_collapsed();
+    let collapsed = move || sidebar_effective_collapsed(store);
     let label = route.title();
     let glyph = route.glyph();
     nsh_base::button()

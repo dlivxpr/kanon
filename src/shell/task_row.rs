@@ -60,7 +60,7 @@ pub fn task_row(store: Store, aggregate: TaskAggregate) -> impl IntoElement {
                                 .child(
                                     text(row_title.clone())
                                         .text_size(px(14.0))
-                                        .text_color(move || tokens::fg_primary())
+                                        .text_color(tokens::fg_primary())
                                         .number_of_lines(1),
                                 ),
                         )

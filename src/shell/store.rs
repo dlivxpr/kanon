@@ -688,37 +688,6 @@ impl Store {
         }
     }
 
-    /// The catalog row menu's reorder: `delta` of -1/1 moves the node
-    /// one slot within its level.
-    pub fn move_catalog_node_rel(&self, id: i64, delta: isize) {
-        let (book_id, parent) = {
-            let node = self.workspace.with(|ws| ws.catalog_node(id).ok().flatten());
-            match node {
-                Some(node) => (node.book_id, node.parent_id),
-                None => return,
-            }
-        };
-        let outline = self
-            .workspace
-            .with(|ws| ws.catalog_outline(book_id).unwrap_or_default());
-        let siblings = outline
-            .iter()
-            .filter(|entry| entry.node.parent_id == parent)
-            .map(|entry| entry.node.id)
-            .collect::<Vec<_>>();
-        let Some(position) = siblings.iter().position(|sibling| *sibling == id) else {
-            return;
-        };
-        let at = (position as isize + delta).clamp(0, siblings.len() as isize - 1) as usize;
-        self.move_catalog_node(id, parent, at);
-    }
-
-    /// The catalog row menu's outdent: move the node to the top of the
-    /// book's root level.
-    pub fn move_catalog_node_to_top(&self, id: i64) {
-        self.move_catalog_node(id, None, 0);
-    }
-
     pub fn set_node_expanded(&self, id: i64, expanded: bool) {
         if let Err(err) = self
             .workspace
@@ -1357,34 +1326,11 @@ impl Store {
     // Shell commands
     // ------------------------------------------------------------------
 
-    /// Whether the responsive rules (docs/ui-design.md §3.4) currently
-    /// force the outer sidebar into its icon rail: a window under
-    /// 1440 px showing an inner-catalog destination. The strip read is
-    /// tracked: bindings that ask re-run when the active tab changes.
-    /// A Project counts only while its Linked Documents sub-view shows.
-    pub fn sidebar_auto_collapsed(&self) -> bool {
-        let strip = self.strip.get();
-        nsh_core::prelude::window().width.0 < 1440.0
-            && strip.tabs.get(strip.active).is_some_and(|tab| match &tab.current {
-                Route::Book(_) | Route::Document(_) => true,
-                Route::Project(_) => tab.project_section == ProjectSection::Documents,
-                _ => false,
-            })
-    }
-
-    /// The sidebar's effective width state for the current window and
-    /// tab: the auto rule wins unless manually expanded for a while.
-    pub fn sidebar_effective_collapsed(&self) -> bool {
-        self.bump.get();
-        if self.sidebar_auto_collapsed() {
-            !self.sidebar_temp_expand.get()
-        } else {
-            self.sidebar_collapsed.get()
-        }
-    }
-
+    /// The sidebar's persistence-backed toggle. The responsive RULE
+    /// lives in the sidebar UI layer (docs/ui-design.md §3.4); this
+    /// method only applies its outcome.
     pub fn toggle_sidebar(&self) {
-        if self.sidebar_auto_collapsed() {
+        if super::sidebar::sidebar_auto_collapsed(*self) {
             self.sidebar_temp_expand
                 .update(|expanded| *expanded = !*expanded);
             return;

@@ -277,26 +277,34 @@ fn sub_view_switch(
             .map(|candidate| {
                 let candidate = *candidate;
                 let active = move || section() == candidate;
-                nsh_base::button()
-                    .on_press(move || store.set_project_section(candidate))
-                    .accessibility_label(candidate.label())
-                    .h(px(28.0))
-                    .px_3()
-                    .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .border_1()
-                    .border_color(move || {
-                        if active() { tokens::accent() } else { tokens::border_subtle() }
+                view()
+                    .child(
+                        nsh_base::button()
+                            .on_press(move || store.set_project_section(candidate))
+                            .accessibility_label(candidate.label())
+                            .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
+                            .h(px(28.0))
+                            .px_3()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .border_1()
+                            .border_color(move || {
+                                if active() { tokens::accent() } else { tokens::border_subtle() }
+                            })
+                            .bg(move || {
+                                if active() { tokens::accent_soft() } else { theme().background.opacity(0.0) }
+                            })
+                            .text_color(move || {
+                                if active() { tokens::accent() } else { tokens::fg_body() }
+                            })
+                            .hover(|s| s.bg(tokens::control_hover()))
+                            .child(text(candidate.label()).text_size(px(12.0))),
+                    )
+                    .accessibility_state(move || {
+                        nsh_core::AccessibilityState { selected: active(), ..Default::default() }
                     })
-                    .bg(move || {
-                        if active() { tokens::accent_soft() } else { theme().background.opacity(0.0) }
-                    })
-                    .text_color(move || {
-                        if active() { tokens::accent() } else { tokens::fg_body() }
-                    })
-                    .hover(|s| s.bg(tokens::control_hover()))
-                    .child(text(candidate.label()).text_size(px(12.0)))
+                    .into_element()
             })
             .collect::<Vec<_>>(),
         )

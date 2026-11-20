@@ -734,7 +734,7 @@ pub fn catalog_sidebar(
                                 catalog_row(
                                     CatalogCtx { store, focus, nav, filter, pending, located },
                                     entry,
-                                    move || outline(),
+                                    outline,
                                 )
                             },
                         )),
@@ -790,6 +790,7 @@ pub fn catalog_sidebar(
                                         .accessibility_label(move || {
                                             Some(format!("恢复 {}", node.with(|node| node.title.clone())).into())
                                         })
+                                        .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
                                         .px_2()
                                         .py_1()
                                         .rounded(tokens::radius_row())
@@ -840,6 +841,37 @@ fn node_title(outline: &[CatalogEntry], id: i64) -> String {
         .unwrap_or_default()
 }
 
+/// The catalog row menu's reorder: `delta` of -1/1 moves the node one
+/// slot within its level. The sibling ordering is a presentation
+/// concern: it is computed here, in the catalog UI layer, and committed
+/// through `Store::move_catalog_node`.
+fn move_catalog_node_rel(store: Store, id: i64, delta: isize) {
+    let (book_id, parent) = {
+        let node = store.catalog_node(id);
+        match node {
+            Some(node) => (node.book_id, node.parent_id),
+            None => return,
+        }
+    };
+    let outline = store.catalog_outline(book_id);
+    let siblings = outline
+        .iter()
+        .filter(|entry| entry.node.parent_id == parent)
+        .map(|entry| entry.node.id)
+        .collect::<Vec<_>>();
+    let Some(position) = siblings.iter().position(|sibling| *sibling == id) else {
+        return;
+    };
+    let at = (position as isize + delta).clamp(0, siblings.len() as isize - 1) as usize;
+    store.move_catalog_node(id, parent, at);
+}
+
+/// The catalog row menu's outdent: move the node to the top of the
+/// book's root level.
+fn move_catalog_node_to_top(store: Store, id: i64) {
+    store.move_catalog_node(id, None, 0);
+}
+
 fn home_row(
     store: Store,
     book_id: i64,
@@ -853,6 +885,7 @@ fn home_row(
             CatalogNav::Project { .. } => store.set_project_document(None),
         })
         .accessibility_label("首页")
+        .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
         .h(px(30.0))
         .w_full()
         .items_center()
@@ -880,6 +913,7 @@ fn book_switcher(store: Store, book_id: i64) -> nsh_base::MenuElement {
             nsh_base::button()
                 .accessibility_label("切换知识库")
                 .test_id("book-switcher")
+                .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
                 .h(px(30.0))
                 .w_full()
                 .items_center()
@@ -1000,14 +1034,26 @@ fn catalog_row(
             view().w(px(26.0)).child(when(
                 move || has_children() && !filtering(),
                 move || {
-                    panel_icon_button(
-                        move || if expanded() { "▾" } else { "▸" },
-                        "切换展开",
-                        move || store.set_node_expanded(node_id(), !expanded()),
-                    )
-                    .accessibility_label(move || {
-                        Some(format!("{} {}", if expanded() { "收起" } else { "展开" }, title()).into())
-                    })
+                    view()
+                        .child(
+                            panel_icon_button(
+                                move || if expanded() { "▾" } else { "▸" },
+                                "切换展开",
+                                move || store.set_node_expanded(node_id(), !expanded()),
+                            )
+                            .accessibility_label(move || {
+                                Some(
+                                    format!("{} {}", if expanded() { "收起" } else { "展开" }, title())
+                                        .into(),
+                                )
+                            }),
+                        )
+                        .accessibility_state(move || {
+                            nsh_core::AccessibilityState {
+                                expanded: Some(expanded()),
+                                ..Default::default()
+                            }
+                        })
                 },
             )),
         )
@@ -1026,6 +1072,7 @@ fn catalog_row(
                     }
                 })
                 .accessibility_label(move || Some(title().into()))
+                .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
                 .flex_1()
                 .min_w(px(0.0))
                 .items_center()
@@ -1045,6 +1092,7 @@ fn catalog_row(
                     pending.set(Some(PendingCreate::Document { parent }));
                 })
                 .accessibility_label("新建子文档")
+                .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
                 .size(px(22.0))
                 .items_center()
                 .justify_center()
@@ -1081,7 +1129,7 @@ fn catalog_row(
                 .child(menu_separator().h(px(1.0)).my_1().bg(tokens::border_subtle()))
                 .child(
                     menu_item()
-                        .on_select(move || store.move_catalog_node_rel(node_id(), -1))
+                        .on_select(move || move_catalog_node_rel(store, node_id(), -1))
                         .px_3()
                         .py_2()
                         .rounded(tokens::radius_row())
@@ -1090,7 +1138,7 @@ fn catalog_row(
                 )
                 .child(
                     menu_item()
-                        .on_select(move || store.move_catalog_node_rel(node_id(), 1))
+                        .on_select(move || move_catalog_node_rel(store, node_id(), 1))
                         .px_3()
                         .py_2()
                         .rounded(tokens::radius_row())
@@ -1099,7 +1147,7 @@ fn catalog_row(
                 )
                 .child(
                     menu_item()
-                        .on_select(move || store.move_catalog_node_to_top(node_id()))
+                        .on_select(move || move_catalog_node_to_top(store, node_id()))
                         .px_3()
                         .py_2()
                         .rounded(tokens::radius_row())
@@ -1306,6 +1354,7 @@ fn home_catalog(store: Store, book_id: i64) -> impl IntoElement {
                                 }
                             })
                             .accessibility_label(move || Some(title().into()))
+                            .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
                             .items_end()
                             .gap_2()
                             .flex_1()
