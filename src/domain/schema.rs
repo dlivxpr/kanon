@@ -6,7 +6,7 @@
 //! preferences live in one database and commit atomically.
 
 /// The schema version `user_version` is set to after migration.
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// The complete workspace schema, applied inside one transaction.
 pub const SCHEMA: &str = "
@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS documents (
     body TEXT NOT NULL DEFAULT '',
     word_count INTEGER NOT NULL DEFAULT 0,
     favorited INTEGER NOT NULL DEFAULT 0,
+    version INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     trashed_at TEXT

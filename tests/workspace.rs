@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use nsh_app_kanon::domain::{
     FixedClock, LocalDate, LocalDateTime, LocalTime, NewTask, Priority, TaskPatch, TaskStatus,
-    Workspace,
+    Workspace, count_words,
 };
 
 fn at(text: &str) -> Arc<FixedClock> {
@@ -358,4 +358,157 @@ fn task_patch_sets_and_clears_independent_dates() {
     assert_eq!(task.scheduled_time, None);
     assert_eq!(task.due_date, Some(date("2026-11-23")), "due date independent");
     assert_eq!(task.due_time, Some(time("17:00")), "due time independent");
+}
+
+#[test]
+fn document_body_update_persists_word_count_and_survives_reopen() {
+    let (mut ws, path, _clock) = workspace_at("doc-body", "2026-11-20 09:00");
+    let book = ws.create_knowledge_base("手册").expect("kb");
+    let doc = ws.create_document(book.id, None, "入门").expect("doc");
+
+    let saved = ws
+        .update_document_body(doc.id, "入门", "# 你好 world\n\n- [ ] 清单项", None)
+        .expect("save body");
+    assert_eq!(saved.word_count, 6, "two CJK heading words + world + three CJK item words");
+    assert_ne!(saved.updated_at, "", "every commit stamps updated_at");
+
+    // A checklist rewrite is body-only persistence: it never invents Tasks
+    // (ADR-0002), so the workspace stays task-free.
+    let rewritten = ws
+        .update_document_body(doc.id, "入门", "# 你好 world\n\n- [x] 清单项", None)
+        .expect("rewrite body");
+    assert_eq!(rewritten.body, "# 你好 world\n\n- [x] 清单项");
+    assert_eq!(ws.task_groups().expect("groups").total_active(), 0, "no global Task appears");
+    drop(ws);
+
+    let ws = Workspace::open(&path, at("2026-11-20 09:30")).expect("reopen");
+    let reopened = ws.document(doc.id).expect("load").expect("present");
+    assert_eq!(reopened.body, "# 你好 world\n\n- [x] 清单项", "the body survives a restart");
+    assert_eq!(reopened.word_count, 6);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn optimistic_body_update_rejects_stale_base_and_retry_commits() {
+    let (mut ws, _path, _clock) = workspace_at("doc-stale", "2026-11-20 09:00");
+    let book = ws.create_knowledge_base("手册").expect("kb");
+    let doc = ws.create_document(book.id, None, "入门").expect("doc");
+    let base = ws.document(doc.id).expect("load").expect("present").version;
+
+    // A concurrent writer (another tab, another process) commits first.
+    ws.update_document_body(doc.id, "入门", "别人的修改", None).expect("concurrent write");
+
+    // The editor's auto-save still speaks from the stale base: rejected,
+    // so the draft is never silently lost over someone else's commit.
+    let stale = ws.update_document_body(doc.id, "入门", "我的草稿", Some(base));
+    assert!(matches!(stale, Err(nsh_app_kanon::domain::WorkspaceError::StaleDocument)), "stale base refuses");
+
+    // Retry against the fresh base commits the same draft.
+    let fresh = ws.document(doc.id).expect("load").expect("present").version;
+    let committed = ws
+        .update_document_body(doc.id, "入门", "我的草稿", Some(fresh))
+        .expect("retry commits");
+    assert_eq!(committed.body, "我的草稿");
+    assert_eq!(committed.title, "入门");
+    assert!(committed.version > fresh, "a successful commit bumps the version");
+}
+
+#[test]
+fn revisions_snapshot_and_restore_only_document_content_and_reference_positions() {
+    let (mut ws, path, clock) = workspace_at("doc-restore", "2026-11-20 09:00");
+    let book = ws.create_knowledge_base("手册").expect("kb");
+    let doc = ws.create_document(book.id, None, "方案").expect("doc");
+
+    // v1: the body mentions Kanon right away; the mention is indexed.
+    ws.update_document_body(doc.id, "方案 v1", "和 Kanon 一起\n\n尾部", None).expect("v1 body");
+    let mention = ws
+        .add_document_reference(doc.id, "mention", "document", Some(7), "Kanon", 2)
+        .expect("mention index");
+    let auto = ws.save_document_revision(doc.id, None).expect("auto snapshot");
+    assert_eq!(auto.name, None, "no name records an automatic snapshot");
+    let v1 = ws.save_document_revision(doc.id, Some("v1")).expect("named version");
+    assert_eq!(v1.name.as_deref(), Some("v1"));
+
+    // The body keeps moving after v1; a live Task is referenced too.
+    clock.advance_to(LocalDateTime::parse("2026-11-20 10:00").unwrap());
+    ws.update_document_body(doc.id, "方案 v2", "开头很长的一段\n\n和 Kanon 一起", None).expect("v2 body");
+    ws.save_document_revision(doc.id, None).expect("another auto snapshot");
+    let task = ws
+        .create_task(&NewTask { title: "被引用的任务".to_owned(), ..Default::default() })
+        .expect("task")
+        .task;
+    let card = ws
+        .add_document_reference(doc.id, "task_card", "task", Some(task.id), "被引用的任务", 14)
+        .expect("card index");
+
+    // Restoring v1 puts back exactly title/body and re-anchors the
+    // references' positions against the restored text; nothing else moves.
+    let restored = ws.restore_document_revision(v1.id).expect("restore v1");
+    assert_eq!(restored.title, "方案 v1");
+    assert_eq!(restored.body, "和 Kanon 一起\n\n尾部");
+    assert_eq!(restored.word_count, count_words("和 Kanon 一起\n\n尾部"));
+
+    let refs = ws.document_references(doc.id).expect("refs");
+    let mention = refs.iter().find(|r| r.id == mention.id).expect("mention survives");
+    assert_eq!(mention.position, 2, "Kanon starts at UTF-16 offset 2 in the restored body");
+    let card = refs.iter().find(|r| r.id == card.id).expect("card survives");
+    assert_eq!(card.position, 14, "labels absent from the restored body keep their position");
+
+    // The Task itself is never mutated by a document restore.
+    let untouched = ws.task(task.id).expect("load").expect("present").task;
+    assert_eq!(untouched.title, "被引用的任务");
+    assert_eq!(untouched.status, TaskStatus::Todo);
+    drop(ws);
+
+    // The restore is durable across a restart.
+    let ws = Workspace::open(&path, at("2026-11-20 10:30")).expect("reopen");
+    assert_eq!(ws.document(doc.id).expect("load").expect("present").body, "和 Kanon 一起\n\n尾部");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn revision_listing_orders_newest_first_and_separates_named_from_auto() {
+    let (mut ws, _path, clock) = workspace_at("doc-history", "2026-11-20 09:00");
+    let book = ws.create_knowledge_base("手册").expect("kb");
+    let doc = ws.create_document(book.id, None, "日志").expect("doc");
+
+    ws.save_document_revision(doc.id, None).expect("auto 1");
+    clock.advance_to(LocalDateTime::parse("2026-11-20 09:10").unwrap());
+    ws.save_document_revision(doc.id, Some("评审版")).expect("named");
+    clock.advance_to(LocalDateTime::parse("2026-11-20 09:20").unwrap());
+    ws.save_document_revision(doc.id, None).expect("auto 2");
+
+    let revisions = ws.document_revisions(doc.id).expect("list");
+    assert_eq!(revisions.len(), 3);
+    assert_eq!(revisions[0].name, None, "newest first: the second auto snapshot");
+    assert_eq!(revisions[1].name.as_deref(), Some("评审版"));
+    assert_eq!(revisions[2].name, None);
+    assert!(revisions.windows(2).all(|w| w[0].created_at >= w[1].created_at), "ordered for the history panel");
+}
+
+#[test]
+fn version2_migration_adds_document_version_to_existing_databases() {
+    let path = temp_db("migrate-v2");
+    // A version-1 database, as shipped by the previous milestone: a
+    // documents table without the optimistic-locking column.
+    {
+        let conn = rusqlite::Connection::open(&path).expect("raw v1 db");
+        conn.execute_batch(
+            "CREATE TABLE knowledge_bases (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', icon TEXT NOT NULL DEFAULT '📕', color TEXT NOT NULL DEFAULT '#547093', favorited INTEGER NOT NULL DEFAULT 0, sort_order INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, trashed_at TEXT);
+             CREATE TABLE documents (id INTEGER PRIMARY KEY AUTOINCREMENT, book_id INTEGER NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', word_count INTEGER NOT NULL DEFAULT 0, favorited INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, trashed_at TEXT);
+             INSERT INTO knowledge_bases (name, created_at, updated_at) VALUES ('旧库', '2026-11-20 09:00', '2026-11-20 09:00');
+             INSERT INTO documents (book_id, title, created_at, updated_at) VALUES (1, '旧文档', '2026-11-20 09:00', '2026-11-20 09:00');
+             PRAGMA user_version = 1;",
+        )
+        .expect("v1 schema with data");
+    }
+    // The current facade opens it, migrates in place, and keeps the data.
+    let mut ws = Workspace::open(&path, at("2026-11-20 10:00")).expect("open migrates");
+    let doc = ws.document(1).expect("load").expect("present");
+    assert_eq!(doc.title, "旧文档");
+    assert_eq!(doc.version, 0, "existing rows start at version 0");
+    let saved = ws.update_document_body(1, "旧文档", "新内容", Some(doc.version)).expect("optimistic write");
+    assert_eq!(saved.version, 1);
+    assert_eq!(ws.document(1).expect("reload").expect("present").body, "新内容");
+    let _ = std::fs::remove_file(path);
 }

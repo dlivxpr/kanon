@@ -5,11 +5,13 @@
 
 mod clock;
 mod date;
+mod document;
 mod schema;
 mod task;
 mod workspace;
 
 pub use clock::*;
 pub use date::*;
+pub use document::*;
 pub use task::*;
 pub use workspace::*;

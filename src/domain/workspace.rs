@@ -24,6 +24,9 @@ pub enum WorkspaceError {
     Sqlite(rusqlite::Error),
     /// A date/time string in storage or input that is not well-formed.
     InvalidDateTime(String),
+    /// An optimistic write whose base `updated_at` no longer matches the
+    /// row: someone else committed first; retry against a fresh base.
+    StaleDocument,
 }
 
 impl fmt::Display for WorkspaceError {
@@ -31,6 +34,7 @@ impl fmt::Display for WorkspaceError {
         match self {
             Self::Sqlite(err) => write!(f, "SQLite error: {err}"),
             Self::InvalidDateTime(value) => write!(f, "invalid date/time value: {value}"),
+            Self::StaleDocument => write!(f, "the document changed since this edit began"),
         }
     }
 }
@@ -74,6 +78,13 @@ pub struct Document {
     pub book_id: i64,
     pub title: String,
     pub body: String,
+    /// The commit stamp of the last body write.
+    pub updated_at: String,
+    /// `count_words` of `body`, persisted with every write.
+    pub word_count: u64,
+    /// Bumped on every body write: the optimistic-locking base of the
+    /// single editor's auto-save.
+    pub version: i64,
 }
 
 /// A saved Document revision: `name = None` is an automatic snapshot,
@@ -85,6 +96,8 @@ pub struct DocumentRevision {
     pub title: String,
     pub body: String,
     pub name: Option<String>,
+    /// When the revision was recorded (the workspace clock's stamp).
+    pub created_at: String,
 }
 
 /// An indexed projection of a Linked Task Card or an inline `@` mention
@@ -97,6 +110,10 @@ pub struct DocumentReference {
     pub target_kind: String,
     pub target_id: Option<i64>,
     pub target_label: String,
+    /// Where in the body the reference anchors, in UTF-16 code units as
+    /// the editor counts; a restore re-anchors it (see
+    /// [`Workspace::restore_document_revision`]).
+    pub position: i64,
 }
 
 /// A Project with its optional `(linked_book_id, linked_group_node_id)`
@@ -186,6 +203,11 @@ impl Workspace {
         let tx = self.conn.transaction()?;
         tx.execute_batch(SCHEMA)?;
         let version: i32 = tx.query_row("SELECT user_version FROM pragma_user_version", [], |row| row.get(0))?;
+        if version < 2 && !table_has_column(&tx, "documents", "version")? {
+            // Version 2 adds the optimistic-locking counter of the
+            // single-editor auto-save.
+            tx.execute_batch("ALTER TABLE documents ADD COLUMN version INTEGER NOT NULL DEFAULT 0;")?;
+        }
         if version < SCHEMA_VERSION {
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
@@ -548,6 +570,26 @@ impl Workspace {
         })
     }
 
+    /// Loads a Knowledge Base (the document breadcrumb shows its name).
+    pub fn knowledge_base(&self, id: i64) -> Result<Option<KnowledgeBase>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, name, description, icon, color FROM knowledge_bases WHERE id = ?",
+                params![id],
+                |row| {
+                    Ok(KnowledgeBase {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        description: row.get(2)?,
+                        icon: row.get(3)?,
+                        color: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
     /// Creates a Document strictly inside one Knowledge Base
     /// (ADR-0001), optionally under a parent Catalog Node, and links it
     /// into the catalog tree.
@@ -570,7 +612,15 @@ impl Workspace {
             params![book_id, parent_node_id, document_id, title, now, now],
         )?;
         tx.commit()?;
-        Ok(Document { id: document_id, book_id, title: title.to_owned(), body: String::new() })
+        Ok(Document {
+            id: document_id,
+            book_id,
+            title: title.to_owned(),
+            body: String::new(),
+            updated_at: now.clone(),
+            word_count: 0,
+            version: 0,
+        })
     }
 
     /// Creates a pure grouping Catalog Node (or a child position).
@@ -600,13 +650,21 @@ impl Workspace {
         let document = self
             .document(document_id)?
             .ok_or_else(|| WorkspaceError::InvalidDateTime(format!("no document {document_id}")))?;
+        let created_at = self.stamp();
         self.conn.execute(
             "INSERT INTO document_revisions (document_id, title, body, name, created_at) \
              VALUES (?, ?, ?, ?, ?)",
-            params![document_id, document.title, document.body, name, self.stamp()],
+            params![document_id, document.title, document.body, name, created_at],
         )?;
         let id = self.conn.last_insert_rowid();
-        Ok(DocumentRevision { id, document_id, title: document.title, body: document.body, name: name.map(str::to_owned) })
+        Ok(DocumentRevision {
+            id,
+            document_id,
+            title: document.title,
+            body: document.body,
+            name: name.map(str::to_owned),
+            created_at,
+        })
     }
 
     /// Indexes a Linked Task Card or `@` mention inside a Document.
@@ -634,6 +692,7 @@ impl Workspace {
             target_kind: target_kind.to_owned(),
             target_id,
             target_label: target_label.to_owned(),
+            position,
         })
     }
 
@@ -642,7 +701,8 @@ impl Workspace {
         Ok(self
             .conn
             .query_row(
-                "SELECT id, book_id, title, body FROM documents WHERE id = ?",
+                "SELECT id, book_id, title, body, updated_at, word_count, version \
+                 FROM documents WHERE id = ?",
                 params![id],
                 |row| {
                     Ok(Document {
@@ -650,6 +710,135 @@ impl Workspace {
                         book_id: row.get(1)?,
                         title: row.get(2)?,
                         body: row.get(3)?,
+                        updated_at: row.get(4)?,
+                        word_count: row.get::<_, i64>(5)? as u64,
+                        version: row.get(6)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Commits a body write: title, body and the derived word count land
+    /// in one statement. With `base_version` the write is optimistic — it
+    /// refuses with [`WorkspaceError::StaleDocument`] when another tab or
+    /// process committed first, so a draft is never silently overwritten;
+    /// re-read the document and retry with its fresh version.
+    pub fn update_document_body(
+        &mut self,
+        id: i64,
+        title: &str,
+        body: &str,
+        base_version: Option<i64>,
+    ) -> Result<Document> {
+        let now = self.stamp();
+        let words = super::document::count_words(body) as i64;
+        let changed = match base_version {
+            Some(base) => self.conn.execute(
+                "UPDATE documents SET title = ?, body = ?, word_count = ?, updated_at = ?, \
+                 version = version + 1 WHERE id = ? AND version = ?",
+                params![title, body, words, now, id, base],
+            )?,
+            None => self.conn.execute(
+                "UPDATE documents SET title = ?, body = ?, word_count = ?, updated_at = ?, \
+                 version = version + 1 WHERE id = ?",
+                params![title, body, words, now, id],
+            )?,
+        };
+        if changed == 0 {
+            if base_version.is_some() && self.document(id)?.is_some() {
+                return Err(WorkspaceError::StaleDocument);
+            }
+            return Err(WorkspaceError::InvalidDateTime(format!("no document {id}")));
+        }
+        Ok(self.document(id)?.expect("document exists after update"))
+    }
+
+    /// Every revision of a Document, newest first for the history panel.
+    pub fn document_revisions(&self, document_id: i64) -> Result<Vec<DocumentRevision>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, document_id, title, body, name, created_at FROM document_revisions \
+             WHERE document_id = ? ORDER BY created_at DESC, id DESC",
+        )?;
+        Ok(stmt
+            .query_map(params![document_id], |row| {
+                Ok(DocumentRevision {
+                    id: row.get(0)?,
+                    document_id: row.get(1)?,
+                    title: row.get(2)?,
+                    body: row.get(3)?,
+                    name: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Every indexed reference of a Document, oldest first (their anchor
+    /// order in the body).
+    pub fn document_references(&self, document_id: i64) -> Result<Vec<DocumentReference>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, document_id, ref_type, target_kind, target_id, target_label, position \
+             FROM document_references WHERE document_id = ? ORDER BY position, id",
+        )?;
+        Ok(stmt
+            .query_map(params![document_id], |row| {
+                Ok(DocumentReference {
+                    id: row.get(0)?,
+                    document_id: row.get(1)?,
+                    ref_type: row.get(2)?,
+                    target_kind: row.get(3)?,
+                    target_id: row.get(4)?,
+                    target_label: row.get(5)?,
+                    position: row.get(6)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Restores a saved revision: the Document's title, body and word
+    /// count are rewritten, and its references are re-anchored to the
+    /// restored text (the first occurrence of each reference's label, in
+    /// UTF-16 offsets as the editor counts). References whose label the
+    /// restored body does not contain keep their position. No Task — and
+    /// no other object — is ever touched (ADR-0002).
+    pub fn restore_document_revision(&mut self, revision_id: i64) -> Result<Document> {
+        let revision = self
+            .document_revision(revision_id)?
+            .ok_or_else(|| WorkspaceError::InvalidDateTime(format!("no revision {revision_id}")))?;
+        let restored = self.update_document_body(
+            revision.document_id,
+            &revision.title,
+            &revision.body,
+            None,
+        )?;
+        let references = self.document_references(revision.document_id)?;
+        for reference in references {
+            if let Some(position) = utf16_position_of(&restored.body, &reference.target_label) {
+                self.conn.execute(
+                    "UPDATE document_references SET position = ? WHERE id = ?",
+                    params![position as i64, reference.id],
+                )?;
+            }
+        }
+        Ok(restored)
+    }
+
+    /// Loads a single revision.
+    pub fn document_revision(&self, revision_id: i64) -> Result<Option<DocumentRevision>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, document_id, title, body, name, created_at FROM document_revisions WHERE id = ?",
+                params![revision_id],
+                |row| {
+                    Ok(DocumentRevision {
+                        id: row.get(0)?,
+                        document_id: row.get(1)?,
+                        title: row.get(2)?,
+                        body: row.get(3)?,
+                        name: row.get(4)?,
+                        created_at: row.get(5)?,
                     })
                 },
             )
@@ -804,6 +993,23 @@ fn opt_time(value: Option<String>) -> std::result::Result<Option<LocalTime>, rus
     value
         .map(|text| LocalTime::parse(&text).ok_or_else(|| rusqlite::Error::InvalidQuery))
         .transpose()
+}
+
+/// Whether `table` already has `column` (a migration guard: `ALTER TABLE
+/// ADD COLUMN` fails on databases that were created with it).
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare("SELECT name FROM pragma_table_info(?)")?;
+    let columns = stmt
+        .query_map(params![table], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(columns.iter().any(|name| name == column))
+}
+
+/// Where `label` first occurs in `body`, counted in UTF-16 code units as
+/// the editor counts positions; `None` when absent.
+fn utf16_position_of(body: &str, label: &str) -> Option<usize> {
+    let byte = body.find(label)?;
+    Some(body[..byte].chars().map(char::len_utf16).sum())
 }
 
 fn task_from_row(row: &Row<'_>) -> std::result::Result<Task, rusqlite::Error> {

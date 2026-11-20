@@ -20,6 +20,11 @@ pub enum Route {
     KnowledgeBases,
     Trash,
     Settings,
+    /// A Document open in this tab (docs/ui-design.md §2.2 `doc/:docId`):
+    /// the payload is the document id. Equality is by id, so a Knowledge
+    /// Base's catalog focuses the tab already showing this Document
+    /// instead of opening a duplicate.
+    Document(i64),
 }
 
 impl Route {
@@ -37,6 +42,7 @@ impl Route {
             Self::KnowledgeBases => "知识库".to_owned(),
             Self::Trash => "回收站".to_owned(),
             Self::Settings => "设置".to_owned(),
+            Self::Document(_) => "文档".to_owned(),
         }
     }
 
@@ -54,6 +60,7 @@ impl Route {
             Self::KnowledgeBases => "📚",
             Self::Trash => "🗑",
             Self::Settings => "⚙",
+            Self::Document(_) => "📄",
         }
     }
 }
@@ -318,5 +325,22 @@ mod tests {
         let last = strip.tabs[1].id;
         assert!(strip.close_tab(last));
         assert_eq!(strip.active, 0);
+    }
+
+    #[test]
+    fn document_routes_focus_by_document_id_and_read_concurrently_in_new_tabs() {
+        let mut strip = TabStrip::new(Route::Document(7), today());
+        strip.open_tab(Route::Document(9), today());
+        strip.open_or_focus(Route::Document(7), today());
+        assert_eq!(strip.active, 0, "opening a Document focuses the tab already showing it");
+        assert_eq!(strip.tabs.len(), 2, "no duplicate tab for the same document");
+        strip.open_tab(Route::Document(7), today());
+        assert_eq!(
+            strip.tabs.iter().filter(|tab| tab.current == Route::Document(7)).count(),
+            2,
+            "a second tab on the same document is how concurrent reading happens"
+        );
+        strip.open_or_focus(Route::Tasks, today());
+        assert_eq!(strip.active_tab().current, Route::Tasks, "other routes keep navigating by reuse");
     }
 }

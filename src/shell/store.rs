@@ -8,7 +8,8 @@
 use nsh_core::prelude::*;
 
 use crate::domain::{
-    LocalDate, LocalDateTime, NewTask, TaskAggregate, TaskGroups, TaskPatch, Workspace,
+    Document, DocumentRevision, LocalDate, LocalDateTime, NewTask, TaskAggregate, TaskGroups,
+    TaskPatch, Workspace, WorkspaceError,
 };
 
 use super::tabs::{Route, TabStrip};
@@ -16,6 +17,34 @@ use super::tabs::{Route, TabStrip};
 /// The sidebar's persistence keys.
 pub const PREF_SIDEBAR_COLLAPSED: &str = "sidebar_collapsed";
 pub const PREF_PANEL_OPEN: &str = "context_panel_open";
+
+/// The single-editor lock (issue #6): at most one workbench tab holds
+/// edit ownership at a time, for any Document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditorLock {
+    pub tab_id: u64,
+    pub document_id: i64,
+}
+
+/// What answering an Edit request means for the requesting tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditOutcome {
+    /// The lock is (or was already) this tab's: switch to editing.
+    Granted,
+    /// Another tab holds the lock: focus the editing tab instead.
+    FocusOther(u64),
+}
+
+/// A reading tab's request to jump to one of the document's headings,
+/// answered by whichever tab shows that document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutlineRequest {
+    pub tab_id: u64,
+    /// Which heading among the body's headings, in document order.
+    pub ordinal: usize,
+    /// Bumped per request so repeats of the same heading re-fire.
+    pub nonce: u64,
+}
 
 /// The app-level store: one `Workspace` behind signals.
 #[derive(Clone, Copy)]
@@ -29,6 +58,11 @@ pub struct Store {
     pub panel_open: Signal<bool>,
     /// The Task shown in the right context panel's Task Detail.
     pub selected_task: Signal<Option<i64>>,
+    /// Which tab (if any) currently owns the single editor lock, and for
+    /// which Document.
+    pub editor_lock: Signal<Option<EditorLock>>,
+    /// The reading tab's latest outline-jump request.
+    pub outline_request: Signal<Option<OutlineRequest>>,
 }
 
 impl Store {
@@ -46,6 +80,8 @@ impl Store {
             sidebar_collapsed: signal(sidebar_collapsed),
             panel_open: signal(panel_open),
             selected_task: signal(None),
+            editor_lock: signal(None),
+            outline_request: signal(None),
         }
     }
 
@@ -221,6 +257,9 @@ impl Store {
     }
 
     pub fn close_tab(&self, id: u64) {
+        // Closing ends the tab's edit session first: the finish-to-read
+        // snapshot lands and the single-editor lock frees.
+        self.release_editor(id, true);
         self.strip.update(|strip| {
             strip.close_tab(id);
         });
@@ -260,6 +299,175 @@ impl Store {
         self.strip.update(|strip| {
             strip.tabs[strip.active].selected_date = date;
         });
+    }
+
+    // ------------------------------------------------------------------
+    // Documents: navigation, the single-editor lock, writes
+    // ------------------------------------------------------------------
+
+    /// Opens a Document in the workbench (the catalog tree's click): focus
+    /// the tab already showing it, else reuse or open per the sidebar rule.
+    pub fn open_document(&self, id: i64) {
+        self.open_or_focus(Route::Document(id));
+    }
+
+    /// Opens a Document in a new tab on purpose: how one Document is read
+    /// concurrently from several tabs.
+    pub fn open_document_in_new_tab(&self, id: i64) {
+        let today = self.now().date;
+        self.strip.update(|strip| strip.open_tab(Route::Document(id), today));
+    }
+
+    /// The committed Document, if it exists.
+    pub fn document(&self, id: i64) -> Option<Document> {
+        self.workspace.with(|ws| ws.document(id).unwrap_or_default())
+    }
+
+    /// The Document's history, newest first.
+    pub fn document_revisions(&self, id: i64) -> Vec<DocumentRevision> {
+        self.workspace.with(|ws| ws.document_revisions(id).unwrap_or_default())
+    }
+
+    /// The Knowledge Base a breadcrumb names.
+    pub fn knowledge_base(&self, id: i64) -> Option<crate::domain::KnowledgeBase> {
+        self.workspace.with(|ws| ws.knowledge_base(id).unwrap_or_default())
+    }
+
+    /// Answers a tab's Edit request under the single-editor invariant:
+    /// grant the lock when it is free or already this tab's, otherwise
+    /// name the tab the requester must focus.
+    pub fn request_edit(&self, tab_id: u64, document_id: i64) -> EditOutcome {
+        match self.editor_lock.get_untracked() {
+            Some(lock) if lock.tab_id == tab_id && lock.document_id == document_id => {
+                EditOutcome::Granted
+            }
+            Some(lock) => EditOutcome::FocusOther(lock.tab_id),
+            None => {
+                self.editor_lock.set(Some(EditorLock { tab_id, document_id }));
+                EditOutcome::Granted
+            }
+        }
+    }
+
+    /// Whether any tab is editing right now (reading tabs lock their
+    /// Checklist Items while this holds).
+    pub fn editing_locked(&self) -> bool {
+        self.editor_lock.get_untracked().is_some()
+    }
+
+    /// Ends the tab's edit session: records the finish-to-read transition
+    /// as an automatic history snapshot, then frees the lock. No-op when
+    /// the tab does not hold the lock.
+    pub fn release_editor(&self, tab_id: u64, snapshot: bool) {
+        let Some(lock) = self.editor_lock.get_untracked() else { return };
+        if lock.tab_id != tab_id {
+            return;
+        }
+        if snapshot {
+            self.take_snapshot(lock.document_id);
+        }
+        self.editor_lock.set(None);
+    }
+
+    /// Records an automatic history snapshot of the committed Document.
+    pub fn take_snapshot(&self, document_id: i64) {
+        if let Err(err) = self.workspace.with(|ws| ws.save_document_revision(document_id, None)) {
+            log::warn!("snapshot document {document_id} failed: {err}");
+        }
+    }
+
+    /// Saves the committed state as a user-named version.
+    pub fn save_named_version(&self, document_id: i64, name: &str) -> bool {
+        let name = name.trim();
+        if name.is_empty() {
+            return false;
+        }
+        match self.workspace.with(|ws| ws.save_document_revision(document_id, Some(name))) {
+            Ok(_) => {
+                self.bump();
+                true
+            }
+            Err(err) => {
+                log::warn!("named version failed: {err}");
+                false
+            }
+        }
+    }
+
+    /// The editing tab's auto-save: optimistic commit of title+body.
+    /// `Ok` carries the committed document (its `version` becomes the
+    /// next save's base); `Err(StaleDocument)` means another writer
+    /// committed first and the caller must keep the draft and offer a
+    /// retry against a fresh base.
+    pub fn save_document_body(
+        &self,
+        document_id: i64,
+        title: &str,
+        body: &str,
+        base_version: i64,
+    ) -> Result<Document, WorkspaceError> {
+        let result =
+            self.workspace.with(|ws| ws.update_document_body(document_id, title, body, Some(base_version)));
+        if result.is_ok() {
+            self.bump();
+        }
+        result
+    }
+
+    /// A reading tab's Checklist toggle when no edit session is active:
+    /// a body-only rewrite that never creates Tasks (ADR-0002).
+    pub fn toggle_reading_checklist(&self, document_id: i64, new_body: &str) -> bool {
+        let document = match self.document(document_id) {
+            Some(document) => document,
+            None => return false,
+        };
+        let result = self
+            .workspace
+            .with(|ws| ws.update_document_body(document_id, &document.title, new_body, None));
+        match result {
+            Ok(_) => {
+                self.bump();
+                true
+            }
+            Err(err) => {
+                log::warn!("reading checklist toggle failed: {err}");
+                false
+            }
+        }
+    }
+
+    /// Restores a history version: the current state is archived as an
+    /// automatic snapshot first, then the revision's title/body come back
+    /// and references re-anchor — never touching any Task.
+    pub fn restore_revision(&self, revision_id: i64) -> bool {
+        let result = self.workspace.with(|ws| {
+            let revision = ws
+                .document_revision(revision_id)?
+                .ok_or_else(|| WorkspaceError::InvalidDateTime(format!("no revision {revision_id}")))?;
+            ws.save_document_revision(revision.document_id, None)?;
+            ws.restore_document_revision(revision_id)
+        });
+        match result {
+            Ok(_) => {
+                self.bump();
+                true
+            }
+            Err(err) => {
+                log::warn!("restore revision {revision_id} failed: {err}");
+                false
+            }
+        }
+    }
+
+    /// A reading tab asks the tab showing the document to reveal one of
+    /// its headings.
+    pub fn request_outline_jump(&self, tab_id: u64, ordinal: usize) {
+        let nonce = self
+            .outline_request
+            .get_untracked()
+            .map(|request| request.nonce + 1)
+            .unwrap_or(1);
+        self.outline_request.set(Some(OutlineRequest { tab_id, ordinal, nonce }));
     }
 
     // ------------------------------------------------------------------
