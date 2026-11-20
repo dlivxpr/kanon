@@ -4,7 +4,7 @@
 
 use nsh_core::prelude::*;
 
-use crate::ui::controls::{input_field, panel, section_heading};
+use crate::ui::controls::{panel, section_heading, submit_field};
 use crate::ui::theme as tokens;
 
 use super::store::{use_store, Store};
@@ -72,10 +72,14 @@ fn overview(store: Store) -> impl IntoElement {
                             .flex_row()
                             .items_center()
                             .gap_2()
-                            .child(input_field(
+                            .child(submit_field(
                                 "速记待办，回车保存",
                                 move || capture.get(),
                                 move |text: &str| capture.set(text.to_owned()),
+                                move |text: &str| {
+                                    store.create_inbox_task(text);
+                                    capture.set(String::new());
+                                },
                             ))
                             .child(when(
                                 move || !capture.get().trim().is_empty(),

@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use nsh_app_kanon::domain::{
-    FixedClock, LocalDate, LocalDateTime, LocalTime, NewTask, Priority, TaskPatch, TaskStatus,
-    Workspace,
+    FixedClock, LocalDate, LocalDateTime, LocalTime, NewTask, Priority, ProjectFilter, TaskFilter,
+    TaskPatch, TaskSort, TaskStatus, Workspace,
 };
 
 fn at(text: &str) -> Arc<FixedClock> {
@@ -326,6 +326,213 @@ fn inbox_predicate_is_strict_and_groups_are_mutually_exclusive() {
     unique.sort();
     unique.dedup();
     assert_eq!(all.len(), unique.len(), "strict mutual exclusion across every group");
+}
+
+#[test]
+fn inbox_triage_removes_task_and_updates_the_inbox_count() {
+    let clock = at("2026-11-20 09:00");
+    let mut ws = Workspace::open_in_memory_with_clock(clock).expect("workspace");
+    let by_project = ws.create_task(&NewTask { title: "分项目".to_owned(), ..Default::default() }).expect("a").task.id;
+    let by_schedule = ws.create_task(&NewTask { title: "排期".to_owned(), ..Default::default() }).expect("b").task.id;
+    let by_due = ws.create_task(&NewTask { title: "截止".to_owned(), ..Default::default() }).expect("c").task.id;
+    assert_eq!(ws.inbox_count().expect("count"), 3);
+    assert_eq!(ws.inbox_tasks().expect("inbox").len(), 3);
+
+    let project = ws.create_project("项目", "#547093", "📌", None, None).expect("project");
+    ws.update_task(by_project, &TaskPatch { project_id: Some(Some(project.id)), ..Default::default() }).unwrap();
+    assert_eq!(ws.inbox_count().expect("count"), 2, "assigning a Project leaves the Inbox at once");
+    assert!(ws.inbox_tasks().expect("inbox").iter().all(|a| a.task.id != by_project));
+
+    ws.update_task(by_schedule, &TaskPatch { scheduled_date: Some(Some(date("2026-11-20"))), ..Default::default() }).unwrap();
+    assert_eq!(ws.inbox_count().expect("count"), 1, "assigning a Scheduled Date leaves the Inbox at once");
+
+    ws.update_task(by_due, &TaskPatch { due_date: Some(Some(date("2026-11-25"))), ..Default::default() }).unwrap();
+    assert_eq!(ws.inbox_count().expect("count"), 0, "assigning a Due Date leaves the Inbox at once");
+    assert!(ws.inbox_tasks().expect("inbox").is_empty());
+
+    // Completion and cancellation also drop a task from the strict Inbox.
+    let finishing = ws.create_task(&NewTask { title: "将完成".to_owned(), ..Default::default() }).expect("d").task.id;
+    assert_eq!(ws.inbox_count().expect("count"), 1);
+    ws.update_task(finishing, &TaskPatch { status: Some(TaskStatus::Done), ..Default::default() }).unwrap();
+    assert_eq!(ws.inbox_count().expect("count"), 0, "done tasks are not Inbox-shaped");
+}
+
+#[test]
+fn carryover_preserves_due_across_local_clock_transitions() {
+    let clock = at("2026-11-20 08:00");
+    let mut ws = Workspace::open_in_memory_with_clock(clock.clone()).expect("workspace");
+    let carry = ws
+        .create_task(&NewTask {
+            title: "连续结转".to_owned(),
+            scheduled_date: Some(date("2026-11-19")),
+            scheduled_time: Some(time("07:30")),
+            due_date: Some(date("2026-11-25")),
+            due_time: Some(time("12:00")),
+            ..Default::default()
+        })
+        .expect("carry")
+        .task
+        .id;
+    let today = ws
+        .create_task(&NewTask { title: "当天".to_owned(), scheduled_date: Some(date("2026-11-20")), ..Default::default() })
+        .expect("today")
+        .task
+        .id;
+
+    assert_eq!(ws.carryover().expect("first carryover"), 1);
+    let task = ws.task(carry).expect("load").expect("present").task;
+    assert_eq!(task.scheduled_date, Some(date("2026-11-20")));
+    assert_eq!(task.scheduled_time, None, "stale scheduled time-of-day cleared");
+    assert_eq!(task.due_date, Some(date("2026-11-25")), "due date untouched");
+    assert_eq!(task.due_time, Some(time("12:00")), "due time untouched");
+
+    // Midnight passes: everything scheduled before the new day moves again,
+    // and the Due Date/Time still stay exactly as promised.
+    clock.advance_to(LocalDateTime::parse("2026-11-21 00:00").unwrap());
+    assert_eq!(ws.carryover_count().expect("count"), 2);
+    assert_eq!(ws.carryover().expect("second carryover"), 2);
+    let task = ws.task(carry).expect("load").expect("present").task;
+    assert_eq!(task.scheduled_date, Some(date("2026-11-21")));
+    assert_eq!(task.scheduled_time, None, "scheduled time-of-day stays cleared");
+    assert_eq!(task.due_date, Some(date("2026-11-25")), "due date survives the clock transition");
+    assert_eq!(task.due_time, Some(time("12:00")), "due time survives the clock transition");
+    assert_eq!(ws.task(today).expect("load").expect("present").task.scheduled_date, Some(date("2026-11-21")));
+}
+
+#[test]
+fn upcoming_lists_future_scheduled_tasks_in_date_order() {
+    let clock = at("2026-11-20 09:00");
+    let mut ws = Workspace::open_in_memory_with_clock(clock).expect("workspace");
+    let base = |title: &str, scheduled: &str| NewTask {
+        title: title.to_owned(),
+        scheduled_date: Some(date(scheduled)),
+        ..Default::default()
+    };
+    ws.create_task(&base("过去", "2026-11-19")).expect("past");
+    ws.create_task(&base("今天", "2026-11-20")).expect("today");
+    let third = ws.create_task(&base("第三天", "2026-11-23")).expect("d3").task.id;
+    let early = ws
+        .create_task(&NewTask { title: "当天早".to_owned(), scheduled_date: Some(date("2026-11-21")), scheduled_time: Some(time("09:00")), ..Default::default() })
+        .expect("early")
+        .task
+        .id;
+    let late = ws
+        .create_task(&NewTask { title: "当天晚".to_owned(), scheduled_date: Some(date("2026-11-21")), scheduled_time: Some(time("18:00")), ..Default::default() })
+        .expect("late")
+        .task
+        .id;
+    let cancelled = ws.create_task(&base("已取消", "2026-11-22")).expect("cancelled").task.id;
+    ws.update_task(cancelled, &TaskPatch { status: Some(TaskStatus::Cancelled), ..Default::default() }).unwrap();
+    let trashed = ws.create_task(&base("已删", "2026-11-22")).expect("trashed").task.id;
+    ws.move_task_to_trash(trashed).unwrap();
+
+    let titles = ws
+        .upcoming_tasks()
+        .expect("upcoming")
+        .into_iter()
+        .map(|a| a.task.title)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        titles,
+        vec!["当天早".to_owned(), "当天晚".to_owned(), "第三天".to_owned()],
+        "future Scheduled-Date tasks only, ordered by date then time-of-day"
+    );
+    let ids = ws.upcoming_tasks().expect("upcoming").into_iter().map(|a| a.task.id).collect::<Vec<_>>();
+    assert_eq!(ids, vec![early, late, third]);
+}
+
+#[test]
+fn task_filter_and_sort_narrow_and_reorder_groups() {
+    let clock = at("2026-11-20 09:00");
+    let mut ws = Workspace::open_in_memory_with_clock(clock).expect("workspace");
+    // Creation order is deliberately the reverse of the priority order.
+    let low = ws
+        .create_task(&NewTask { title: "低优".to_owned(), priority: Some(Priority::Low), ..Default::default() })
+        .expect("low")
+        .task
+        .id;
+    let high = ws
+        .create_task(&NewTask { title: "高优".to_owned(), priority: Some(Priority::High), ..Default::default() })
+        .expect("high")
+        .task
+        .id;
+    // Due-only tasks (no Project, no Scheduled Date) land in 未排期; their
+    // creation order is the reverse of their Due Date order.
+    let late_due = ws
+        .create_task(&NewTask {
+            title: "晚截止".to_owned(),
+            priority: Some(Priority::High),
+            due_date: Some(date("2026-11-28")),
+            ..Default::default()
+        })
+        .expect("late due")
+        .task
+        .id;
+    let early_due = ws
+        .create_task(&NewTask {
+            title: "早截止".to_owned(),
+            priority: Some(Priority::Low),
+            due_date: Some(date("2026-11-22")),
+            ..Default::default()
+        })
+        .expect("early due")
+        .task
+        .id;
+    let project = ws.create_project("项目", "#547093", "📌", None, None).expect("project");
+    let bound = ws
+        .create_task(&NewTask { title: "项内".to_owned(), project_id: Some(project.id), ..Default::default() })
+        .expect("bound")
+        .task
+        .id;
+    let finished = ws.create_task(&NewTask { title: "做完".to_owned(), ..Default::default() }).expect("done").task.id;
+    ws.update_task(finished, &TaskPatch { status: Some(TaskStatus::Done), ..Default::default() }).unwrap();
+
+    let groups = ws.task_groups().expect("groups");
+    let titles = |list: &[nsh_app_kanon::domain::TaskAggregate]| {
+        list.iter().map(|a| a.task.title.clone()).collect::<Vec<_>>()
+    };
+
+    // Manual order is the creation order.
+    assert_eq!(titles(&groups.inbox), vec!["低优".to_owned(), "高优".to_owned()]);
+
+    // Priority sort flips the inbox; Due Date sort is independent of it.
+    assert_eq!(titles(&groups.sorted(TaskSort::Priority).inbox), vec!["高优".to_owned(), "低优".to_owned()]);
+    assert_eq!(
+        titles(&groups.sorted(TaskSort::DueDate).unscheduled),
+        vec!["早截止".to_owned(), "晚截止".to_owned(), "项内".to_owned()],
+        "due-date order, rows without a Due Date last"
+    );
+    assert_eq!(
+        titles(&groups.sorted(TaskSort::Priority).unscheduled),
+        vec!["晚截止".to_owned(), "早截止".to_owned(), "项内".to_owned()],
+        "priority order, rows without a priority last"
+    );
+
+    // Filters narrow every group; mutual exclusion is preserved.
+    let only_done = groups.filtered(&TaskFilter { status: Some(TaskStatus::Done), ..Default::default() });
+    assert_eq!(only_done.total(), 1);
+    assert_eq!(titles(&only_done.done), vec!["做完".to_owned()]);
+
+    let only_high = groups.filtered(&TaskFilter { priority: Some(Priority::High), ..Default::default() });
+    assert_eq!(titles(&only_high.inbox), vec!["高优".to_owned()]);
+
+    let in_project = groups.filtered(&TaskFilter {
+        project: ProjectFilter::Project(project.id),
+        ..Default::default()
+    });
+    assert_eq!(in_project.total(), 1);
+    assert_eq!(titles(&in_project.unscheduled), vec!["项内".to_owned()]);
+
+    let unassigned = groups.filtered(&TaskFilter { project: ProjectFilter::Unassigned, ..Default::default() });
+    assert_eq!(unassigned.total(), 5, "everything except the project-bound task");
+    assert!(!titles(&unassigned.unscheduled).is_empty(), "due-only rows have no Project either");
+
+    // Filter and sort compose.
+    let sorted = groups
+        .filtered(&TaskFilter { project: ProjectFilter::Unassigned, ..Default::default() })
+        .sorted(TaskSort::Priority);
+    assert_eq!(titles(&sorted.inbox), vec!["高优".to_owned(), "低优".to_owned()]);
+    let _ = (low, high, late_due, early_due, bound);
 }
 
 #[test]

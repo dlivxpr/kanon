@@ -148,6 +148,128 @@ impl TaskGroups {
     pub fn total_active(&self) -> usize {
         self.overdue.len() + self.today.len() + self.upcoming.len() + self.inbox.len() + self.unscheduled.len()
     }
+
+    /// Every row across all groups (unfiltered length).
+    pub fn total(&self) -> usize {
+        self.total_active() + self.done.len() + self.cancelled.len()
+    }
+
+    /// The rows matching `filter`, still grouped with mutual exclusion.
+    pub fn filtered(&self, filter: &TaskFilter) -> TaskGroups {
+        let keeps = |aggregate: &&TaskAggregate| filter.matches(aggregate);
+        TaskGroups {
+            overdue: self.overdue.iter().filter(keeps).cloned().collect(),
+            today: self.today.iter().filter(keeps).cloned().collect(),
+            upcoming: self.upcoming.iter().filter(keeps).cloned().collect(),
+            inbox: self.inbox.iter().filter(keeps).cloned().collect(),
+            unscheduled: self.unscheduled.iter().filter(keeps).cloned().collect(),
+            done: self.done.iter().filter(keeps).cloned().collect(),
+            cancelled: self.cancelled.iter().filter(keeps).cloned().collect(),
+        }
+    }
+
+    /// The same groups with each group's rows re-ordered by `sort`
+    /// (the storage order is the manual order).
+    pub fn sorted(&self, sort: TaskSort) -> TaskGroups {
+        let mut groups = self.clone();
+        match sort {
+            TaskSort::Manual => {}
+            TaskSort::CreatedAt => {
+                for rows in groups.lists_mut() {
+                    rows.sort_by_key(|a| std::cmp::Reverse(a.task.created_at.clone()));
+                }
+            }
+            TaskSort::DueDate => {
+                for rows in groups.lists_mut() {
+                    rows.sort_by_key(|a| due_key(&a.task));
+                }
+            }
+            TaskSort::Priority => {
+                for rows in groups.lists_mut() {
+                    rows.sort_by_key(|a| std::cmp::Reverse(priority_rank(a.task.priority)));
+                }
+            }
+        }
+        groups
+    }
+
+    fn lists_mut(&mut self) -> [&mut Vec<TaskAggregate>; 7] {
+        [
+            &mut self.overdue,
+            &mut self.today,
+            &mut self.upcoming,
+            &mut self.inbox,
+            &mut self.unscheduled,
+            &mut self.done,
+            &mut self.cancelled,
+        ]
+    }
+}
+
+/// How the Tasks view narrows rows (spec: filter by status, priority
+/// and Project). A `None` field keeps every value.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TaskFilter {
+    pub status: Option<TaskStatus>,
+    pub priority: Option<Priority>,
+    pub project: ProjectFilter,
+}
+
+impl TaskFilter {
+    pub fn matches(&self, aggregate: &TaskAggregate) -> bool {
+        if self.status.is_some_and(|status| aggregate.task.status != status) {
+            return false;
+        }
+        if self.priority.is_some_and(|priority| aggregate.task.priority != priority) {
+            return false;
+        }
+        match self.project {
+            ProjectFilter::All => true,
+            ProjectFilter::Unassigned => aggregate.task.project_id.is_none(),
+            ProjectFilter::Project(id) => aggregate.task.project_id == Some(id),
+        }
+    }
+}
+
+/// The Project half of a [`TaskFilter`]: every Project, Project-less
+/// rows only, or one Project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProjectFilter {
+    #[default]
+    All,
+    Unassigned,
+    Project(i64),
+}
+
+/// How the Tasks view orders rows inside each group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TaskSort {
+    /// The storage order (`sort_order`, then id).
+    #[default]
+    Manual,
+    /// Newest creation first.
+    CreatedAt,
+    /// Due Date first (`None` last), then Due Time with a date-only row
+    /// counting as the start of its day.
+    DueDate,
+    /// High > Medium > Low > None.
+    Priority,
+}
+
+fn due_key(task: &Task) -> (bool, LocalDate, LocalTime) {
+    match task.due_date {
+        Some(date) => (false, date, task.due_time.unwrap_or(LocalTime::new(0, 0))),
+        None => (true, LocalDate::new(1970, 1, 1), LocalTime::new(0, 0)),
+    }
+}
+
+fn priority_rank(priority: Priority) -> u8 {
+    match priority {
+        Priority::None => 0,
+        Priority::Low => 1,
+        Priority::Medium => 2,
+        Priority::High => 3,
+    }
 }
 
 /// The local-first workspace facade: one SQLite database, one clock.
@@ -392,6 +514,32 @@ impl Workspace {
         )?;
         let tasks = stmt
             .query_map([], task_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        tasks.into_iter().map(|task| self.with_details(task)).collect()
+    }
+
+    /// How many tasks sit in the Inbox right now (the top-bar badge
+    /// reads this; GLOSSARY: the badge counts Inbox tasks only).
+    pub fn inbox_count(&self) -> Result<usize> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE trashed_at IS NULL AND status IN ('todo', 'doing') \
+             AND project_id IS NULL AND scheduled_date IS NULL AND due_date IS NULL",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as usize)
+    }
+
+    /// Every non-trashed, non-cancelled Task scheduled strictly after
+    /// today, in upcoming order (the Upcoming view's list and board).
+    pub fn upcoming_tasks(&self) -> Result<Vec<TaskAggregate>> {
+        let today = self.today().to_string();
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM tasks WHERE trashed_at IS NULL AND status != 'cancel' \
+             AND scheduled_date IS NOT NULL AND scheduled_date > ? \
+             ORDER BY scheduled_date, scheduled_time IS NULL, scheduled_time, sort_order, id",
+        )?;
+        let tasks = stmt
+            .query_map(params![today], task_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         tasks.into_iter().map(|task| self.with_details(task)).collect()
     }

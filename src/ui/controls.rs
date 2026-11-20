@@ -154,6 +154,35 @@ pub fn input_field(
         .min_w(px(0.0))
 }
 
+/// The same field plus an Enter-to-commit handler (quick capture boxes).
+pub fn submit_field(
+    placeholder: &'static str,
+    value: impl Fn() -> String + 'static,
+    on_change: impl Fn(&str) + 'static,
+    on_submit: impl Fn(&str) + 'static,
+) -> impl IntoElement {
+    nsh_base::input()
+        .value(value)
+        .on_change(on_change)
+        .on_submit(on_submit)
+        .placeholder(placeholder)
+        .placeholder_color(|| color(theme().muted_foreground))
+        .caret_color(|| color(theme().primary))
+        .h(px(32.0))
+        .px_3()
+        .text_size(px(13.0))
+        .rounded(move || theme().radius)
+        .bg(tokens::control_bg())
+        .border_1()
+        .border_color(move || theme().background.opacity(0.0))
+        .focus(|s| s.border_color(tokens::accent()))
+        .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
+        .transition_colors()
+        .duration(tokens::ms(tokens::MOTION_INSTANT_MS))
+        .flex_1()
+        .min_w(px(0.0))
+}
+
 /// A rounded workbench panel (main canvas, right context panel).
 pub fn panel() -> View {
     view().flex_1().rounded(tokens::radius_panel()).bg(tokens::panel_bg()).min_w(px(0.0)).min_h(px(0.0))

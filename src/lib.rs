@@ -6,8 +6,10 @@
 
 pub mod domain;
 mod shell;
+mod tasks;
 mod today;
 mod ui;
+mod upcoming;
 
 use std::path::Path;
 use std::sync::Arc;

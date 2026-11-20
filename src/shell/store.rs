@@ -69,6 +69,18 @@ impl Store {
         self.workspace.with(|ws| ws.task_groups().unwrap_or_default())
     }
 
+    pub fn inbox_count(&self) -> usize {
+        self.workspace.with(|ws| ws.inbox_count().unwrap_or_default())
+    }
+
+    pub fn upcoming_tasks(&self) -> Vec<TaskAggregate> {
+        self.workspace.with(|ws| ws.upcoming_tasks().unwrap_or_default())
+    }
+
+    pub fn projects(&self) -> Vec<crate::domain::Project> {
+        self.workspace.with(|ws| ws.projects().unwrap_or_default())
+    }
+
     pub fn carryover_count(&self) -> usize {
         self.workspace.with(|ws| ws.carryover_count().unwrap_or_default())
     }
