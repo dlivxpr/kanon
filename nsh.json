@@ -1,6 +1,6 @@
 {
   "name": "Kanon",
-  "id": "com.example.kanon",
+  "id": "io.github.dlivxpr.kanon",
   "version": "0.1.0",
   "build": 1,
   "nsh": "=0.6.1",

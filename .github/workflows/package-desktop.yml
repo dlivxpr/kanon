@@ -1,0 +1,87 @@
+name: Package desktop
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NSH_VERSION: v0.6.1
+
+jobs:
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Install the pinned NSH CLI
+        run: |
+          archive=nsh-macos-arm64.tar.gz
+          curl -fsSL "https://github.com/longbridge/nsh/releases/download/$NSH_VERSION/$archive" -o "$RUNNER_TEMP/$archive"
+          (cd "$RUNNER_TEMP" && echo "ee1aed2a4d111fe90e6cceca4b9d5f834c9e11cfda525f8be984261a329c06de  $archive" | shasum -a 256 -c -)
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/nsh/bin" >> "$GITHUB_PATH"
+      - name: Build and verify the universal app
+        run: |
+          test "$(nsh --version | cut -d ' ' -f2)" = "${NSH_VERSION#v}"
+          version=$(jq -er .version nsh.json)
+          nsh package --target macos --arch universal --out .nsh/release-build
+          app=.nsh/release-build/Kanon.app
+          plist="$app/Contents/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = "$version"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")" = "$(jq -er .id nsh.json)"
+          lipo -verify_arch arm64 x86_64 "$app/Contents/MacOS/Kanon"
+          codesign --verify --deep --strict "$app"
+          mkdir -p "$RUNNER_TEMP/release-assets"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$RUNNER_TEMP/release-assets/Kanon-$version-macos-universal.zip"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: kanon-macos
+          path: ${{ runner.temp }}/release-assets/*.zip
+          if-no-files-found: error
+          compression-level: 0
+
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the pinned NSH CLI
+        shell: pwsh
+        run: |
+          $archive = 'nsh-windows-x86_64.zip'
+          $zip = Join-Path $env:RUNNER_TEMP $archive
+          Invoke-WebRequest "https://github.com/longbridge/nsh/releases/download/$env:NSH_VERSION/$archive" -OutFile $zip
+          if ((Get-FileHash $zip).Hash -ne '7952c84b165e13515bd2ad2787ef22622e49ce88cb8d877825e40b40f3aff4be') {
+            throw 'Unexpected NSH archive checksum'
+          }
+          Expand-Archive -Path $zip -DestinationPath $env:RUNNER_TEMP
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $env:RUNNER_TEMP 'nsh\bin')
+      - name: Build and verify the installer and portable ZIP
+        shell: pwsh
+        run: |
+          if (((nsh --version) -split ' ')[1] -ne $env:NSH_VERSION.TrimStart('v')) { throw 'Unexpected NSH version' }
+          $config = Get-Content -Raw nsh.json | ConvertFrom-Json
+          nsh package --target windows --out .nsh/release-build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $app = Get-Content -Raw .nsh/release-build/Kanon/nsh/app.json | ConvertFrom-Json
+          if ($app.version -ne $config.version -or $app.id -ne $config.id) { throw 'Unexpected package metadata' }
+          $version = $config.version
+          $assets = New-Item -ItemType Directory -Force (Join-Path $env:RUNNER_TEMP 'release-assets')
+          Copy-Item .nsh/release-build/Kanon-setup.exe (Join-Path $assets.FullName "Kanon-$version-windows-x64-setup.exe")
+          Copy-Item .nsh/release-build/Kanon.zip (Join-Path $assets.FullName "Kanon-$version-windows-x64.zip")
+      - uses: actions/upload-artifact@v6
+        with:
+          name: kanon-windows
+          path: ${{ runner.temp }}/release-assets/*
+          if-no-files-found: error
+          compression-level: 0

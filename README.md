@@ -25,6 +25,9 @@ The native backends opt in to `svg` for the window and navigation icons; their s
 
 The application icon source is `assets/kanon.svg`. NSH packages `assets/kanon.png` for both desktops; the direct Windows launcher uses the multi-resolution `assets/kanon.ico`.
 
+Download desktop packages from [GitHub Releases](https://github.com/dlivxpr/kanon/releases). The **Package desktop** workflow builds the Windows x64 installer and portable ZIP, and the macOS universal ZIP; macOS builds are ad hoc signed, not notarized.
+Earlier development packages used `com.example.kanon` and keep their own workspace. Export a backup before switching to the release build. If you installed the Windows preview, uninstall it after backing up, then install the release build. Use **恢复到新副本** to open the backup without overwriting the release workspace.
+
 Use **设置 → 数据与备份 → 导出备份** to save a complete SQLite snapshot to a new file. **恢复到新副本** opens a separate Kanon window backed by a new file; it never replaces the active workspace or modifies the snapshot. For command-line recovery, launch with `KANON_WORKSPACE_PATH` set to a copy of the snapshot. Keep the original backup separately.
 
 NSH-generated files stay in `.nsh/`: runner sources in `.nsh/rust/` and default packages in `.nsh/out/`.

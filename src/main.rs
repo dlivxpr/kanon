@@ -28,8 +28,8 @@ fn main() -> impl std::process::Termination {
                 .main_window(window),
         ),
         platform::AppOptions {
-            title: "Kanon".to_owned(),
-            app_id: "com.example.kanon".to_owned(),
+            title: config["name"].as_str().expect("nsh.json: name").to_owned(),
+            app_id: config["id"].as_str().expect("nsh.json: id").to_owned(),
             icon: Some(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
                 if cfg!(target_os = "windows") {
                     "assets/kanon.ico"
