@@ -13,23 +13,27 @@ use nsh_base::rich_editor::{
         history::{close_history, redo, undo},
         suggestion::{replace_suggestion, suggestion_state},
     },
+    formats::{DocFormat, MarkdownFormat},
     model::Fragment,
     state::EditorState,
     tables::commands::insert_table,
-    view::{EditorSession, NodeViews, rich_editor},
+    view::{EditorSession, NodeViews},
 };
 use nsh_core::prelude::*;
 use serde_json::{Value, json};
 
 use crate::domain::{LocalDate, WorkspaceError, should_snapshot};
 use crate::shell::Store;
-use crate::ui::controls::{
-    ButtonKind, app_button, app_button_with, empty_state, panel_icon_button,
-};
+use crate::ui::controls::{ButtonKind, app_button, app_button_with, empty_state};
 use crate::ui::theme as tokens;
+use crate::ui::{
+    chrome::{Icon, hint, icon},
+    editor as editor_ui,
+};
 
 use super::task_card::TaskCardView;
-use super::{CARD_NODE, MENTION_KEY, SLASH_KEY, build_session, doc_markdown};
+use super::templates::TEMPLATES;
+use super::{CARD_NODE, MENTION_KEY, SLASH_KEY, build_session_with_shortcut, doc_markdown};
 
 /// The auto-save indicator states. `Saved` shows only after a commit
 /// acknowledgement from SQLite; `Failed` keeps the draft and offers a
@@ -42,7 +46,7 @@ enum SaveState {
 }
 
 /// The editing chrome of one Document tab (its holder owns the lock).
-pub fn editing_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoElement {
+pub(super) fn editing_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoElement {
     let Some(document) = store.document(document_id) else {
         return empty_state("文档不存在", "它可能已被删除；关闭此标签页即可").into_element();
     };
@@ -52,22 +56,43 @@ pub fn editing_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
     // lock belongs to the tab and must survive (route-aware release).
     cleanup(move || store.release_editor_if_route_left(tab_id, true));
 
-    let session = build_session(
+    let finish_requested = signal(0_u64);
+    let session = build_session_with_shortcut(
         &document.body,
         NodeViews::new()
             .with(CARD_NODE, Arc::new(TaskCardView { store }))
-            .with(super::kanon::MENTION_NODE, Arc::new(super::mention::KanonMentionView { store })),
+            .with(
+                super::kanon::MENTION_NODE,
+                Arc::new(super::mention::KanonMentionView { store }),
+            ),
+        Some(finish_requested),
     );
+    let outline_session = session.clone();
+    effect(move || {
+        if let Some(request) = store.outline_request.get()
+            && request.tab_id == tab_id
+        {
+            super::reveal_heading(&outline_session, request.ordinal);
+        }
+    });
     let draft_title = signal(document.title.clone());
     let draft_body = signal(document.body.clone());
     let base_version = signal(document.version);
     let save_state = signal(SaveState::Saved);
     let composing = signal(false);
+    let body_focused = signal(false);
     let history_open = signal(false);
     // The promote chooser (转为任务) and the task card picker.
     let promote_open = signal(false);
     let card_picker_open = signal(false);
+    let card_from_slash = signal(false);
     let card_filter = signal(String::new());
+    let open_card_picker = move |from_slash| {
+        card_from_slash.set(from_slash);
+        card_filter.set(String::new());
+        promote_open.set(false);
+        card_picker_open.set(true);
+    };
     // Debounce bookkeeping: the newest scheduled save wins.
     let save_epoch = signal(0_u64);
     // History policy bookkeeping (milliseconds since this view started).
@@ -109,6 +134,17 @@ pub fn editing_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
             }
         }
     };
+    let flush = move || {
+        if save_state.get_untracked() == SaveState::Dirty {
+            try_save();
+        }
+        save_state.get_untracked() == SaveState::Saved
+    };
+    crate::desktop::check_before_quit(move || !composing.get_untracked() && flush());
+    nsh_core::element::desktop::on_app_quit(move || {
+        flush();
+        std::future::ready(())
+    });
     let schedule_save = {
         move || {
             save_state.set(SaveState::Dirty);
@@ -138,14 +174,34 @@ pub fn editing_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
     // 完成: flush the pending draft, then hand the lock back. A failed
     // flush keeps the editor open so the draft survives.
     let finish = move || {
-        if save_state.get_untracked() == SaveState::Dirty {
-            try_save();
-        }
-        if save_state.get_untracked() == SaveState::Failed {
+        if !flush() {
             return;
         }
         store.release_editor(tab_id, true);
     };
+    let finish_if_available = move || {
+        if !composing.get_untracked()
+            && !history_open.get_untracked()
+            && !promote_open.get_untracked()
+            && !card_picker_open.get_untracked()
+        {
+            finish();
+        }
+    };
+    effect(move || {
+        if finish_requested.get() > 0 {
+            untracked(finish_if_available);
+        }
+    });
+    use nsh_core::{element::KeyOptions, keymap::When};
+    on_key_with(
+        "mod+e",
+        KeyOptions {
+            when: When::Always,
+            ..Default::default()
+        },
+        move |_| finish_if_available(),
+    );
     // Retry speaks for the retained draft: take the freshest base and
     // commit it (an explicit user decision to overwrite the concurrent
     // change).
@@ -163,30 +219,37 @@ pub fn editing_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
     // a Chinese IME composition is running the draft still updates, but
     // the `/` menu stays shut (see slash_panel).
     let change_session = session.clone();
+    let editor_events = signal(0_u64);
     let on_change = move |_: &_| {
         draft_body.set(doc_markdown(&change_session));
         mark_edited();
+        editor_events.update(|events| *events += 1);
     };
     let on_composition = move |composing_now: &bool| {
         composing.set(*composing_now);
     };
     // Re-read suggestion state on every change/selection event.
-    let editor_events = signal(0_u64);
     let on_activity = move |_: &_| {
         editor_events.update(|events| *events += 1);
     };
+    let blank = computed(move || draft_body.with(|body| body.trim().is_empty()));
+    let book_id = document.book_id;
+    let book_name = computed(move || {
+        store
+            .knowledge_base(book_id)
+            .map_or_else(|| "知识库".to_owned(), |book| book.name)
+    });
 
     view()
         .flex_1()
         .min_h(px(0.0))
         .flex_col()
         .child(editing_header(
-            draft_title,
+            book_name,
             save_state,
             history_open,
             finish,
             retry,
-            on_title,
         ))
         .child(toolbar(
             session.clone(),
@@ -194,6 +257,7 @@ pub fn editing_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
             composing,
             promote_open,
             card_picker_open,
+            move || open_card_picker(false),
         ))
         .child(promote_panel(
             store,
@@ -209,6 +273,7 @@ pub fn editing_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
             store,
             session.clone(),
             card_picker_open,
+            card_from_slash,
             card_filter,
         ))
         .child(mention_panel(
@@ -217,7 +282,6 @@ pub fn editing_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
             editor_events,
             composing,
         ))
-        .child(slash_panel(store, session.clone(), editor_events, composing))
         .child(
             view()
                 .flex_1()
@@ -233,23 +297,49 @@ pub fn editing_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
                         .justify_center()
                         .child(
                             view()
-                                .w(px(780.0))
-                                .max_w(px(780.0))
+                                .test_id("document-paper")
+                                .w_full()
+                                .max_w(px(860.0))
+                                .style_when(
+                                    move || super::wide_paper(store),
+                                    |s| s.max_w(px(1120.0)),
+                                )
                                 .flex_1()
                                 .min_h(px(0.0))
-                                .py_4()
+                                .pt_8()
+                                .pb_4()
+                                .px_10()
+                                .style_when(|| window().width.0 < 960.0, |s| s.px_4().pt_4())
+                                .gap_4()
+                                .child(editor_ui::paper_title(move || draft_title.get(), on_title))
                                 .child(
-                                    rich_editor()
+                                    editor_ui::paper_body()
                                         .key(format!("editing-{document_id}"))
                                         .editor(session.clone())
                                         .auto_focus(true)
+                                        .flex_1()
+                                        .min_h(px(0.0))
+                                        .style_when(blank, |s| s.flex_none().min_h(px(72.0)))
                                         .accessibility_label("文档正文")
-                                        .placeholder("输入正文，/ 插入块")
+                                        .placeholder("开始写作，或输入 / 插入内容")
+                                        .on_focus(move || body_focused.set(true))
+                                        .on_blur(move || body_focused.set(false))
+                                        .bubble_menu_placement(Placement::Bottom)
+                                        .bubble_menu(super::insert::caret_menu(
+                                            store,
+                                            session.clone(),
+                                            body_focused,
+                                            composing,
+                                            move || open_card_picker(true),
+                                            |session, id| {
+                                                insert_card_at_suggestion(session, SLASH_KEY, id)
+                                            },
+                                        ))
                                         .on_change(on_change)
                                         .on_selection_change(on_activity)
-                                        .on_composition_change(on_composition)
-                                        .text_color(tokens::fg_body()),
-                                ),
+                                        .on_composition_change(on_composition),
+                                )
+                                .child(blank_templates(session.clone(), blank)),
                         ),
                 )
                 .child(super::history::history_panel(
@@ -262,13 +352,65 @@ pub fn editing_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
         .into_element()
 }
 
+fn blank_templates(session: EditorSession, blank: Memo<bool>) -> impl IntoElement {
+    when(blank, move || {
+        view()
+            .gap_2()
+            .pt_4()
+            .border_t_1()
+            .border_color(tokens::border_subtle)
+            .child(
+                text("从模板开始")
+                    .text_size(tokens::text_px(13.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(tokens::fg_primary),
+            )
+            .child(
+                text("选择一个模板，直接插入常用章节。")
+                    .text_size(tokens::text_px(12.0))
+                    .text_color(tokens::fg_muted),
+            )
+            .child(
+                view()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_2()
+                    .children(TEMPLATES.map(|template| {
+                        let session = session.clone();
+                        editor_ui::template_card(template.title, template.sections, move || {
+                            if !doc_markdown(&session).trim().is_empty() {
+                                return;
+                            }
+                            let state = session.state();
+                            let Ok(content) = MarkdownFormat::default()
+                                .parse(state.schema(), &template.markdown())
+                            else {
+                                return;
+                            };
+                            let mut transaction = state.tr();
+                            if transaction
+                                .replace_with(
+                                    0,
+                                    state.doc().content().size(),
+                                    content.content().clone(),
+                                )
+                                .is_ok()
+                                && session.dispatch(transaction).is_ok()
+                            {
+                                session.focus();
+                            }
+                        })
+                    })),
+            )
+    })
+}
+
 fn editing_header(
-    draft_title: Signal<String>,
+    book_name: Memo<String>,
     save_state: Signal<SaveState>,
     history_open: Signal<bool>,
     finish: impl Fn() + Copy + 'static,
     retry: impl Fn() + Copy + 'static,
-    on_title: impl Fn(&str) + Copy + 'static,
 ) -> impl IntoElement {
     view()
         .flex_row()
@@ -279,19 +421,20 @@ fn editing_header(
         .border_b_1()
         .border_color(tokens::border_subtle())
         .child(
-            nsh_base::input()
-                .value(move || draft_title.get())
-                .on_change(on_title)
-                .placeholder("文档标题")
-                .placeholder_color(move || color(nsh_base::theme().muted_foreground))
-                .h(px(34.0))
-                .px_3()
-                .text_size(px(15.0))
-                .font_weight(FontWeight::SEMIBOLD)
-                .rounded(move || nsh_base::theme().radius)
-                .bg(tokens::control_bg())
+            view()
                 .flex_1()
-                .min_w(px(0.0)),
+                .min_w(px(0.0))
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .text_color(tokens::fg_muted)
+                .child(icon(|| Icon::Book, px(16.0)))
+                .child(
+                    text(move || book_name.get())
+                        .text_size(tokens::text_px(13.0))
+                        .number_of_lines(1)
+                        .flex_1(),
+                ),
         )
         .child(save_indicator(save_state, retry))
         .child(super::history::history_button(history_open))
@@ -311,363 +454,309 @@ fn save_indicator(
         .flex_row()
         .items_center()
         .gap_2()
-        .child(text(label).text_size(px(12.0)).text_color(move || {
-            if save_state.get() == SaveState::Failed {
-                tokens::danger()
-            } else {
-                tokens::fg_muted()
-            }
-        }))
+        .child(
+            text(label)
+                .text_size(tokens::text_px(12.0))
+                .text_color(move || {
+                    if save_state.get() == SaveState::Failed {
+                        tokens::danger()
+                    } else {
+                        tokens::fg_muted()
+                    }
+                }),
+        )
         .child(when(
             move || save_state.get() == SaveState::Failed,
             move || app_button(ButtonKind::Soft, "重试", retry).flex_none(),
         ))
 }
 
-// ---------------------------------------------------------------------
-// The format toolbar: undo/redo, block kinds, marks, lists, table, the
-// Checklist Item → Task promotion and the Linked Task Card picker — one
-// row of the app's quiet buttons driving session commands (Markdown
-// shortcuts and `/` cover the keyboard path).
-// ---------------------------------------------------------------------
+/// One action description drives both the toolbar and its overflow menu.
+#[derive(Clone)]
+struct FormatAction {
+    label: &'static str,
+    icon: Icon,
+    command: BoxCommand,
+    active: Option<&'static str>,
+}
 
-#[allow(clippy::too_many_arguments)]
+impl FormatAction {
+    fn new(label: &'static str, icon: Icon, command: BoxCommand) -> Self {
+        Self {
+            label,
+            icon,
+            command,
+            active: None,
+        }
+    }
+
+    fn toggle(mut self, name: &'static str) -> Self {
+        self.active = Some(name);
+        self
+    }
+
+    fn button(
+        &self,
+        session: &EditorSession,
+        changed: Memo<u64>,
+        composing: Signal<bool>,
+    ) -> AnyElement {
+        let check = session.clone();
+        let active = self.active;
+        let can = self.command.clone();
+        let enable = session.clone();
+        let apply = session.clone();
+        let command = self.command.clone();
+        editor_ui::format_button(
+            self.label,
+            self.icon,
+            move || {
+                changed.get();
+                active.is_some_and(|name| check.is_active(Some(name), None))
+            },
+            move || {
+                changed.get();
+                composing.get() || !enable.can(&can)
+            },
+            move || {
+                apply.run(&command);
+                apply.focus();
+            },
+        )
+        .into_element()
+    }
+
+    fn item(
+        &self,
+        session: &EditorSession,
+        changed: Memo<u64>,
+        composing: Signal<bool>,
+    ) -> AnyElement {
+        let enable = session.clone();
+        let can = self.command.clone();
+        let apply = session.clone();
+        let command = self.command.clone();
+        let owner = Owner::current();
+        editor_ui::format_item(
+            self.label,
+            self.icon,
+            move || {
+                changed.get();
+                composing.get() || !enable.can(&can)
+            },
+            move || {
+                apply.run(&command);
+                let apply = apply.clone();
+                // NSH returns focus to the menu trigger on close. The editor
+                // takes it back on the next turn, after the menu has closed.
+                owner.run(|| set_timeout(Duration::ZERO, move || apply.focus()));
+            },
+        )
+    }
+}
+
+const HEADINGS: [(u64, &str); 4] = [
+    (1, "一级标题"),
+    (2, "二级标题"),
+    (3, "三级标题"),
+    (4, "四级标题"),
+];
+
+fn heading_level(level: u64) -> nsh_base::rich_editor::model::Attrs {
+    [("level".to_owned(), json!(level))].into_iter().collect()
+}
+
 fn toolbar(
     session: EditorSession,
     editor_events: Signal<u64>,
     composing: Signal<bool>,
     promote_open: Signal<bool>,
     card_picker_open: Signal<bool>,
+    open_card_picker: impl Fn() + Copy + 'static,
 ) -> impl IntoElement {
     let state = session.state();
     let schema = state.schema();
-    let heading = schema.node_type("heading").unwrap();
-    let paragraph = schema.node_type("paragraph").unwrap();
-    let bullet_list = schema.node_type("bulletList").unwrap();
-    let ordered_list = schema.node_type("orderedList").unwrap();
-    let list_item = schema.node_type("listItem").unwrap();
-    let task_list = schema.node_type("taskList").unwrap();
-    let task_item = schema.node_type("taskItem").unwrap();
-    let blockquote = schema.node_type("blockquote").unwrap();
-    let code_block = schema.node_type("codeBlock").unwrap();
-    let level = |n: u64| {
-        [("level".to_owned(), json!(n))]
-            .into_iter()
-            .collect::<nsh_base::rich_editor::model::Attrs>()
-    };
-    let no_attrs = nsh_base::rich_editor::model::Attrs::new();
-    let language_none = [("language".to_owned(), Value::Null)]
-        .into_iter()
-        .collect::<nsh_base::rich_editor::model::Attrs>();
-    let bold = schema.mark_type("bold").unwrap();
-    let italic = schema.mark_type("italic").unwrap();
-    let underline = schema.mark_type("underline").unwrap();
-    let strike = schema.mark_type("strike").unwrap();
-    let code = schema.mark_type("code").unwrap();
+    let node = |name: &str| schema.node_type(name).expect("registered editor node");
+    let attrs = nsh_base::rich_editor::model::Attrs::new;
+    let changed = computed(move || editor_events.get());
+    let paragraph = FormatAction::new(
+        "正文",
+        Icon::Note,
+        tiptap::set_node(node("paragraph"), attrs()),
+    );
+    let headings = HEADINGS.map(|(level, label)| {
+        FormatAction::new(
+            label,
+            Icon::Heading,
+            tiptap::set_node(node("heading"), heading_level(level)),
+        )
+    });
+    let [bold, italic, underline, strike, code] = [
+        ("加粗", Icon::Bold, "bold"),
+        ("斜体", Icon::Italic, "italic"),
+        ("下划线", Icon::Underline, "underline"),
+        ("删除线", Icon::Strike, "strike"),
+        ("行内代码", Icon::Code, "code"),
+    ]
+    .map(|(label, icon, name)| {
+        FormatAction::new(
+            label,
+            icon,
+            toggle_mark(
+                schema.mark_type(name).expect("registered editor mark"),
+                None,
+                true,
+            ),
+        )
+        .toggle(name)
+    });
+    let [bullets, ordered, checklist] = [
+        ("无序列表", Icon::Bullets, "bulletList", "listItem"),
+        ("有序列表", Icon::Ordered, "orderedList", "listItem"),
+        ("清单", Icon::Tasks, "taskList", "taskItem"),
+    ]
+    .map(|(label, icon, list, item)| {
+        FormatAction::new(
+            label,
+            icon,
+            tiptap::toggle_list(node(list), node(item), false, attrs()),
+        )
+        .toggle(list)
+    });
+    let quote = FormatAction::new(
+        "引用",
+        Icon::Quote,
+        tiptap::toggle_wrap(node("blockquote"), attrs()),
+    )
+    .toggle("blockquote");
+    let code_block = FormatAction::new(
+        "代码块",
+        Icon::CodeBlock,
+        tiptap::toggle_node(
+            node("codeBlock"),
+            node("paragraph"),
+            [("language".to_owned(), Value::Null)].into_iter().collect(),
+        ),
+    )
+    .toggle("codeBlock");
+    let table = FormatAction::new("表格", Icon::Table, insert_table(3, 2, true));
+    let clear = FormatAction::new(
+        "清除格式",
+        Icon::ClearFormat,
+        chain(vec![tiptap::unset_all_marks(), tiptap::clear_nodes()]),
+    );
     drop(state);
 
-    let tools: Vec<(&'static str, BoxCommand)> = vec![
-        ("撤销", command(undo)),
-        ("重做", command(redo)),
-        (
-            "正文",
-            tiptap::set_node(paragraph.clone(), no_attrs.clone()),
-        ),
-        (
-            "一级标题",
-            tiptap::toggle_node(heading.clone(), paragraph.clone(), level(1)),
-        ),
-        (
-            "二级标题",
-            tiptap::toggle_node(heading.clone(), paragraph.clone(), level(2)),
-        ),
-        (
-            "三级标题",
-            tiptap::toggle_node(heading.clone(), paragraph.clone(), level(3)),
-        ),
-        ("加粗", toggle_mark(bold, None, true)),
-        ("斜体", toggle_mark(italic, None, true)),
-        ("下划线", toggle_mark(underline, None, true)),
-        ("删除线", toggle_mark(strike, None, true)),
-        ("行内代码", toggle_mark(code, None, true)),
-        (
-            "无序列表",
-            tiptap::toggle_list(bullet_list, list_item.clone(), false, no_attrs.clone()),
-        ),
-        (
-            "有序列表",
-            tiptap::toggle_list(ordered_list, list_item, false, no_attrs.clone()),
-        ),
-        (
-            "清单",
-            tiptap::toggle_list(task_list, task_item, false, no_attrs.clone()),
-        ),
-        ("引用", tiptap::toggle_wrap(blockquote, no_attrs.clone())),
-        (
-            "代码块",
-            tiptap::toggle_node(code_block, paragraph, language_none),
-        ),
-        ("表格", insert_table(3, 2, true)),
-        (
-            "清除格式",
-            chain(vec![tiptap::unset_all_marks(), tiptap::clear_nodes()]),
-        ),
-    ];
-
+    let heading_session = session.clone();
+    let current_heading = move || {
+        changed.get();
+        HEADINGS
+            .into_iter()
+            .find(|&(level, _)| {
+                heading_session.is_active(Some("heading"), Some(heading_level(level)))
+            })
+            .map_or("正文", |(_, label)| label)
+    };
     let promote_session = session.clone();
     let in_checklist = move || {
-        editor_events.get();
+        changed.get();
         !composing.get() && selection_task_item(&promote_session).is_some()
     };
+    let compact = signal(true);
+    let menu_item = |action: &FormatAction| action.item(&session, changed, composing);
+    let direct = |action: &FormatAction| action.button(&session, changed, composing);
+    let marks = [underline, strike, code];
+    let blocks = [bullets, ordered, checklist, quote, code_block, table, clear];
+    let extra_session = session.clone();
 
     view()
+        .test_id("document-format-toolbar")
+        // Reserve room for the contextual checklist action as well as the fixed icons.
+        .on_layout(move |frame: &Bounds<Points>| compact.set(frame.size.width.0 < 704.0))
+        .bind_motion(&crate::ui::motion::toolbar_enter())
+        .h(px(44.0))
+        .flex_none()
         .flex_row()
         .items_center()
-        .gap_1()
+        .gap_0p5()
         .px_4()
-        .py_2()
-        .flex_wrap()
+        .bg(tokens::panel_bg)
         .border_b_1()
-        .border_color(tokens::border_subtle())
-        .children(tools.into_iter().map(|(label, cmd)| {
-            let run = session.clone();
-            panel_icon_button(label, label, move || {
-                run.run(&cmd);
-                run.focus();
-            })
-        }))
-        .child(when(
-            in_checklist,
-            move || {
-                // 转为任务 (ADR-0002): promote the selected Checklist
-                // Item into a real Task; the chooser below picks the
-                // Inbox or a Project.
-                app_button_with(
-                    ButtonKind::Soft,
-                    move || "转为任务".into(),
-                    move || {
-                        promote_open.update(|open| *open = !*open);
-                        card_picker_open.set(false);
-                    },
-                )
-                .flex_none()
-            },
+        .border_color(tokens::border_subtle)
+        .child(super::insert::toolbar_panel(
+            session.clone(),
+            composing,
+            open_card_picker,
         ))
-        .child(
-            // 关联任务卡片 (GLOSSARY): pick an existing Task to embed as
-            // a Linked Task Card block.
-            app_button_with(
-                ButtonKind::Soft,
-                move || "关联任务卡片".into(),
-                move || {
-                    card_picker_open.update(|open| *open = !*open);
-                    promote_open.set(false);
-                },
-            )
-            .flex_none(),
-        )
-}
-
-// ---------------------------------------------------------------------
-// The `/` block-insertion menu: opens on the slash trigger, filters by
-// the typed query, and replaces the trigger with the picked block. It
-// stays shut while a Chinese IME composition is running, so candidate
-// text never becomes a menu.
-// ---------------------------------------------------------------------
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SlashItem {
-    Heading(u64),
-    BulletList,
-    OrderedList,
-    TaskList,
-    Blockquote,
-    CodeBlock,
-    Table,
-    HorizontalRule,
-}
-
-impl SlashItem {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Heading(1) => "一级标题",
-            Self::Heading(2) => "二级标题",
-            Self::Heading(3) => "三级标题",
-            Self::Heading(_) => "标题",
-            Self::BulletList => "无序列表",
-            Self::OrderedList => "有序列表",
-            Self::TaskList => "清单",
-            Self::Blockquote => "引用",
-            Self::CodeBlock => "代码块",
-            Self::Table => "表格",
-            Self::HorizontalRule => "分割线",
-        }
-    }
-
-    fn json(self) -> Value {
-        let paragraph = || json!({"type": "paragraph"});
-        match self {
-            Self::Heading(level) => json!({"type": "heading", "attrs": {"level": level}}),
-            Self::BulletList => {
-                json!({"type": "bulletList", "content": [{"type": "listItem", "content": [paragraph()]}]})
-            }
-            Self::OrderedList => {
-                json!({"type": "orderedList", "content": [{"type": "listItem", "content": [paragraph()]}]})
-            }
-            Self::TaskList => json!({
-                "type": "taskList",
-                "content": [{"type": "taskItem", "attrs": {"checked": false}, "content": [paragraph()]}],
-            }),
-            Self::Blockquote => json!({"type": "blockquote", "content": [paragraph()]}),
-            Self::CodeBlock => json!({"type": "codeBlock", "attrs": {"language": null}}),
-            Self::Table => {
-                let cell = |header: bool| {
-                    json!({
-                        "type": if header { "tableHeader" } else { "tableCell" },
-                        "content": [paragraph()],
-                    })
-                };
-                json!({
-                    "type": "table",
-                    "content": [{
-                        "type": "tableRow",
-                        "content": [cell(true), cell(true)],
-                    }],
-                })
-            }
-            Self::HorizontalRule => json!({"type": "horizontalRule"}),
-        }
-    }
-}
-
-const SLASH_ITEMS: &[SlashItem] = &[
-    SlashItem::Heading(1),
-    SlashItem::Heading(2),
-    SlashItem::Heading(3),
-    SlashItem::BulletList,
-    SlashItem::OrderedList,
-    SlashItem::TaskList,
-    SlashItem::Blockquote,
-    SlashItem::CodeBlock,
-    SlashItem::Table,
-    SlashItem::HorizontalRule,
-];
-
-fn slash_panel(
-    store: Store,
-    session: EditorSession,
-    editor_events: Signal<u64>,
-    composing: Signal<bool>,
-) -> impl IntoElement {
-    let items_session = session.clone();
-    let items = move || {
-        editor_events.get();
-        if composing.get() {
-            return Vec::new();
-        }
-        let state: EditorState = items_session.state();
-        let Some(suggestion) = suggestion_state(&state, SLASH_KEY) else {
-            return Vec::new();
-        };
-        if !suggestion.active {
-            return Vec::new();
-        }
-        let query = suggestion.query.clone().unwrap_or_default();
-        SLASH_ITEMS
-            .iter()
-            .copied()
-            .filter(|item| query.is_empty() || item.label().contains(query.as_str()))
-            .collect::<Vec<_>>()
-    };
-    // The `/` embed path (docs/ui-design.md §4.4): matching Tasks embed
-    // as interactive Linked Task Cards.
-    let tasks_store = store;
-    let tasks_session = session.clone();
-    let task_matches = move || {
-        editor_events.get();
-        if composing.get() {
-            return Vec::new();
-        }
-        let state: EditorState = tasks_session.state();
-        let Some(suggestion) = suggestion_state(&state, SLASH_KEY) else { return Vec::new() };
-        if !suggestion.active {
-            return Vec::new();
-        }
-        let query = suggestion.query.clone().unwrap_or_default();
-        let needle = query.trim().to_lowercase();
-        if needle.is_empty() {
-            return Vec::new();
-        }
-        tasks_store
-            .live_tasks()
-            .into_iter()
-            .filter(|aggregate| aggregate.task.title.to_lowercase().contains(&needle))
-            .take(4)
-            .collect::<Vec<_>>()
-    };
-    let items_list = items.clone();
-    let session_list = session.clone();
-    let tasks_list = task_matches.clone();
-    let session_cards = session.clone();
-    when(
-        move || !items().is_empty() || !task_matches().is_empty(),
-        move || {
-            view()
-                .mx_4()
-                .my_1()
-                .flex_row()
-                .gap_1()
-                .flex_wrap()
-                .rounded(tokens::radius_card())
-                .bg(tokens::panel_subtle())
-                .border_1()
-                .border_color(tokens::border_subtle())
-                .p_2()
-                .child({
-                    let list = items_list.clone();
-                    let pick_source = session_list.clone();
-                    each(
-                        list,
-                        |item: &SlashItem| item.label(),
-                        move |item, _index| {
-                            let pick = pick_source.clone();
-                            app_button(ButtonKind::Soft, item.get().label(), move || {
-                                let state = pick.state();
-                                let Ok(node) = state.schema().node_from_json(&item.get().json())
-                                else {
-                                    return;
-                                };
-                                pick.run(&replace_suggestion(SLASH_KEY, Fragment::from(node)));
-                                pick.focus();
-                            })
-                            .flex_none()
-                        },
+        .child(editor_ui::divider())
+        .child(direct(&FormatAction::new(
+            "撤销",
+            Icon::Undo,
+            command(undo),
+        )))
+        .child(direct(&FormatAction::new(
+            "重做",
+            Icon::Redo,
+            command(redo),
+        )))
+        .child(editor_ui::divider())
+        .child(editor_ui::format_menu(
+            editor_ui::tool_face(false)
+                .w(px(84.0))
+                .px_2()
+                .justify_between()
+                .label("段落样式")
+                .child(
+                    text(current_heading)
+                        .text_size(tokens::text_px(13.0))
+                        .number_of_lines(1),
+                )
+                .child(icon(|| Icon::Down, px(13.0))),
+            std::iter::once(menu_item(&paragraph)).chain(headings.iter().map(menu_item)),
+        ))
+        .child(editor_ui::divider())
+        .child(direct(&bold))
+        .child(direct(&italic))
+        .child(dynamic(move || {
+            if compact.get() {
+                editor_ui::format_menu(
+                    editor_ui::tool_face(false)
+                        .label("更多格式")
+                        .child(icon(|| Icon::More, px(16.0)))
+                        .child(hint("更多格式")),
+                    marks
+                        .iter()
+                        .chain(&blocks)
+                        .map(|action| action.item(&extra_session, changed, composing)),
+                )
+                .into_element()
+            } else {
+                view()
+                    .flex_none()
+                    .flex_row()
+                    .items_center()
+                    .gap_0p5()
+                    .children(
+                        marks
+                            .iter()
+                            .map(|action| action.button(&extra_session, changed, composing)),
                     )
-                })
-                .child({
-                    let list = tasks_list.clone();
-                    let cards = session_cards.clone();
-                    each(
-                        list,
-                        |aggregate: &crate::domain::TaskAggregate| aggregate.task.id,
-                        move |aggregate, _index| {
-                            let pick = cards.clone();
-                            let id = aggregate.with(|a| a.task.id);
-                            let title = aggregate.with(|a| a.task.title.clone());
-                            app_button(
-                                ButtonKind::Soft,
-                                format!("关联任务卡片 · {title}"),
-                                move || {
-                                    insert_card_at_suggestion(&pick, SLASH_KEY, id);
-                                },
-                            )
-                            .flex_none()
-                            .into_element()
-                        },
+                    .child(editor_ui::divider())
+                    .children(
+                        blocks
+                            .iter()
+                            .map(|action| action.button(&extra_session, changed, composing)),
                     )
-                })
-        },
-    )
+                    .into_element()
+            }
+        }))
+        .child(when(in_checklist, move || {
+            app_button(ButtonKind::Soft, "转为任务", move || {
+                promote_open.update(|open| *open = !*open);
+                card_picker_open.set(false);
+            })
+            .flex_none()
+        }))
 }
 
 // ---------------------------------------------------------------------
@@ -710,8 +799,8 @@ fn promote_panel(
     when(
         move || promote_open.get() && available(),
         move || {
-            let panel_session = session.clone();
             let inbox_session = session.clone();
+            let projects_session = session.clone();
             view()
                 .mx_4()
                 .my_1()
@@ -724,7 +813,11 @@ fn promote_panel(
                 .border_1()
                 .border_color(tokens::border_subtle())
                 .p_2()
-                .child(text("新任务存入").text_size(px(12.0)).text_color(tokens::fg_muted()))
+                .child(
+                    text("新任务存入")
+                        .text_size(tokens::text_px(12.0))
+                        .text_color(tokens::fg_muted()),
+                )
                 .child(app_button(ButtonKind::Positive, "收件箱", move || {
                     promote_open.set(false);
                     promote_selected_item(
@@ -736,21 +829,31 @@ fn promote_panel(
                         None,
                     );
                 }))
-                .children(store.projects().into_iter().map(|project| {
-                    let pick_session = panel_session.clone();
-                    let label = format!("项目 · {}", project.name);
-                    app_button(ButtonKind::Soft, label, move || {
-                        promote_open.set(false);
-                        promote_selected_item(
-                            store,
-                            &pick_session,
-                            document_id,
-                            base_version,
-                            save_state,
-                            Some(project.id),
-                        );
-                    })
-                    .into_element()
+                // A `when` branch builds once per flip, so the project
+                // list below is a dynamic region: it follows workspace
+                // changes while the chooser stays open.
+                .child(dynamic(move || {
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap_1()
+                        .flex_wrap()
+                        .children(store.projects().into_iter().map(|project| {
+                            let pick_session = projects_session.clone();
+                            let label = format!("项目 · {}", project.name);
+                            app_button(ButtonKind::Soft, label, move || {
+                                promote_open.set(false);
+                                promote_selected_item(
+                                    store,
+                                    &pick_session,
+                                    document_id,
+                                    base_version,
+                                    save_state,
+                                    Some(project.id),
+                                );
+                            })
+                            .into_element()
+                        }))
                 }))
         },
     )
@@ -772,7 +875,9 @@ fn promote_selected_item(
     project_id: Option<i64>,
 ) {
     let state = session.state();
-    let Ok(resolved) = state.doc().resolve(state.selection().from()) else { return };
+    let Ok(resolved) = state.doc().resolve(state.selection().from()) else {
+        return;
+    };
     let mut item_depth = None;
     for depth in (1..=resolved.depth).rev() {
         if resolved.node(depth).ty().name() == "taskItem" {
@@ -797,8 +902,7 @@ fn promote_selected_item(
         start
     };
     let schema = state.schema().clone();
-    let Ok(card) =
-        schema.node_from_json(&json!({"type": CARD_NODE, "attrs": {"taskId": 0}}))
+    let Ok(card) = schema.node_from_json(&json!({"type": CARD_NODE, "attrs": {"taskId": 0}}))
     else {
         return;
     };
@@ -870,6 +974,7 @@ fn task_card_picker(
     store: Store,
     session: EditorSession,
     open: Signal<bool>,
+    from_slash: Signal<bool>,
     filter: Signal<String>,
 ) -> impl IntoElement {
     let matches = move || {
@@ -889,6 +994,27 @@ fn task_card_picker(
     when(
         move || open.get(),
         move || {
+            let field = element_ref();
+            let return_focus = session.clone();
+            on_key_with(
+                "escape",
+                nsh_core::element::KeyOptions {
+                    when: nsh_core::keymap::When::Always,
+                    ..Default::default()
+                },
+                move |_| {
+                    if from_slash.get_untracked() {
+                        return_focus.run(
+                            &nsh_base::rich_editor::extensions::suggestion::exit_suggestion(
+                                SLASH_KEY,
+                            ),
+                        );
+                    }
+                    open.set(false);
+                    return_focus.focus();
+                },
+            );
+            spawn(async move { field.focus() });
             view()
                 .mx_4()
                 .my_1()
@@ -901,13 +1027,14 @@ fn task_card_picker(
                 .p_2()
                 .child(
                     nsh_base::input()
+                        .element_ref(&field)
                         .value(move || filter.get())
                         .on_change(move |text: &str| filter.set(text.to_owned()))
                         .placeholder("搜索任务，点选插入关联任务卡片")
                         .placeholder_color(move || color(nsh_base::theme().muted_foreground))
                         .h(px(30.0))
                         .px_2()
-                        .text_size(px(13.0))
+                        .text_size(tokens::text_px(13.0))
                         .rounded(tokens::radius_row())
                         .bg(tokens::control_bg())
                         .label("搜索任务"),
@@ -926,7 +1053,11 @@ fn task_card_picker(
                                 format!("插入卡片 · {title}"),
                                 move || {
                                     open.set(false);
-                                    insert_card_block(&pick_session, id);
+                                    if from_slash.get_untracked() {
+                                        insert_card_at_suggestion(&pick_session, SLASH_KEY, id);
+                                    } else {
+                                        insert_card_block(&pick_session, id);
+                                    }
                                 },
                             )
                             .into_element()
@@ -970,7 +1101,9 @@ fn insert_card_block(session: &EditorSession, task_id: i64) {
 /// inserting the card after the enclosing top-level block.
 fn insert_card_at_suggestion(session: &EditorSession, key: &str, task_id: i64) {
     let state = session.state();
-    let Some(suggestion) = suggestion_state(&state, key).filter(|s| s.active) else { return };
+    let Some(suggestion) = suggestion_state(&state, key).filter(|s| s.active) else {
+        return;
+    };
     let schema = state.schema().clone();
     let Ok(card) = schema.node_from_json(&json!({"type": CARD_NODE, "attrs": {"taskId": task_id}}))
     else {
@@ -978,7 +1111,10 @@ fn insert_card_at_suggestion(session: &EditorSession, key: &str, task_id: i64) {
     };
     let range = suggestion.range;
     let mut tr = state.tr();
-    if tr.replace_with(range.from, range.to, Fragment::from(card.clone())).is_err() {
+    if tr
+        .replace_with(range.from, range.to, Fragment::from(card.clone()))
+        .is_err()
+    {
         // Delete the trigger text, then put the card after the
         // enclosing top-level block (positions computed on the original
         // document, shifted by the deletion when after it).
@@ -1047,13 +1183,20 @@ impl MentionItem {
     }
 }
 
-fn mention_items(store: Store, session: &EditorSession, editor_events: Signal<u64>, composing: Signal<bool>) -> Vec<MentionItem> {
+fn mention_items(
+    store: Store,
+    session: &EditorSession,
+    editor_events: Signal<u64>,
+    composing: Signal<bool>,
+) -> Vec<MentionItem> {
     editor_events.get();
     if composing.get() {
         return Vec::new();
     }
     let state = session.state();
-    let Some(suggestion) = suggestion_state(&state, MENTION_KEY) else { return Vec::new() };
+    let Some(suggestion) = suggestion_state(&state, MENTION_KEY) else {
+        return Vec::new();
+    };
     if !suggestion.active {
         return Vec::new();
     }
@@ -1115,7 +1258,10 @@ fn mention_panel(
                     let pick = pick_session.clone();
                     each(
                         list,
-                        |item: &MentionItem| item.label(),
+                        // The key is the target's identity, not its label:
+                        // two Tasks can share a title, and a duplicated
+                        // label would collide in the row list.
+                        |item: &MentionItem| item.id(),
                         move |item, _index| {
                             let pick = pick.clone();
                             app_button(ButtonKind::Soft, item.with(|item| item.label()), move || {

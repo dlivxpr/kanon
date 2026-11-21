@@ -8,7 +8,9 @@
 use nsh_base::rich_editor::model::{Attrs, Fragment, Node, NodeSpec, Schema};
 use serde_json::json;
 
-use crate::domain::{parse_mention_marker, parse_task_card_marker, mention_marker, task_card_marker};
+use crate::domain::{
+    mention_marker, parse_mention_marker, parse_task_card_marker, task_card_marker,
+};
 
 /// The Linked Task Card block node (`group: "block"`, an atom carrying
 /// the referenced Task's id).
@@ -45,11 +47,20 @@ fn materialize_node(schema: &Schema, node: &Node, top_level: bool) -> Node {
         && let Some(task_id) = parse_task_card_marker(&node.text_content())
         && let Some(ty) = schema.node_type(CARD_NODE)
     {
-        let attrs: Attrs =
-            [("taskId".to_owned(), json!(task_id))].into_iter().collect();
+        let attrs: Attrs = [("taskId".to_owned(), json!(task_id))]
+            .into_iter()
+            .collect();
         if let Ok(card) = ty.create(Some(attrs), Fragment::empty(), vec![]) {
             return card;
         }
+    }
+    if node.ty().name() == "blockquote" && node.child_count() == 0 {
+        let paragraph = schema
+            .node_type("paragraph")
+            .expect("the paragraph type")
+            .create(None, Fragment::empty(), vec![])
+            .expect("an empty paragraph builds");
+        return node.copy(Fragment::from(paragraph));
     }
     let children = node
         .content()
@@ -68,7 +79,9 @@ fn materialize_node(schema: &Schema, node: &Node, top_level: bool) -> Node {
 /// Splits one text node into text and mention nodes at every valid
 /// mention marker; text that almost looks like a marker stays text.
 fn split_mentions(schema: &Schema, text: &Node) -> Vec<Node> {
-    let Some(content) = text.text() else { return vec![text.clone()] };
+    let Some(content) = text.text() else {
+        return vec![text.clone()];
+    };
     let marks = text.marks().to_vec();
     let mut out = Vec::new();
     let mut rest = content;
@@ -85,7 +98,10 @@ fn split_mentions(schema: &Schema, text: &Node) -> Vec<Node> {
                 ]
                 .into_iter()
                 .collect();
-                match schema.node_type(MENTION_NODE).and_then(|ty| ty.create(Some(attrs), Fragment::empty(), vec![]).ok()) {
+                match schema
+                    .node_type(MENTION_NODE)
+                    .and_then(|ty| ty.create(Some(attrs), Fragment::empty(), vec![]).ok())
+                {
                     Some(mention) => out.push(mention),
                     None => out.push(schema.text(&rest[start..start + byte_len], marks.clone())),
                 }
@@ -120,7 +136,11 @@ fn dematerialize_node(schema: &Schema, node: &Node) -> Node {
         return node.clone();
     }
     if node.ty().name() == CARD_NODE {
-        let task_id = node.attrs().get("taskId").and_then(|v| v.as_i64()).unwrap_or(0);
+        let task_id = node
+            .attrs()
+            .get("taskId")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
         let marker = task_card_marker(task_id);
         let paragraph = schema.node_type("paragraph").expect("the paragraph type");
         return paragraph
@@ -170,13 +190,25 @@ mod tests {
         let session = build_session(body, NodeViews::new().with(CARD_NODE, Arc::new(ProbeCard)));
         let doc = session.state().doc().clone();
         let all = node_names(&doc);
-        assert!(all.contains(&"taskCard".to_owned()), "the card marker becomes a card node: {all:?}");
+        assert!(
+            all.contains(&"taskCard".to_owned()),
+            "the card marker becomes a card node: {all:?}"
+        );
         let mentions = all.iter().filter(|name| *name == "mention").count();
-        assert_eq!(mentions, 2, "both mention markers become mention nodes: {all:?}");
-        assert!(all.contains(&"taskItem".to_owned()), "the plain checklist item stays one");
+        assert_eq!(
+            mentions, 2,
+            "both mention markers become mention nodes: {all:?}"
+        );
+        assert!(
+            all.contains(&"taskItem".to_owned()),
+            "the plain checklist item stays one"
+        );
 
         let serialized = doc_markdown(&session);
-        assert_eq!(serialized, body, "the kanon serialization restores the archive body byte for byte");
+        assert_eq!(
+            serialized, body,
+            "the kanon serialization restores the archive body byte for byte"
+        );
     }
 
     #[test]
@@ -193,10 +225,12 @@ mod tests {
 
     impl nsh_base::rich_editor::view::NodeView for ProbeCard {
         fn create(&self, _cx: &nsh_base::rich_editor::view::NodeViewCx, node: &Node) -> AnyElement {
-            let task_id = node.attrs().get("taskId").and_then(|v| v.as_i64()).unwrap_or(0);
-            view()
-                .child(text(format!("card {task_id}")))
-                .into_element()
+            let task_id = node
+                .attrs()
+                .get("taskId")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            view().child(text(format!("card {task_id}"))).into_element()
         }
     }
 }

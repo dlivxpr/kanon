@@ -5,6 +5,7 @@
 //! through these methods into `Workspace`, and the `bump` revision signal
 //! re-runs the bound queries against the fresh snapshot.
 
+use nsh_core::platform::Appearance;
 use nsh_core::prelude::*;
 
 use crate::domain::{
@@ -12,11 +13,27 @@ use crate::domain::{
     TaskPatch, Workspace, WorkspaceError,
 };
 
+use super::ContextChoice;
 use super::tabs::{ProjectSection, Route, TabStrip};
+
+mod collections;
+mod notes;
+pub(super) mod preferences;
 
 /// The sidebar's persistence keys.
 pub const PREF_SIDEBAR_COLLAPSED: &str = "sidebar_collapsed";
-pub const PREF_PANEL_OPEN: &str = "context_panel_open";
+const PANEL_PREFS: [&str; 3] = [
+    "context_panel_open",
+    "context_document_panel_open",
+    "context_other_panel_open",
+];
+const PREF_APPEARANCE: &str = "appearance";
+pub(crate) const PREF_START_PAGE: &str = "start_page";
+pub(crate) const PREF_CALENDAR_RANGE: &str = "calendar_range";
+pub(crate) const PREF_CARRYOVER: &str = "show_carryover";
+pub(crate) const PREF_WORD_COUNT: &str = "show_word_count";
+pub(crate) const PREF_OUTLINE: &str = "show_outline";
+pub(crate) const PREF_DOCUMENT_WIDTH: &str = "document_width";
 
 /// The single-editor lock (issue #6): at most one workbench tab holds
 /// edit ownership FOR a given document_id; locks for different
@@ -47,10 +64,19 @@ pub struct OutlineRequest {
     pub nonce: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ScenePanel {
+    open: bool,
+    choice: ContextChoice,
+    task: Option<i64>,
+}
+
 /// The app-level store: one `Workspace` behind signals.
 #[derive(Clone, Copy)]
 pub struct Store {
     workspace: Stored<Workspace>,
+    appearance: Signal<Appearance>,
+    preference_revision: Signal<u64>,
     /// Bumped after every workspace mutation so bound queries re-run.
     pub bump: Signal<u64>,
     /// The workbench tab strip (routes, per-tab history, pin state).
@@ -59,9 +85,8 @@ pub struct Store {
     /// The manual temporary expand while the responsive rules
     /// auto-collapse the outer sidebar (docs/ui-design.md §3.4).
     pub sidebar_temp_expand: Signal<bool>,
-    pub panel_open: Signal<bool>,
-    /// The Task shown in the right context panel's Task Detail.
-    pub selected_task: Signal<Option<i64>>,
+    panels: Signal<[ScenePanel; 3]>,
+    panel_drawer: Signal<bool>,
     /// Which tab (if any) currently owns the single editor lock for
     /// which Document. One entry per editing tab: ownership is scoped
     /// to a `document_id`, so an edit session for one Document never
@@ -74,23 +99,60 @@ pub struct Store {
 impl Store {
     pub fn new(workspace: Workspace) -> Self {
         let today = workspace.today();
+        let startup = match workspace
+            .preference(PREF_START_PAGE)
+            .ok()
+            .flatten()
+            .as_deref()
+        {
+            Some("start") => Route::Start,
+            Some("tasks") => Route::Tasks,
+            Some("calendar") => Route::Calendar,
+            Some("notes") => Route::QuickNotes,
+            _ => Route::Today,
+        };
         let sidebar_collapsed = workspace
             .preference(PREF_SIDEBAR_COLLAPSED)
             .ok()
             .flatten()
             .is_some_and(|v| v == "true");
-        // The panel defaults to open on task views (docs/ui-design.md
-        // §3.4); only an explicit "false" preference collapses it.
-        let panel_open =
-            workspace.preference(PREF_PANEL_OPEN).ok().flatten() != Some("false".to_owned());
+        let panels = std::array::from_fn(|i| ScenePanel {
+            open: match workspace
+                .preference(PANEL_PREFS[i])
+                .ok()
+                .flatten()
+                .as_deref()
+            {
+                Some("true") => true,
+                Some("false") => false,
+                _ => i == 0,
+            },
+            choice: ContextChoice::Auto,
+            task: None,
+        });
+        let appearance = match workspace
+            .preference(PREF_APPEARANCE)
+            .ok()
+            .flatten()
+            .as_deref()
+        {
+            Some("light") => Appearance::Light,
+            Some("dark") => Appearance::Dark,
+            _ => Appearance::System,
+        };
+        if appearance != Appearance::System {
+            nsh_core::element::set_color_scheme(appearance);
+        }
         Self {
             workspace: stored(workspace),
+            appearance: signal(appearance),
+            preference_revision: signal(0),
             bump: signal(0),
-            strip: signal(TabStrip::new(Route::Today, today)),
+            strip: signal(TabStrip::new(startup, today)),
             sidebar_collapsed: signal(sidebar_collapsed),
             sidebar_temp_expand: signal(false),
-            panel_open: signal(panel_open),
-            selected_task: signal(None),
+            panels: signal(panels),
+            panel_drawer: signal(false),
             editor_lock: signal(Vec::new()),
             outline_request: signal(None),
         }
@@ -125,6 +187,15 @@ impl Store {
         self.bump.get();
         self.workspace
             .with(|ws| ws.inbox_count().unwrap_or_default())
+    }
+
+    /// The Data & Backup page's 本地工作区状态 card: live counts of the
+    /// Knowledge Bases, Documents, Projects, Tasks and Quick Notes
+    /// (docs/ui-design.md §4.7); trashed objects do not count.
+    pub fn workspace_status(&self) -> crate::domain::WorkspaceStatus {
+        self.bump.get();
+        self.workspace
+            .with(|ws| ws.workspace_status().unwrap_or_default())
     }
 
     pub fn upcoming_tasks(&self) -> Vec<TaskAggregate> {
@@ -177,30 +248,42 @@ impl Store {
             .with(|ws| ws.project_document_target(project_id).unwrap_or_default())
     }
 
-    /// Whether the Project's linked grouping node currently sits in
-    /// Trash (the recoverable-binding notice reads this).
-    pub fn project_linked_node_trashed(&self, project_id: i64) -> bool {
-        let Some(project) = self.project(project_id) else { return false };
-        let Some(node_id) = project.linked_group_node_id else { return false };
-        self.catalog_node_is_trashed(node_id)
+    /// Whether the book or grouping node a project uses is in Trash.
+    pub fn project_link_in_trash(&self, project_id: i64) -> bool {
+        self.project_document_target(project_id)
+            .is_some_and(|target| {
+                self.book_in_trash(target.book_id)
+                    || target
+                        .group_node_id
+                        .is_some_and(|id| self.catalog_node_is_trashed(id))
+            })
+    }
+
+    pub fn book_in_trash(&self, id: i64) -> bool {
+        self.bump.get();
+        self.workspace
+            .with(|ws| ws.knowledge_base_is_trashed(id).unwrap_or(false))
     }
 
     pub fn catalog_node_is_trashed(&self, id: i64) -> bool {
         self.bump.get();
-        self.workspace.with(|ws| ws.catalog_node_is_trashed(id).unwrap_or(false))
+        self.workspace
+            .with(|ws| ws.catalog_node_is_trashed(id).unwrap_or(false))
     }
 
     /// One Catalog Node regardless of its Trash state (labels and
     /// breadcrumbs).
     pub fn catalog_node(&self, id: i64) -> Option<crate::domain::CatalogNode> {
         self.bump.get();
-        self.workspace.with(|ws| ws.catalog_node(id).unwrap_or_default())
+        self.workspace
+            .with(|ws| ws.catalog_node(id).unwrap_or_default())
     }
 
     /// The Trash screen's project rows.
     pub fn trashed_projects(&self) -> Vec<crate::domain::Project> {
         self.bump.get();
-        self.workspace.with(|ws| ws.trashed_projects().unwrap_or_default())
+        self.workspace
+            .with(|ws| ws.trashed_projects().unwrap_or_default())
     }
 
     /// The Trash screen's catalog node rows (subtree roots, all books).
@@ -236,6 +319,12 @@ impl Store {
         self.bump.get();
         self.workspace
             .with(|ws| ws.carryover_count().unwrap_or_default())
+    }
+
+    pub(crate) fn carryover_task_ids(&self) -> Vec<i64> {
+        self.bump.get();
+        self.workspace
+            .with(|ws| ws.carryover_task_ids().unwrap_or_default())
     }
 
     // ------------------------------------------------------------------
@@ -297,15 +386,29 @@ impl Store {
     /// right panel's backlinks section).
     pub fn document_backlinks(&self, document_id: i64) -> Vec<crate::domain::DocumentBacklink> {
         self.bump.get();
-        self.workspace
-            .with(|ws| ws.documents_referencing("document", document_id).unwrap_or_default())
+        self.workspace.with(|ws| {
+            ws.documents_referencing("document", document_id)
+                .unwrap_or_default()
+        })
+    }
+
+    /// Live documents that embed this task, newest first, once per document.
+    pub(crate) fn task_documents(&self, task_id: i64, limit: Option<i64>) -> Vec<(i64, String)> {
+        self.bump.get();
+        self.workspace.with(|workspace| {
+            workspace
+                .task_card_documents(task_id, limit)
+                .unwrap_or_default()
+        })
     }
 
     /// Documents whose title matches `query` (the `@` mention menu).
     pub fn document_titles_matching(&self, query: &str, limit: usize) -> Vec<(i64, String)> {
         self.bump.get();
-        self.workspace
-            .with(|ws| ws.document_titles_matching(query, limit).unwrap_or_default())
+        self.workspace.with(|ws| {
+            ws.document_titles_matching(query, limit)
+                .unwrap_or_default()
+        })
     }
 
     /// The Trash screen's task section.
@@ -319,7 +422,9 @@ impl Store {
     /// Task Card picker's candidate list.
     pub fn live_tasks(&self) -> Vec<TaskAggregate> {
         self.bump.get();
-        let groups = self.workspace.with(|ws| ws.task_groups().unwrap_or_default());
+        let groups = self
+            .workspace
+            .with(|ws| ws.task_groups().unwrap_or_default());
         let mut all = Vec::new();
         for list in groups.lists() {
             all.extend(list.iter().cloned());
@@ -347,6 +452,9 @@ impl Store {
                 .with(|ws| ws.project(*id).ok().flatten())
                 .map(|project| project.name)
                 .unwrap_or_else(|| route.title()),
+            Route::Tag(id) => self
+                .tag_name(*id)
+                .map_or_else(|| route.title(), |name| format!("#{name}")),
             Route::ProjectEditor(Some(id)) => self
                 .workspace
                 .with(|ws| ws.project(*id).ok().flatten())
@@ -411,15 +519,29 @@ impl Store {
 
     /// The quick circle: strictly `done ↔ todo`.
     pub fn toggle_circle(&self, id: i64) {
-        if let Err(err) = self.workspace.with(|ws| ws.toggle_task_circle(id)) {
-            log::warn!("toggle task {id} failed: {err}");
+        match self.workspace.with(|ws| ws.toggle_task_circle(id)) {
+            Ok(task) if task.status == crate::domain::TaskStatus::Done => {
+                self.play_completion_sound()
+            }
+            Ok(_) => (),
+            Err(err) => log::warn!("toggle task {id} failed: {err}"),
         }
         self.bump();
     }
 
     pub fn update_task(&self, id: i64, patch: &TaskPatch) {
-        if let Err(err) = self.workspace.with(|ws| ws.update_task(id, patch)) {
-            log::warn!("update task {id} failed: {err}");
+        use crate::domain::TaskStatus;
+        let result = self.workspace.with(|ws| {
+            let completing = patch.status == Some(TaskStatus::Done)
+                && ws
+                    .task(id)?
+                    .is_some_and(|previous| previous.task.status != TaskStatus::Done);
+            ws.update_task(id, patch).map(|_| completing)
+        });
+        match result {
+            Ok(true) => self.play_completion_sound(),
+            Ok(false) => (),
+            Err(err) => log::warn!("update task {id} failed: {err}"),
         }
         self.bump();
     }
@@ -431,9 +553,7 @@ impl Store {
         if let Err(err) = self.workspace.with(|ws| ws.move_task_to_trash(id)) {
             log::warn!("trash task {id} failed: {err}");
         }
-        if self.selected_task.get_untracked() == Some(id) {
-            self.selected_task.set(None);
-        }
+        self.clear_task_from_panels(id);
         self.bump();
     }
 
@@ -451,9 +571,7 @@ impl Store {
         if let Err(err) = self.workspace.with(|ws| ws.delete_task_permanent(id)) {
             log::warn!("delete task {id} failed: {err}");
         }
-        if self.selected_task.get_untracked() == Some(id) {
-            self.selected_task.set(None);
-        }
+        self.clear_task_from_panels(id);
         self.bump();
     }
 
@@ -629,13 +747,23 @@ impl Store {
         parent: Option<i64>,
         title: &str,
     ) -> Option<i64> {
+        self.create_document_with_body_in(book_id, parent, title, "")
+    }
+
+    pub(crate) fn create_document_with_body_in(
+        &self,
+        book_id: i64,
+        parent: Option<i64>,
+        title: &str,
+        body: &str,
+    ) -> Option<i64> {
         let title = title.trim();
         if title.is_empty() {
             return None;
         }
         let result = self
             .workspace
-            .with(|ws| ws.create_document(book_id, parent, title));
+            .with(|ws| ws.create_document_with_body(book_id, parent, title, body));
         match result {
             Ok(doc) => {
                 self.bump();
@@ -666,6 +794,35 @@ impl Store {
             Err(err) => {
                 log::warn!("create catalog node failed: {err}");
                 None
+            }
+        }
+    }
+
+    /// A live editor owns the title as well as the body. Rename there
+    /// instead of overwriting its draft from a different surface.
+    pub fn rename_catalog_node(&self, id: i64, title: &str) -> bool {
+        let editors_open = self.editor_lock.with_untracked(|locks| !locks.is_empty());
+        let result = self.workspace.with(|ws| {
+            if editors_open
+                && let Some(document_id) = ws.catalog_node(id)?.and_then(|node| node.document_id)
+                && self.editor_lock.with_untracked(|locks| {
+                    locks.iter().any(|lock| lock.document_id == document_id)
+                })
+            {
+                return Ok(false);
+            }
+            ws.rename_catalog_node(id, title)
+        });
+        match result {
+            Ok(changed) => {
+                if changed {
+                    self.bump();
+                }
+                changed
+            }
+            Err(error) => {
+                log::warn!("rename catalog node {id} failed: {error}");
+                false
             }
         }
     }
@@ -784,7 +941,9 @@ impl Store {
             return;
         }
         let fallback = |doc_id: i64| {
-            self.workspace.with(|ws| ws.document(doc_id).ok().flatten()).is_none()
+            self.workspace
+                .with(|ws| ws.document(doc_id).ok().flatten())
+                .is_none()
         };
         self.strip.update(|strip| {
             for (tab_id, doc_id) in open_docs {
@@ -823,9 +982,9 @@ impl Store {
         if name.is_empty() {
             return None;
         }
-        let result = self.workspace.with(|ws| {
-            ws.create_project_with_binding(name, color, emoji, binding)
-        });
+        let result = self
+            .workspace
+            .with(|ws| ws.create_project_with_binding(name, color, emoji, binding));
         match result {
             Ok(project) => {
                 self.bump();
@@ -884,10 +1043,7 @@ impl Store {
     /// its Milestones deleted, while Knowledge Bases and Documents stay
     /// (ADR-0001).
     pub fn delete_project_permanent(&self, id: i64) {
-        if let Err(err) = self
-            .workspace
-            .with(|ws| ws.delete_project_permanent(id))
-        {
+        if let Err(err) = self.workspace.with(|ws| ws.delete_project_permanent(id)) {
             log::warn!("delete project {id} failed: {err}");
         }
         self.bump();
@@ -922,12 +1078,13 @@ impl Store {
     /// The kanban card's move: sets a Task's status (recording the
     /// completion time on `done`).
     pub fn set_task_status(&self, id: i64, status: crate::domain::TaskStatus) {
-        if let Err(err) = self.workspace.with(|ws| {
-            ws.update_task(id, &TaskPatch { status: Some(status), ..Default::default() })
-        }) {
-            log::warn!("set task {id} status failed: {err}");
-        }
-        self.bump();
+        self.update_task(
+            id,
+            &TaskPatch {
+                status: Some(status),
+                ..Default::default()
+            },
+        );
     }
 
     pub fn create_milestone(
@@ -962,37 +1119,16 @@ impl Store {
         self.bump();
     }
 
-    /// The Linked Documents view's creation: places the new Document
-    /// under the linked grouping node, or at the top of the linked
-    /// book's root (ADR-0001). Returns the new document id.
-    pub fn create_document_for_project(&self, project_id: i64, title: &str) -> Option<i64> {
-        let title = title.trim();
-        if title.is_empty() {
-            return None;
-        }
-        let result = self
-            .workspace
-            .with(|ws| ws.create_document_for_project(project_id, title));
-        match result {
-            Ok(doc) => {
-                self.bump();
-                Some(doc.id)
-            }
-            Err(err) => {
-                log::warn!("create project document failed: {err}");
-                None
-            }
-        }
-    }
-
     /// The Linked Documents view remembers which Document is open, per
     /// tab (like the Today view's selected date).
     pub fn set_project_section(&self, section: super::tabs::ProjectSection) {
-        self.strip.update(|strip| strip.set_project_section(section));
+        self.strip
+            .update(|strip| strip.set_project_section(section));
     }
 
     pub fn set_project_document(&self, document: Option<i64>) {
-        self.strip.update(|strip| strip.set_project_document(document));
+        self.strip
+            .update(|strip| strip.set_project_document(document));
     }
 
     /// The Project sub-view one tab currently shows.
@@ -1019,6 +1155,24 @@ impl Store {
         })
     }
 
+    pub(crate) fn catalog_hidden(&self, tab_id: u64) -> bool {
+        self.strip.with(|strip| {
+            strip
+                .tabs
+                .iter()
+                .any(|tab| tab.id == tab_id && tab.catalog_hidden)
+        })
+    }
+
+    pub(crate) fn set_catalog_hidden(&self, tab_id: u64, hidden: bool) {
+        crate::ui::motion::panel_change();
+        self.strip.update(|strip| {
+            if let Some(tab) = strip.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                tab.catalog_hidden = hidden;
+            }
+        });
+    }
+
     /// Opens the Project editor (create when `editing` is None).
     pub fn open_project_editor(&self, editing: Option<i64>) {
         self.open_or_focus(Route::ProjectEditor(editing));
@@ -1040,6 +1194,7 @@ impl Store {
 
     pub fn open_new_tab(&self) {
         let today = self.now().date;
+        crate::ui::motion::tab_change();
         self.strip
             .update(|strip| strip.open_tab(Route::Start, today));
     }
@@ -1047,14 +1202,40 @@ impl Store {
     pub fn open_or_focus(&self, route: Route) {
         let today = self.now().date;
         self.strip.update(|strip| strip.open_or_focus(route, today));
+        if window().width.0 < 680.0 {
+            self.sidebar_temp_expand.set(false);
+        }
     }
 
     pub fn close_tab(&self, id: u64) {
+        if !self
+            .strip
+            .with_untracked(|strip| strip.tabs.iter().any(|tab| tab.id == id && !tab.pinned))
+        {
+            return;
+        }
         // Closing ends the tab's edit session first: the finish-to-read
         // snapshot lands and the single-editor lock frees.
         self.release_editor(id, true);
+        crate::ui::motion::tab_change();
         self.strip.update(|strip| {
             strip.close_tab(id);
+        });
+    }
+
+    pub fn cycle_tab(&self) {
+        self.strip.update(TabStrip::cycle);
+    }
+
+    pub fn reopen_tab(&self) {
+        self.strip.update(|strip| {
+            strip.reopen_last(|route| match route {
+                Route::Book(id) => self.knowledge_base(*id).is_some(),
+                Route::Document(id) => self.document(*id).is_some(),
+                Route::QuickNote(id) => self.live_quick_note(*id).is_some(),
+                Route::Project(id) | Route::ProjectEditor(Some(id)) => self.project(*id).is_some(),
+                _ => true,
+            })
         });
     }
 
@@ -1128,8 +1309,12 @@ impl Store {
             Some(lock) if lock.tab_id == tab_id => EditOutcome::Granted,
             Some(lock) => EditOutcome::FocusOther(lock.tab_id),
             None => {
-                self.editor_lock
-                    .update(|locks| locks.push(EditorLock { tab_id, document_id }));
+                self.editor_lock.update(|locks| {
+                    locks.push(EditorLock {
+                        tab_id,
+                        document_id,
+                    })
+                });
                 EditOutcome::Granted
             }
         }
@@ -1178,7 +1363,10 @@ impl Store {
         let still_on_document = self.strip.with_untracked(|strip| {
             strip.tabs.iter().any(|tab| {
                 tab.id == tab_id
-                    && matches!(tab.current, Route::Document(id) if id == lock.document_id)
+                    && (matches!(tab.current, Route::Document(id) if id == lock.document_id)
+                        || (matches!(tab.current, Route::Project(_))
+                            && tab.project_section == ProjectSection::Documents
+                            && tab.project_doc == Some(lock.document_id)))
             })
         });
         if still_on_document {
@@ -1254,7 +1442,13 @@ impl Store {
         project_id: Option<i64>,
     ) -> Result<crate::domain::Promotion, WorkspaceError> {
         let result = self.workspace.with(|ws| {
-            ws.promote_checklist_item(document_id, Some(base_version), editor_body, title, project_id)
+            ws.promote_checklist_item(
+                document_id,
+                Some(base_version),
+                editor_body,
+                title,
+                project_id,
+            )
         });
         if result.is_ok() {
             self.bump();
@@ -1289,9 +1483,9 @@ impl Store {
     /// and references re-anchor — never touching any Task.
     pub fn restore_revision(&self, revision_id: i64) -> bool {
         let result = self.workspace.with(|ws| {
-            let revision = ws.document_revision(revision_id)?.ok_or_else(|| {
-                WorkspaceError::NotFound(format!("revision {revision_id}"))
-            })?;
+            let revision = ws
+                .document_revision(revision_id)?
+                .ok_or_else(|| WorkspaceError::NotFound(format!("revision {revision_id}")))?;
             ws.save_document_revision(revision.document_id, None)?;
             ws.restore_document_revision(revision_id)
         });
@@ -1326,10 +1520,59 @@ impl Store {
     // Shell commands
     // ------------------------------------------------------------------
 
+    pub(super) fn export_backup(&self, path: &std::path::Path) -> Result<(), WorkspaceError> {
+        self.workspace.with(|ws| ws.export_backup(path))
+    }
+
+    pub(crate) fn preference(&self, key: &str) -> Option<String> {
+        self.preference_revision.get();
+        self.workspace.with(|ws| ws.preference(key).ok().flatten())
+    }
+
+    pub(crate) fn preference_enabled(&self, key: &str) -> bool {
+        self.preference(key).as_deref() != Some("false")
+    }
+
+    pub(crate) fn set_preference(&self, key: &str, value: &str) -> bool {
+        match self.workspace.with(|ws| ws.set_preference(key, value)) {
+            Ok(()) => {
+                self.preference_revision.update(|revision| *revision += 1);
+                true
+            }
+            Err(err) => {
+                log::warn!("persist {key} preference failed: {err}");
+                false
+            }
+        }
+    }
+
+    pub fn appearance(&self) -> Appearance {
+        self.appearance.get()
+    }
+
+    pub fn set_appearance(&self, appearance: Appearance) -> bool {
+        let value = match appearance {
+            Appearance::System => "system",
+            Appearance::Light => "light",
+            Appearance::Dark => "dark",
+        };
+        if let Err(err) = self
+            .workspace
+            .with(|ws| ws.set_preference(PREF_APPEARANCE, value))
+        {
+            log::warn!("persist appearance preference failed: {err}");
+            return false;
+        }
+        self.appearance.set(appearance);
+        nsh_core::element::set_color_scheme(appearance);
+        true
+    }
+
     /// The sidebar's persistence-backed toggle. The responsive RULE
     /// lives in the sidebar UI layer (docs/ui-design.md §3.4); this
     /// method only applies its outcome.
     pub fn toggle_sidebar(&self) {
+        crate::ui::motion::panel_change();
         if super::sidebar::sidebar_auto_collapsed(*self) {
             self.sidebar_temp_expand
                 .update(|expanded| *expanded = !*expanded);
@@ -1348,26 +1591,83 @@ impl Store {
         }
     }
 
+    /// Tasks, library/documents, and other workspaces have independent inspectors.
+    fn panel_scene(&self) -> usize {
+        self.strip
+            .with(|strip| match strip.tabs[strip.active].current {
+                Route::KnowledgeBases | Route::Book(_) | Route::Document(_) => 1,
+                Route::QuickNotes
+                | Route::QuickNote(_)
+                | Route::Trash
+                | Route::Settings
+                | Route::ProjectEditor(_) => 2,
+                _ => 0,
+            })
+    }
+
+    pub(super) fn panel_choice(&self) -> ContextChoice {
+        self.panels.with(|panels| panels[self.panel_scene()].choice)
+    }
+
+    pub(super) fn choose_panel(&self, choice: ContextChoice) {
+        let scene = self.panel_scene();
+        self.panels.update(|panels| {
+            panels[scene].choice = choice;
+            panels[scene].task = None;
+        });
+        if !self.panel_visible() {
+            self.toggle_panel();
+        }
+    }
+
+    pub(super) fn selected_task(&self) -> Option<i64> {
+        self.panels.with(|panels| panels[self.panel_scene()].task)
+    }
+
+    pub fn panel_visible(&self) -> bool {
+        if window().width.0 < 960.0 {
+            self.panel_drawer.get()
+        } else {
+            self.panels.with(|panels| panels[self.panel_scene()].open)
+        }
+    }
+
     pub fn toggle_panel(&self) {
-        let open = !self.panel_open.get_untracked();
-        self.panel_open.set(open);
+        crate::ui::motion::panel_change();
+        if window().width.0 < 960.0 {
+            self.panel_drawer.update(|open| *open = !*open);
+            return;
+        }
+        let scene = self.panel_scene();
+        let open = !self.panels.with_untracked(|panels| panels[scene].open);
         let result = self
             .workspace
-            .with(|ws| ws.set_preference(PREF_PANEL_OPEN, if open { "true" } else { "false" }));
+            .with(|ws| ws.set_preference(PANEL_PREFS[scene], if open { "true" } else { "false" }));
+        self.panels.update(|panels| panels[scene].open = open);
         if let Err(err) = result {
             log::warn!("persist panel preference failed: {err}");
         }
     }
 
     pub fn open_task(&self, id: i64) {
-        self.selected_task.set(Some(id));
-        if !self.panel_open.get_untracked() {
+        let scene = self.panel_scene();
+        self.panels.update(|panels| panels[scene].task = Some(id));
+        if !self.panel_visible() {
             self.toggle_panel();
         }
     }
 
     pub fn close_task(&self) {
-        self.selected_task.set(None);
+        let scene = self.panel_scene();
+        self.panels.update(|panels| panels[scene].task = None);
+    }
+
+    fn clear_task_from_panels(&self, id: i64) {
+        self.panels.update(|panels| {
+            for panel in panels.iter_mut().filter(|panel| panel.task == Some(id)) {
+                panel.task = None;
+            }
+        });
     }
 
     fn bump(&self) {

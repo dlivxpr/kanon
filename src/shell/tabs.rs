@@ -1,10 +1,12 @@
-//! Workbench tabs: routes, per-tab back/forward history, and the
-//! focus-or-reuse navigation rule (spec user story 3).
+//! Workbench tabs: routes, per-tab back/forward history, the
+//! focus-or-reuse navigation rule (spec user story 3), and the drag
+//! reorder rule (docs/ui-design.md §3.1).
 //!
 //! Pure Rust: the engine store owns the signals, this module owns the
 //! rules, and `cargo test` covers them without an engine.
 
 use crate::domain::LocalDate;
+use crate::ui::chrome::Icon;
 
 /// Every destination a workbench tab can show.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,8 +17,10 @@ pub enum Route {
     Tasks,
     Calendar,
     QuickNotes,
+    QuickNote(i64),
     Favorites,
     Tags,
+    Tag(i64),
     KnowledgeBases,
     /// One open book: its home page plus the inner catalog sidebar.
     Book(i64),
@@ -68,9 +72,9 @@ impl Route {
             Self::Upcoming => "即将到来".to_owned(),
             Self::Tasks => "待办".to_owned(),
             Self::Calendar => "日历".to_owned(),
-            Self::QuickNotes => "小记".to_owned(),
+            Self::QuickNotes | Self::QuickNote(_) => "小记".to_owned(),
             Self::Favorites => "收藏".to_owned(),
-            Self::Tags => "标签".to_owned(),
+            Self::Tags | Self::Tag(_) => "标签".to_owned(),
             Self::KnowledgeBases => "知识库".to_owned(),
             Self::Book(_) => "知识库".to_owned(),
             Self::Document(_) => "文档".to_owned(),
@@ -81,24 +85,23 @@ impl Route {
         }
     }
 
-    /// A short glyph for the tab and the sidebar.
-    pub fn glyph(&self) -> &'static str {
+    /// The app's shared route icon for the sidebar and work tabs.
+    pub fn icon(&self) -> Icon {
         match self {
-            Self::Start => "◇",
-            Self::Today => "☀",
-            Self::Upcoming => "⧗",
-            Self::Tasks => "☑",
-            Self::Calendar => "▦",
-            Self::QuickNotes => "✎",
-            Self::Favorites => "★",
-            Self::Tags => "#",
-            Self::KnowledgeBases => "📚",
-            Self::Book(_) => "📕",
-            Self::Document(_) => "📄",
-            Self::Project(_) => "🗂",
-            Self::ProjectEditor(_) => "🗂",
-            Self::Trash => "🗑",
-            Self::Settings => "⚙",
+            Self::Start => Icon::Start,
+            Self::Today => Icon::Sun,
+            Self::Upcoming => Icon::Clock,
+            Self::Tasks => Icon::Tasks,
+            Self::Calendar => Icon::Calendar,
+            Self::QuickNotes | Self::QuickNote(_) => Icon::Note,
+            Self::Favorites => Icon::Star,
+            Self::Tags | Self::Tag(_) => Icon::Tag,
+            Self::KnowledgeBases => Icon::Books,
+            Self::Book(_) => Icon::Book,
+            Self::Document(_) => Icon::Document,
+            Self::Project(_) | Self::ProjectEditor(_) => Icon::Project,
+            Self::Trash => Icon::Trash,
+            Self::Settings => Icon::Settings,
         }
     }
 }
@@ -114,6 +117,7 @@ pub struct Tab {
     pub future: Vec<Route>,
     pub pinned: bool,
     pub selected_date: LocalDate,
+    pub catalog_hidden: bool,
     /// Which Project sub-view shows (Overview / Tasks / Board /
     /// Documents).
     pub project_section: ProjectSection,
@@ -131,6 +135,7 @@ impl Tab {
             future: Vec::new(),
             pinned: false,
             selected_date: today,
+            catalog_hidden: false,
             project_section: ProjectSection::default(),
             project_doc: None,
         }
@@ -197,18 +202,24 @@ impl Tab {
     }
 }
 
-/// The tab-strip rules: opening, closing, pinning, and the sidebar's
-/// focus-or-reuse navigation.
+/// The tab-strip rules: opening, closing, pinning, drag reorder, and the
+/// sidebar's focus-or-reuse navigation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TabStrip {
     pub tabs: Vec<Tab>,
     pub active: usize,
     next_id: u64,
+    closed: Vec<Tab>,
 }
 
 impl TabStrip {
     pub fn new(initial: Route, today: LocalDate) -> Self {
-        Self { tabs: vec![Tab::new(1, initial, today)], active: 0, next_id: 2 }
+        Self {
+            tabs: vec![Tab::new(1, initial, today)],
+            active: 0,
+            next_id: 2,
+            closed: Vec::new(),
+        }
     }
 
     fn active_tab(&self) -> &Tab {
@@ -240,14 +251,20 @@ impl TabStrip {
     /// the current *unpinned* tab). Closing the active tab focuses its
     /// right neighbor (or the new last tab).
     pub fn close_tab(&mut self, id: u64) -> bool {
-        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else { return false };
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return false;
+        };
         if self.tabs[index].pinned {
             return false;
         }
-        self.tabs.remove(index);
+        let closed = self.tabs.remove(index);
+        let date = closed.selected_date;
+        self.closed.push(closed);
+        if self.closed.len() > 32 {
+            self.closed.remove(0);
+        }
         if self.tabs.is_empty() {
-            // The workbench always keeps at least one tab.
-            self.tabs.push(Tab::new(self.next_id, Route::Start, self.active_tab_today()));
+            self.tabs.push(Tab::new(self.next_id, Route::Start, date));
             self.next_id += 1;
             self.active = 0;
         } else if self.active >= self.tabs.len() {
@@ -256,10 +273,6 @@ impl TabStrip {
             self.active -= 1;
         }
         true
-    }
-
-    fn active_tab_today(&self) -> LocalDate {
-        self.tabs.first().map(|tab| tab.selected_date).unwrap_or(LocalDate::new(1970, 1, 1))
     }
 
     pub fn navigate_active(&mut self, route: Route) {
@@ -287,6 +300,22 @@ impl TabStrip {
         self.tabs[self.active].forward()
     }
 
+    pub fn cycle(&mut self) {
+        self.active = (self.active + 1) % self.tabs.len();
+    }
+
+    pub fn reopen_last(&mut self, is_live: impl Fn(&Route) -> bool) {
+        while let Some(mut tab) = self.closed.pop() {
+            if is_live(&tab.current) {
+                tab.past.retain(&is_live);
+                tab.future.retain(&is_live);
+                self.tabs.push(tab);
+                self.active = self.tabs.len() - 1;
+                return;
+            }
+        }
+    }
+
     pub fn set_active(&mut self, index: usize) {
         if index < self.tabs.len() {
             self.active = index;
@@ -297,6 +326,35 @@ impl TabStrip {
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
             tab.pinned = !tab.pinned;
         }
+    }
+
+    /// Moves the tab `id` onto the tab `target`, occupying the target's
+    /// prior index (docs/kanon.html's tab drag: `splice(j, 0,
+    /// splice(i, 1))` — the dragged tab takes the slot the target
+    /// occupied, every tab between the two shifting one place). A drop
+    /// on the tab itself, or on an unknown tab, is a no-op, as is a
+    /// cancelled release. The active tab keeps its identity: `active`
+    /// follows the same tab id to its new index, so reordering never
+    /// activates a different tab.
+    pub fn reorder(&mut self, id: u64, target: u64) -> bool {
+        if id == target {
+            return false;
+        }
+        let Some(from) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return false;
+        };
+        let Some(to) = self.tabs.iter().position(|tab| tab.id == target) else {
+            return false;
+        };
+        let active_id = self.tabs[self.active].id;
+        let tab = self.tabs.remove(from);
+        self.tabs.insert(to, tab);
+        self.active = self
+            .tabs
+            .iter()
+            .position(|tab| tab.id == active_id)
+            .unwrap_or(0);
+        true
     }
 }
 
@@ -325,7 +383,10 @@ mod tests {
         assert_eq!(strip.active_tab().current, Route::Today);
         assert!(strip.active_tab().can_forward());
         strip.navigate_active(Route::Tasks);
-        assert!(!strip.active_tab().can_forward(), "new navigation clears the forward stack");
+        assert!(
+            !strip.active_tab().can_forward(),
+            "new navigation clears the forward stack"
+        );
         assert_eq!(strip.active_tab().current, Route::Tasks);
     }
 
@@ -367,7 +428,11 @@ mod tests {
     fn sidebar_click_reuses_the_active_unpinned_tab() {
         let mut strip = TabStrip::new(Route::Today, today());
         strip.open_or_focus(Route::Tasks, today());
-        assert_eq!(strip.tabs.len(), 1, "the unpinned tab navigates instead of opening a new tab");
+        assert_eq!(
+            strip.tabs.len(),
+            1,
+            "the unpinned tab navigates instead of opening a new tab"
+        );
         assert_eq!(strip.active_tab().current, Route::Tasks);
         assert!(strip.active_tab().can_back(), "reuse still records history");
     }
@@ -380,7 +445,11 @@ mod tests {
         strip.open_or_focus(Route::Tasks, today());
         assert_eq!(strip.tabs.len(), 2, "a pinned active tab forces a new tab");
         assert_eq!(strip.active, 1);
-        assert_eq!(strip.tabs[0].current, Route::Today, "the pinned tab keeps its place");
+        assert_eq!(
+            strip.tabs[0].current,
+            Route::Today,
+            "the pinned tab keeps its place"
+        );
     }
 
     #[test]
@@ -391,7 +460,11 @@ mod tests {
         assert!(!strip.close_tab(id), "pinned tabs do not close");
         strip.toggle_pin(id);
         assert!(strip.close_tab(id));
-        assert_eq!(strip.tabs.len(), 1, "closing the last tab opens a fresh Start tab");
+        assert_eq!(
+            strip.tabs.len(),
+            1,
+            "closing the last tab opens a fresh Start tab"
+        );
         assert_eq!(strip.active_tab().current, Route::Start);
     }
 
@@ -414,7 +487,10 @@ mod tests {
         assert_eq!(strip.active_tab().project_section, ProjectSection::Overview);
         strip.set_project_section(ProjectSection::Board);
         strip.set_project_document(Some(9));
-        assert_eq!(strip.active_tab().project_section, ProjectSection::Documents);
+        assert_eq!(
+            strip.active_tab().project_section,
+            ProjectSection::Documents
+        );
         assert_eq!(strip.active_tab().project_doc, Some(9));
 
         // Another tab keeps its own project state.
@@ -425,7 +501,10 @@ mod tests {
         // Focusing the first project tab restores its state.
         strip.open_or_focus(Route::Project(3), today());
         assert_eq!(strip.active, 0);
-        assert_eq!(strip.active_tab().project_section, ProjectSection::Documents);
+        assert_eq!(
+            strip.active_tab().project_section,
+            ProjectSection::Documents
+        );
         assert_eq!(strip.active_tab().project_doc, Some(9));
 
         // Navigating away (or to another Project) resets the per-tab
@@ -440,15 +519,155 @@ mod tests {
         let mut strip = TabStrip::new(Route::Document(7), today());
         strip.open_tab(Route::Document(9), today());
         strip.open_or_focus(Route::Document(7), today());
-        assert_eq!(strip.active, 0, "opening a Document focuses the tab already showing it");
-        assert_eq!(strip.tabs.len(), 2, "no duplicate tab for the same document");
+        assert_eq!(
+            strip.active, 0,
+            "opening a Document focuses the tab already showing it"
+        );
+        assert_eq!(
+            strip.tabs.len(),
+            2,
+            "no duplicate tab for the same document"
+        );
         strip.open_tab(Route::Document(7), today());
         assert_eq!(
-            strip.tabs.iter().filter(|tab| tab.current == Route::Document(7)).count(),
+            strip
+                .tabs
+                .iter()
+                .filter(|tab| tab.current == Route::Document(7))
+                .count(),
             2,
             "a second tab on the same document is how concurrent reading happens"
         );
         strip.open_or_focus(Route::Tasks, today());
-        assert_eq!(strip.active_tab().current, Route::Tasks, "other routes keep navigating by reuse");
+        assert_eq!(
+            strip.active_tab().current,
+            Route::Tasks,
+            "other routes keep navigating by reuse"
+        );
+    }
+
+    #[test]
+    fn drag_a_right_tab_onto_a_left_tab_takes_the_targets_prior_index() {
+        let mut strip = TabStrip::new(Route::Today, today());
+        strip.open_tab(Route::Tasks, today());
+        strip.open_tab(Route::Calendar, today());
+        let today_id = strip.tabs[0].id;
+        let tasks_id = strip.tabs[1].id;
+        let calendar_id = strip.tabs[2].id;
+        assert!(
+            strip.reorder(calendar_id, today_id),
+            "a real drop onto another tab reorders"
+        );
+        let order = |strip: &TabStrip| strip.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>();
+        assert_eq!(
+            order(&strip),
+            vec![calendar_id, today_id, tasks_id],
+            "the dragged tab occupies the target's prior index; the target and the tabs it jumped over shift one place"
+        );
+        assert!(
+            !strip.reorder(tasks_id, 999),
+            "dropping on a tab that does not exist is an invalid drop: order stays"
+        );
+        assert_eq!(order(&strip), vec![calendar_id, today_id, tasks_id]);
+    }
+
+    #[test]
+    fn drag_a_left_tab_onto_a_right_tab_moves_everything_between() {
+        let mut strip = TabStrip::new(Route::Today, today());
+        strip.open_tab(Route::Tasks, today());
+        strip.open_tab(Route::Calendar, today());
+        let today_id = strip.tabs[0].id;
+        let tasks_id = strip.tabs[1].id;
+        let calendar_id = strip.tabs[2].id;
+        assert!(strip.reorder(today_id, calendar_id));
+        let order = || strip.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>();
+        assert_eq!(order(), vec![tasks_id, calendar_id, today_id]);
+    }
+
+    #[test]
+    fn drop_onto_the_tab_itself_leaves_the_order() {
+        let mut strip = TabStrip::new(Route::Today, today());
+        strip.open_tab(Route::Tasks, today());
+        let (first, second) = (strip.tabs[0].id, strip.tabs[1].id);
+        assert!(
+            !strip.reorder(second, second),
+            "dropping a tab on itself is a no-op"
+        );
+        assert_eq!(
+            strip.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            vec![first, second]
+        );
+    }
+
+    #[test]
+    fn reorder_preserves_the_active_tabs_identity_not_its_index() {
+        // The active tab is a bystander: its index follows it.
+        let mut strip = TabStrip::new(Route::Today, today());
+        strip.open_tab(Route::Tasks, today());
+        strip.open_tab(Route::Calendar, today());
+        strip.set_active(1);
+        let active = strip.tabs[strip.active].id;
+        let rightmost = strip.tabs[2].id;
+        let leftmost = strip.tabs[0].id;
+        assert!(strip.reorder(rightmost, leftmost));
+        assert_eq!(
+            strip.tabs[strip.active].id, active,
+            "the same tab is still active after others moved around it"
+        );
+        assert_eq!(
+            strip.active, 2,
+            "jumping the rightmost tab left pushed the bystander one slot right"
+        );
+
+        // The active tab is the dragged one: it stays active from its new
+        // index, and no other tab takes focus.
+        let mut strip = TabStrip::new(Route::Today, today());
+        strip.open_tab(Route::Tasks, today());
+        strip.open_tab(Route::Calendar, today());
+        let rightmost = strip.tabs[2].id;
+        let leftmost = strip.tabs[0].id;
+        assert!(strip.reorder(rightmost, leftmost));
+        assert_eq!(
+            strip.active, 0,
+            "the dragged tab lands at the target's index"
+        );
+        assert_eq!(
+            strip.tabs[strip.active].id, rightmost,
+            "reordering never activates a different tab"
+        );
+    }
+
+    #[test]
+    fn reorder_carries_history_pin_date_and_project_state_with_the_tab() {
+        let mut strip = TabStrip::new(Route::Today, today());
+        strip.open_tab(Route::Project(3), today());
+        strip.open_tab(Route::Calendar, today());
+        // Give the middle tab a history, a pin, and per-tab state.
+        strip.set_active(1);
+        strip.navigate_active(Route::Project(5));
+        let middle = strip.tabs[1].id;
+        strip.toggle_pin(middle);
+        strip.set_project_document(Some(9));
+        let leftmost = strip.tabs[0].id;
+
+        assert!(strip.reorder(middle, leftmost));
+        assert_eq!(
+            strip.tabs[0].id, middle,
+            "the tab moved to the target's prior index"
+        );
+        let moved = &strip.tabs[0];
+        assert!(moved.pinned, "the pin state travels with the tab");
+        assert!(moved.can_back(), "its back history travels with it");
+        assert_eq!(moved.project_section, ProjectSection::Documents);
+        assert_eq!(moved.project_doc, Some(9));
+        assert!(!strip.tabs[1].pinned, "the tab it jumped over is untouched");
+        assert!(
+            strip.reorder(strip.tabs[0].id, strip.tabs[2].id),
+            "reordering a pinned tab is allowed; only closing refuses them"
+        );
+        assert_eq!(
+            strip.tabs[2].id, middle,
+            "the pinned tab took the right target's prior index"
+        );
     }
 }

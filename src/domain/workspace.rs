@@ -9,14 +9,21 @@ use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, params};
 
 use super::clock::{Clock, SystemClock};
 use super::date::{LocalDate, LocalDateTime, LocalTime};
-use super::schema::{SCHEMA, SCHEMA_VERSION};
+use super::schema::{APPLICATION_ID, SCHEMA, SCHEMA_VERSION};
 use super::task::{
     NewTask, Priority, ProjectRef, Subtask, Tag, Task, TaskAggregate, TaskPatch, TaskStatus,
 };
+
+mod collections;
+pub use collections::*;
+mod quick_notes;
+pub use quick_notes::*;
+mod status;
+pub use status::*;
 
 /// What can go wrong inside the domain.
 #[derive(Debug)]
@@ -270,7 +277,11 @@ pub struct TaskGroups {
 
 impl TaskGroups {
     pub fn total_active(&self) -> usize {
-        self.overdue.len() + self.today.len() + self.upcoming.len() + self.inbox.len() + self.unscheduled.len()
+        self.overdue.len()
+            + self.today.len()
+            + self.upcoming.len()
+            + self.inbox.len()
+            + self.unscheduled.len()
     }
 
     /// Every row across all groups (unfiltered length).
@@ -354,10 +365,16 @@ pub struct TaskFilter {
 
 impl TaskFilter {
     pub fn matches(&self, aggregate: &TaskAggregate) -> bool {
-        if self.status.is_some_and(|status| aggregate.task.status != status) {
+        if self
+            .status
+            .is_some_and(|status| aggregate.task.status != status)
+        {
             return false;
         }
-        if self.priority.is_some_and(|priority| aggregate.task.priority != priority) {
+        if self
+            .priority
+            .is_some_and(|priority| aggregate.task.priority != priority)
+        {
             return false;
         }
         match self.project {
@@ -418,7 +435,10 @@ pub struct Workspace {
 impl Workspace {
     /// Opens (creating if needed) the workspace at `path` and migrates it.
     pub fn open(path: &Path, clock: Arc<dyn Clock>) -> Result<Self> {
-        if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             std::fs::create_dir_all(parent).map_err(WorkspaceError::Io)?;
         }
         let mut workspace = Self::connect(Connection::open(path)?, clock)?;
@@ -451,16 +471,84 @@ impl Workspace {
     pub fn migrate(&mut self) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute_batch(SCHEMA)?;
-        let version: i32 = tx.query_row("SELECT user_version FROM pragma_user_version", [], |row| row.get(0))?;
+        let version: i32 =
+            tx.query_row("SELECT user_version FROM pragma_user_version", [], |row| {
+                row.get(0)
+            })?;
         if version < 2 && !table_has_column(&tx, "documents", "version")? {
             // Version 2 adds the optimistic-locking counter of the
             // single-editor auto-save.
-            tx.execute_batch("ALTER TABLE documents ADD COLUMN version INTEGER NOT NULL DEFAULT 0;")?;
+            tx.execute_batch(
+                "ALTER TABLE documents ADD COLUMN version INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        if version < 4 {
+            tx.execute_batch(
+                "UPDATE catalog_nodes AS node SET title = doc.title \
+                 FROM documents AS doc WHERE node.document_id = doc.id AND node.title <> doc.title;",
+            )?;
+        }
+        if version < 5 && !table_has_column(&tx, "projects", "favorited")? {
+            tx.execute_batch(
+                "ALTER TABLE projects ADD COLUMN favorited INTEGER NOT NULL DEFAULT 0;",
+            )?;
         }
         if version < SCHEMA_VERSION {
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
+        tx.pragma_update(None, "application_id", APPLICATION_ID)?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Exports a consistent snapshot, including history, Trash, and
+    /// relationships. The destination must be a new file.
+    pub fn export_backup(&self, destination: &Path) -> Result<()> {
+        Self::copy_snapshot(&self.conn, destination)
+    }
+
+    /// Recover a backup to a new workspace. Neither the input file nor
+    /// any existing destination is opened for writing.
+    pub fn restore_backup_copy(backup: &Path, destination: &Path) -> Result<()> {
+        let conn = Connection::open_with_flags(
+            backup,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.pragma_update(None, "trusted_schema", false)?;
+        let identity =
+            conn.pragma_query_value(None, "application_id", |row| row.get::<_, i32>(0))?;
+        let version = conn.pragma_query_value(None, "user_version", |row| row.get::<_, i32>(0))?;
+        if identity != APPLICATION_ID || !(1..=SCHEMA_VERSION).contains(&version) {
+            return Err(WorkspaceError::InvalidOperation(
+                "not a compatible Kanon backup".to_owned(),
+            ));
+        }
+        let clean = conn.query_row("PRAGMA quick_check(1)", [], |row| {
+            Ok(row.get_ref(0)?.as_str()? == "ok")
+        })?;
+        if !clean {
+            return Err(WorkspaceError::InvalidOperation(
+                "invalid SQLite backup".to_owned(),
+            ));
+        }
+        Self::copy_snapshot(&conn, destination)
+    }
+
+    fn copy_snapshot(conn: &Connection, destination: &Path) -> Result<()> {
+        let destination = std::path::absolute(destination).map_err(WorkspaceError::Io)?;
+        let name = destination.to_str().ok_or_else(|| {
+            WorkspaceError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "backup path must be Unicode",
+            ))
+        })?;
+        let file = std::fs::File::create_new(&destination).map_err(WorkspaceError::Io)?;
+        // SQLite needs to reopen the reserved output on Windows.
+        drop(file);
+        if let Err(error) = conn.execute("VACUUM INTO ?1", [name]) {
+            let _ = std::fs::remove_file(destination);
+            return Err(error.into());
+        }
         Ok(())
     }
 
@@ -485,7 +573,9 @@ impl Workspace {
 
     /// Reads a preference value (e.g. `sidebar_collapsed`).
     pub fn preference(&self, key: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare("SELECT value FROM preferences WHERE key = ?")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value FROM preferences WHERE key = ?")?;
         Ok(stmt.query_row(params![key], |row| row.get(0)).optional()?)
     }
 
@@ -529,14 +619,19 @@ impl Workspace {
         )?;
         let id = tx.last_insert_rowid();
         tx.commit()?;
-        self.task(id)?.ok_or_else(|| WorkspaceError::NotFound(format!("task {id} missing after insert")))
+        self.task(id)?
+            .ok_or_else(|| WorkspaceError::NotFound(format!("task {id} missing after insert")))
     }
 
     /// Loads a Task with its tags, subtasks and project.
     pub fn task(&self, id: i64) -> Result<Option<TaskAggregate>> {
         let task = self
             .conn
-            .query_row("SELECT * FROM tasks WHERE id = ?", params![id], task_from_row)
+            .query_row(
+                "SELECT * FROM tasks WHERE id = ?",
+                params![id],
+                task_from_row,
+            )
             .optional()?;
         task.map(|task| self.with_details(task)).transpose()
     }
@@ -551,7 +646,10 @@ impl Workspace {
         let tasks = stmt
             .query_map(params![date.to_string()], task_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        tasks.into_iter().map(|task| self.with_details(task)).collect()
+        tasks
+            .into_iter()
+            .map(|task| self.with_details(task))
+            .collect()
     }
 
     /// Applies a partial edit. `Some(Some(v))` sets a field, `Some(None)`
@@ -567,7 +665,11 @@ impl Workspace {
             sets.push("status = ?");
             values.push(Some(status.as_str().to_owned()));
             sets.push("completed_at = ?");
-            values.push(if status == TaskStatus::Done { Some(self.stamp()) } else { None });
+            values.push(if status == TaskStatus::Done {
+                Some(self.stamp())
+            } else {
+                None
+            });
         }
         if let Some(priority) = patch.priority {
             sets.push("priority = ?");
@@ -580,6 +682,12 @@ impl Workspace {
         if let Some(project_id) = &patch.project_id {
             sets.push("project_id = ?");
             values.push(project_id.map(|id| id.to_string()));
+            if patch.milestone_id.is_none() {
+                sets.push(
+                    "milestone_id = CASE WHEN project_id IS ? THEN milestone_id ELSE NULL END",
+                );
+                values.push(project_id.map(|id| id.to_string()));
+            }
         }
         if let Some(milestone_id) = &patch.milestone_id {
             sets.push("milestone_id = ?");
@@ -604,8 +712,10 @@ impl Workspace {
         sets.push("updated_at = ?");
         values.push(Some(self.stamp()));
 
-        let mut refs: Vec<&dyn rusqlite::ToSql> =
-            values.iter().map(|value| value as &dyn rusqlite::ToSql).collect();
+        let mut refs: Vec<&dyn rusqlite::ToSql> = values
+            .iter()
+            .map(|value| value as &dyn rusqlite::ToSql)
+            .collect();
         let id_param: &dyn rusqlite::ToSql = &id;
         refs.push(id_param);
         let sql = format!("UPDATE tasks SET {} WHERE id = ?", sets.join(", "));
@@ -623,7 +733,13 @@ impl Workspace {
             .task(id)?
             .ok_or_else(|| WorkspaceError::NotFound(format!("task {id}")))?
             .task;
-        self.update_task(id, &TaskPatch { status: Some(current.status.circle_toggled()), ..Default::default() })
+        self.update_task(
+            id,
+            &TaskPatch {
+                status: Some(current.status.circle_toggled()),
+                ..Default::default()
+            },
+        )
     }
 
     /// How many tasks Carryover would move today (the badge on its
@@ -636,6 +752,18 @@ impl Workspace {
             params![today],
             |row| row.get::<_, i64>(0),
         )? as usize)
+    }
+
+    /// IDs the Carryover action would move, oldest scheduled day first.
+    pub(crate) fn carryover_task_ids(&self) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM tasks WHERE trashed_at IS NULL AND status IN ('todo', 'doing') \
+             AND scheduled_date < ? ORDER BY scheduled_date, scheduled_time IS NULL, \
+             scheduled_time, sort_order, id",
+        )?;
+        Ok(stmt
+            .query_map(params![self.today().to_string()], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// Carryover (GLOSSARY): moves every active task scheduled strictly
@@ -668,7 +796,10 @@ impl Workspace {
         let tasks = stmt
             .query_map([], task_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        tasks.into_iter().map(|task| self.with_details(task)).collect()
+        tasks
+            .into_iter()
+            .map(|task| self.with_details(task))
+            .collect()
     }
 
     /// How many tasks sit in the Inbox right now (the top-bar badge
@@ -694,7 +825,10 @@ impl Workspace {
         let tasks = stmt
             .query_map(params![today], task_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        tasks.into_iter().map(|task| self.with_details(task)).collect()
+        tasks
+            .into_iter()
+            .map(|task| self.with_details(task))
+            .collect()
     }
 
     /// All non-trashed tasks, grouped with strict mutual exclusion
@@ -775,7 +909,12 @@ impl Workspace {
             params![task_id, title, self.stamp()],
         )?;
         let id = self.conn.last_insert_rowid();
-        Ok(Subtask { id, task_id, title: title.to_owned(), done: false })
+        Ok(Subtask {
+            id,
+            task_id,
+            title: title.to_owned(),
+            done: false,
+        })
     }
 
     /// Toggles or sets a subtask's done flag.
@@ -789,7 +928,10 @@ impl Workspace {
 
     /// Removes a subtask.
     pub fn remove_subtask(&mut self, subtask_id: i64) -> Result<()> {
-        self.conn.execute("DELETE FROM task_subtasks WHERE id = ?", params![subtask_id])?;
+        self.conn.execute(
+            "DELETE FROM task_subtasks WHERE id = ?",
+            params![subtask_id],
+        )?;
         Ok(())
     }
 
@@ -797,7 +939,11 @@ impl Workspace {
     pub fn ensure_tag(&mut self, name: &str) -> Result<Tag> {
         if let Some(tag) = self
             .conn
-            .query_row("SELECT id, name, color FROM tags WHERE name = ?", params![name], tag_from_row)
+            .query_row(
+                "SELECT id, name, color FROM tags WHERE name = ?",
+                params![name],
+                tag_from_row,
+            )
             .optional()?
         {
             return Ok(tag);
@@ -807,7 +953,11 @@ impl Workspace {
             params![name, self.stamp()],
         )?;
         let id = self.conn.last_insert_rowid();
-        Ok(Tag { id, name: name.to_owned(), color: "#547093".to_owned() })
+        Ok(Tag {
+            id,
+            name: name.to_owned(),
+            color: "#547093".to_owned(),
+        })
     }
 
     /// Attaches a Tag to a Task (idempotent).
@@ -859,7 +1009,9 @@ impl Workspace {
             "SELECT id, name, description, icon, color, favorited FROM knowledge_bases \
              WHERE trashed_at IS NULL ORDER BY favorited DESC, sort_order, id",
         )?;
-        Ok(stmt.query_map([], kb_from_row)?.collect::<std::result::Result<Vec<_>, _>>()?)
+        Ok(stmt
+            .query_map([], kb_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// Loads a Knowledge Base regardless of its Trash state (the Trash
@@ -873,6 +1025,18 @@ impl Workspace {
                 kb_from_row,
             )
             .optional()?)
+    }
+
+    pub(crate) fn knowledge_base_is_trashed(&self, id: i64) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT trashed_at IS NOT NULL FROM knowledge_bases WHERE id = ?",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(false))
     }
 
     /// Applies a partial edit to a Knowledge Base.
@@ -902,17 +1066,23 @@ impl Workspace {
         if !sets.is_empty() {
             sets.push("updated_at = ?");
             values.push(self.stamp());
-            let mut refs: Vec<&dyn rusqlite::ToSql> =
-                values.iter().map(|value| value as &dyn rusqlite::ToSql).collect();
+            let mut refs: Vec<&dyn rusqlite::ToSql> = values
+                .iter()
+                .map(|value| value as &dyn rusqlite::ToSql)
+                .collect();
             let id_param: &dyn rusqlite::ToSql = &id;
             refs.push(id_param);
-            let sql = format!("UPDATE knowledge_bases SET {} WHERE id = ?", sets.join(", "));
+            let sql = format!(
+                "UPDATE knowledge_bases SET {} WHERE id = ?",
+                sets.join(", ")
+            );
             let changed = self.conn.execute(&sql, &refs[..])?;
             if changed == 0 {
                 return Err(WorkspaceError::NotFound(format!("knowledge base {id}")));
             }
         }
-        self.knowledge_base(id)?.ok_or_else(|| WorkspaceError::NotFound(format!("knowledge base {id}")))
+        self.knowledge_base(id)?
+            .ok_or_else(|| WorkspaceError::NotFound(format!("knowledge base {id}")))
     }
 
     /// Pins or unpins a Knowledge Base on the shelf.
@@ -933,7 +1103,10 @@ impl Workspace {
             params![book_id],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )?;
-        Ok(BookStats { documents: documents as usize, words: words as usize })
+        Ok(BookStats {
+            documents: documents as usize,
+            words: words as usize,
+        })
     }
 
     /// Moves a Knowledge Base and its whole descendant subtree — every
@@ -1031,12 +1204,24 @@ impl Workspace {
         parent_node_id: Option<i64>,
         title: &str,
     ) -> Result<Document> {
+        self.create_document_with_body(book_id, parent_node_id, title, "")
+    }
+
+    /// Creates a document with its initial Markdown and catalog entry in one commit.
+    pub(crate) fn create_document_with_body(
+        &mut self,
+        book_id: i64,
+        parent_node_id: Option<i64>,
+        title: &str,
+        body: &str,
+    ) -> Result<Document> {
+        let word_count = super::document::count_words(body);
         let expanded = self.validate_parent(book_id, parent_node_id)?;
         let now = self.stamp();
         let tx = self.conn.transaction()?;
         tx.execute(
-            "INSERT INTO documents (book_id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
-            params![book_id, title, now, now],
+            "INSERT INTO documents (book_id, title, body, word_count, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            params![book_id, title, body, word_count as i64, now, now],
         )?;
         let document_id = tx.last_insert_rowid();
         let sort_order = top_sort_order(&tx, book_id, parent_node_id)?;
@@ -1046,14 +1231,17 @@ impl Workspace {
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             params![book_id, parent_node_id, document_id, title, sort_order, expanded as i64, now, now],
         )?;
+        if !body.is_empty() {
+            reconcile_references(&tx, document_id, body, &now)?;
+        }
         tx.commit()?;
         Ok(Document {
             id: document_id,
             book_id,
             title: title.to_owned(),
-            body: String::new(),
-            updated_at: now.clone(),
-            word_count: 0,
+            body: body.to_owned(),
+            updated_at: now,
+            word_count,
             version: 0,
         })
     }
@@ -1074,7 +1262,15 @@ impl Workspace {
             "INSERT INTO catalog_nodes \
              (book_id, parent_id, title, sort_order, expanded, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?)",
-            params![book_id, parent_id, title, sort_order, expanded as i64, now, now],
+            params![
+                book_id,
+                parent_id,
+                title,
+                sort_order,
+                expanded as i64,
+                now,
+                now
+            ],
         )?;
         let id = tx.last_insert_rowid();
         tx.commit()?;
@@ -1173,7 +1369,9 @@ impl Workspace {
             "SELECT id, name, description, icon, color, favorited FROM knowledge_bases \
              WHERE trashed_at IS NOT NULL ORDER BY updated_at DESC, id",
         )?;
-        Ok(stmt.query_map([], kb_from_row)?.collect::<std::result::Result<Vec<_>, _>>()?)
+        Ok(stmt
+            .query_map([], kb_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// Every trashed Catalog Node subtree root across all books (the
@@ -1266,6 +1464,39 @@ impl Workspace {
         Ok(())
     }
 
+    /// Renames a live node in place. A document owns its title; the
+    /// catalog title is synchronized by the document-title trigger.
+    pub fn rename_catalog_node(&mut self, id: i64, title: &str) -> Result<bool> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Ok(false);
+        }
+        let now = self.stamp();
+        let tx = self.conn.transaction()?;
+        let document_id = tx
+            .query_row(
+                "SELECT cn.document_id FROM catalog_nodes cn JOIN knowledge_bases kb ON kb.id = cn.book_id \
+                 WHERE cn.id = ?1 AND cn.trashed_at IS NULL AND kb.trashed_at IS NULL",
+                [id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .ok_or_else(|| WorkspaceError::NotFound(format!("catalog node {id}")))?;
+        let changed = match document_id {
+            Some(document_id) => tx.execute(
+                "UPDATE documents SET title = ?1, updated_at = ?2, version = version + 1 \
+                 WHERE id = ?3 AND trashed_at IS NULL AND title <> ?1",
+                params![title, now, document_id],
+            )?,
+            None => tx.execute(
+                "UPDATE catalog_nodes SET title = ?1, updated_at = ?2 WHERE id = ?3 AND title <> ?1",
+                params![title, now, id],
+            )?,
+        };
+        tx.commit()?;
+        Ok(changed > 0)
+    }
+
     /// Moves a Catalog Node to `new_parent_id` (its own id's level when
     /// `None`) at `index` among the target level's children, renumbering
     /// both affected levels. Rejects a move into the node itself or any
@@ -1283,7 +1514,9 @@ impl Workspace {
         let _ = self.validate_parent(node.book_id, new_parent_id)?;
         if let Some(parent) = new_parent_id {
             if parent == id {
-                return Err(WorkspaceError::InvalidMove(format!("cannot move node {id} into itself")));
+                return Err(WorkspaceError::InvalidMove(format!(
+                    "cannot move node {id} into itself"
+                )));
             }
             let mut cursor = Some(parent);
             while let Some(current) = cursor {
@@ -1292,13 +1525,18 @@ impl Workspace {
                         "cannot move node {id} into its own descendant {parent}"
                     )));
                 }
-                cursor = self.catalog_node(current)?.and_then(|ancestor| ancestor.parent_id);
+                cursor = self
+                    .catalog_node(current)?
+                    .and_then(|ancestor| ancestor.parent_id);
             }
         }
         if node.parent_id == new_parent_id {
             let siblings = self.children_of(node.book_id, new_parent_id)?;
-            let mut ids: Vec<i64> =
-                siblings.iter().filter(|sibling| sibling.id != id).map(|sibling| sibling.id).collect();
+            let mut ids: Vec<i64> = siblings
+                .iter()
+                .filter(|sibling| sibling.id != id)
+                .map(|sibling| sibling.id)
+                .collect();
             let at = index.min(ids.len());
             ids.insert(at, id);
             self.renumber_level(node.book_id, new_parent_id, &ids)?;
@@ -1375,7 +1613,11 @@ impl Workspace {
         // The subtree's Documents move with it, atomically.
         let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let trashed_value: Option<String> = if trashed { Some(now.clone()) } else { None };
-        let trashed_clause = if trashed { "trashed_at IS NULL" } else { "trashed_at IS NOT NULL" };
+        let trashed_clause = if trashed {
+            "trashed_at IS NULL"
+        } else {
+            "trashed_at IS NOT NULL"
+        };
         tx.execute(
             &format!(
                 "UPDATE documents SET trashed_at = ?, updated_at = ? \
@@ -1385,7 +1627,10 @@ impl Workspace {
             rusqlite::params_from_iter(
                 std::iter::once(Box::new(trashed_value) as Box<dyn rusqlite::ToSql>)
                     .chain(std::iter::once(Box::new(now) as Box<dyn rusqlite::ToSql>))
-                    .chain(ids.iter().map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>))
+                    .chain(
+                        ids.iter()
+                            .map(|id| Box::new(*id) as Box<dyn rusqlite::ToSql>),
+                    )
                     .map(|param| param as Box<dyn rusqlite::ToSql>),
             ),
         )?;
@@ -1406,7 +1651,8 @@ impl Workspace {
         if changed == 0 {
             return Err(WorkspaceError::NotFound(format!("document {id}")));
         }
-        self.document(id)?.ok_or_else(|| WorkspaceError::NotFound(format!("document {id}")))
+        self.document(id)?
+            .ok_or_else(|| WorkspaceError::NotFound(format!("document {id}")))
     }
 
     /// Saves a Document revision; `name = None` records an automatic
@@ -1451,7 +1697,15 @@ impl Workspace {
             "INSERT INTO document_references \
              (document_id, ref_type, target_kind, target_id, target_label, position, created_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?)",
-            params![document_id, ref_type, target_kind, target_id, target_label, position, self.stamp()],
+            params![
+                document_id,
+                ref_type,
+                target_kind,
+                target_id,
+                target_label,
+                position,
+                self.stamp()
+            ],
         )?;
         let id = self.conn.last_insert_rowid();
         Ok(DocumentReference {
@@ -1582,14 +1836,25 @@ impl Workspace {
         let changed = tx.execute(
             "UPDATE documents SET title = ?, body = ?, word_count = ?, updated_at = ?, \
              version = version + 1 WHERE id = ?",
-            params![revision.title, revision.body, words, now, revision.document_id],
+            params![
+                revision.title,
+                revision.body,
+                words,
+                now,
+                revision.document_id
+            ],
         )?;
         if changed == 0 {
-            return Err(WorkspaceError::NotFound(format!("document {}", revision.document_id)));
+            return Err(WorkspaceError::NotFound(format!(
+                "document {}",
+                revision.document_id
+            )));
         }
         reconcile_references(&tx, revision.document_id, &revision.body, &now)?;
         tx.commit()?;
-        Ok(self.document(revision.document_id)?.expect("document exists after restore"))
+        Ok(self
+            .document(revision.document_id)?
+            .expect("document exists after restore"))
     }
 
     /// Loads a single revision.
@@ -1681,7 +1946,9 @@ impl Workspace {
         reconcile_references(&tx, document_id, &final_body, &now)?;
         tx.commit()?;
 
-        let document = self.document(document_id)?.expect("document exists after promotion");
+        let document = self
+            .document(document_id)?
+            .expect("document exists after promotion");
         let reference = self
             .conn
             .query_row(
@@ -1695,7 +1962,11 @@ impl Workspace {
             .ok_or_else(|| {
                 WorkspaceError::InvalidPromotion(format!("reference for task {task_id} missing"))
             })?;
-        Ok(Promotion { task_id, document, reference })
+        Ok(Promotion {
+            task_id,
+            document,
+            reference,
+        })
     }
 
     /// The editing tab's auto-save: like [`Self::update_document_body`],
@@ -1777,16 +2048,51 @@ impl Workspace {
             .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Distinct live documents containing a task card, newest first.
+    pub(crate) fn task_card_documents(
+        &self,
+        task_id: i64,
+        limit: Option<i64>,
+    ) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT DISTINCT d.id, d.title FROM document_references r \
+             JOIN documents d ON d.id = r.document_id \
+             WHERE r.target_kind = 'task' AND r.target_id = ?1 AND r.ref_type = 'task_card' \
+               AND d.trashed_at IS NULL AND EXISTS ( \
+                   SELECT 1 FROM catalog_nodes cn \
+                   WHERE cn.document_id = d.id AND cn.trashed_at IS NULL \
+               ) \
+             ORDER BY d.updated_at DESC, d.id DESC LIMIT ?2",
+        )?;
+        Ok(stmt
+            .query_map(params![task_id, limit.unwrap_or(-1)], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// Documents whose title matches `query` (the `@` mention menu);
     /// trashed documents never surface as mention candidates.
-    pub fn document_titles_matching(&self, query: &str, limit: usize) -> Result<Vec<(i64, String)>> {
-        let needle = format!("%{}%", query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+    pub fn document_titles_matching(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<(i64, String)>> {
+        let needle = format!(
+            "%{}%",
+            query
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
         let mut stmt = self.conn.prepare(
             "SELECT id, title FROM documents WHERE trashed_at IS NULL AND title LIKE ? ESCAPE '\\' \
              ORDER BY updated_at DESC, id LIMIT ?",
         )?;
         Ok(stmt
-            .query_map(params![needle, limit as i64], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map(params![needle, limit as i64], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
@@ -1798,7 +2104,10 @@ impl Workspace {
         let tasks = stmt
             .query_map([], task_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        tasks.into_iter().map(|task| self.with_details(task)).collect()
+        tasks
+            .into_iter()
+            .map(|task| self.with_details(task))
+            .collect()
     }
 
     // ------------------------------------------------------------------
@@ -1923,9 +2232,9 @@ impl Workspace {
     /// Every trashed Project (the Trash screen's restore rows), newest
     /// first.
     pub fn trashed_projects(&self) -> Result<Vec<Project>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT * FROM projects WHERE trashed_at IS NOT NULL ORDER BY updated_at DESC, id")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT * FROM projects WHERE trashed_at IS NOT NULL ORDER BY updated_at DESC, id",
+        )?;
         let projects = stmt
             .query_map([], project_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -1937,7 +2246,11 @@ impl Workspace {
     pub fn project(&self, id: i64) -> Result<Option<Project>> {
         Ok(self
             .conn
-            .query_row("SELECT * FROM projects WHERE id = ?", params![id], project_from_row)
+            .query_row(
+                "SELECT * FROM projects WHERE id = ?",
+                params![id],
+                project_from_row,
+            )
             .optional()?)
     }
 
@@ -1974,8 +2287,10 @@ impl Workspace {
         if !sets.is_empty() {
             sets.push("updated_at = ?");
             values.push(Some(self.stamp()));
-            let mut refs: Vec<&dyn rusqlite::ToSql> =
-                values.iter().map(|value| value as &dyn rusqlite::ToSql).collect();
+            let mut refs: Vec<&dyn rusqlite::ToSql> = values
+                .iter()
+                .map(|value| value as &dyn rusqlite::ToSql)
+                .collect();
             let id_param: &dyn rusqlite::ToSql = &id;
             refs.push(id_param);
             let sql = format!("UPDATE projects SET {} WHERE id = ?", sets.join(", "));
@@ -1984,7 +2299,8 @@ impl Workspace {
                 return Err(WorkspaceError::NotFound(format!("project {id}")));
             }
         }
-        self.project(id)?.ok_or_else(|| WorkspaceError::NotFound(format!("project {id}")))
+        self.project(id)?
+            .ok_or_else(|| WorkspaceError::NotFound(format!("project {id}")))
     }
 
     /// Every non-trashed Task assigned to the Project, in status order
@@ -1998,7 +2314,10 @@ impl Workspace {
         let tasks = stmt
             .query_map(params![project_id], task_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        tasks.into_iter().map(|task| self.with_details(task)).collect()
+        tasks
+            .into_iter()
+            .map(|task| self.with_details(task))
+            .collect()
     }
 
     /// Moves a Project into Trash. Its Tasks KEEP their `project_id` so
@@ -2061,14 +2380,17 @@ impl Workspace {
             params![book_id, now, project_id],
         )?;
         tx.commit()?;
-        self.project(project_id)?.ok_or_else(|| WorkspaceError::NotFound(format!("project {project_id}")))
+        self.project(project_id)?
+            .ok_or_else(|| WorkspaceError::NotFound(format!("project {project_id}")))
     }
 
     /// How many non-trashed Documents live in the Project's linked scope
     /// (the whole book, or the grouping node's subtree) — the Overview's
     /// 关联文档 metric.
     pub fn project_document_count(&self, project_id: i64) -> Result<usize> {
-        let Some(target) = self.project_document_target(project_id)? else { return Ok(0) };
+        let Some(target) = self.project_document_target(project_id)? else {
+            return Ok(0);
+        };
         let count = match target.group_node_id {
             Some(node_id) => self.conn.query_row(
                 "WITH RECURSIVE subtree(id) AS ( \
@@ -2104,9 +2426,15 @@ impl Workspace {
             let node = self.catalog_node(node_id)?.ok_or_else(|| {
                 WorkspaceError::InvalidOperation(format!("linked grouping node {node_id} is gone"))
             })?;
-            return Ok(Some(ProjectDocsTarget { book_id: node.book_id, group_node_id: Some(node_id) }));
+            return Ok(Some(ProjectDocsTarget {
+                book_id: node.book_id,
+                group_node_id: Some(node_id),
+            }));
         }
-        Ok(project.linked_book_id.map(|book_id| ProjectDocsTarget { book_id, group_node_id: None }))
+        Ok(project.linked_book_id.map(|book_id| ProjectDocsTarget {
+            book_id,
+            group_node_id: None,
+        }))
     }
 
     /// Creates a Document for a Project's Linked Documents view (ADR-0001):
@@ -2114,7 +2442,11 @@ impl Workspace {
     /// root when bound to the whole book. Refused while the linked node
     /// sits in Trash (the UI offers restore or rebind first) and for
     /// unbound Projects.
-    pub fn create_document_for_project(&mut self, project_id: i64, title: &str) -> Result<Document> {
+    pub fn create_document_for_project(
+        &mut self,
+        project_id: i64,
+        title: &str,
+    ) -> Result<Document> {
         let Some(target) = self.project_document_target(project_id)? else {
             return Err(WorkspaceError::InvalidOperation(format!(
                 "project {project_id} has no Knowledge Base binding"
@@ -2143,10 +2475,21 @@ impl Workspace {
         self.conn.execute(
             "INSERT INTO milestones (project_id, title, target_date, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?)",
-            params![project_id, title, target_date.map(|d| d.to_string()), now, now],
+            params![
+                project_id,
+                title,
+                target_date.map(|d| d.to_string()),
+                now,
+                now
+            ],
         )?;
         let id = self.conn.last_insert_rowid();
-        Ok(Milestone { id, project_id, title: title.to_owned(), target_date })
+        Ok(Milestone {
+            id,
+            project_id,
+            title: title.to_owned(),
+            target_date,
+        })
     }
 
     /// A Project's Milestones in display order (the Overview's list).
@@ -2193,7 +2536,12 @@ impl Workspace {
             params![content, now, now],
         )?;
         let id = self.conn.last_insert_rowid();
-        Ok(QuickNote { id, content: content.to_owned(), pinned: false, archived: false })
+        Ok(QuickNote {
+            id,
+            content: content.to_owned(),
+            pinned: false,
+            archived: false,
+        })
     }
 
     // ------------------------------------------------------------------
@@ -2206,18 +2554,29 @@ impl Workspace {
     /// book itself must exist (ADR-0001: a Document never lands outside
     /// a Knowledge Base).
     fn validate_parent(&self, book_id: i64, parent_id: Option<i64>) -> Result<bool> {
-        match parent_id {
+        let book = self
+            .conn
+            .query_row(
+                "SELECT trashed_at IS NULL FROM knowledge_bases WHERE id = ?",
+                params![book_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .optional()?;
+        match book {
             None => {
-                let exists = self
-                    .conn
-                    .query_row("SELECT 1 FROM knowledge_bases WHERE id = ?", params![book_id], |_| Ok(()))
-                    .optional()?
-                    .is_some();
-                if !exists {
-                    return Err(WorkspaceError::NotFound(format!("knowledge base {book_id}")));
-                }
-                Ok(true)
+                return Err(WorkspaceError::NotFound(format!(
+                    "knowledge base {book_id}"
+                )));
             }
+            Some(false) => {
+                return Err(WorkspaceError::InvalidMove(format!(
+                    "knowledge base {book_id} is in Trash"
+                )));
+            }
+            Some(true) => {}
+        }
+        match parent_id {
+            None => Ok(true),
             Some(parent) => {
                 let parent = self.catalog_node(parent)?.ok_or_else(|| {
                     WorkspaceError::InvalidMove(format!("no parent catalog node {parent}"))
@@ -2282,13 +2641,22 @@ impl Workspace {
                     "SELECT id, name, color FROM projects WHERE id = ?",
                     params![id],
                     |row| {
-                        Ok(ProjectRef { id: row.get(0)?, name: row.get(1)?, color: row.get(2)? })
+                        Ok(ProjectRef {
+                            id: row.get(0)?,
+                            name: row.get(1)?,
+                            color: row.get(2)?,
+                        })
                     },
                 )
                 .optional()?,
             None => None,
         };
-        Ok(TaskAggregate { task, tags, subtasks, project })
+        Ok(TaskAggregate {
+            task,
+            tags,
+            subtasks,
+            project,
+        })
     }
 
     fn tags_of_task(&self, task_id: i64) -> Result<Vec<Tag>> {
@@ -2297,7 +2665,9 @@ impl Workspace {
              JOIN task_tags ON task_tags.tag_id = tags.id \
              WHERE task_tags.task_id = ? ORDER BY tags.name",
         )?;
-        Ok(stmt.query_map(params![task_id], tag_from_row)?.collect::<std::result::Result<Vec<_>, _>>()?)
+        Ok(stmt
+            .query_map(params![task_id], tag_from_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     fn subtasks_of_task(&self, task_id: i64) -> Result<Vec<Subtask>> {
@@ -2342,7 +2712,11 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool
 /// Whether a Document row exists (any Trash state).
 fn document_exists(conn: &Connection, document_id: i64) -> Result<bool> {
     Ok(conn
-        .query_row("SELECT 1 FROM documents WHERE id = ?", params![document_id], |_| Ok(()))
+        .query_row(
+            "SELECT 1 FROM documents WHERE id = ?",
+            params![document_id],
+            |_| Ok(()),
+        )
         .optional()?
         .is_some())
 }
@@ -2387,15 +2761,22 @@ fn reconcile_references(conn: &Connection, document_id: i64, body: &str, now: &s
                 .is_some_and(|id| cards.iter().any(|(card_id, _)| *card_id == id)),
             "mention" => match row.target_kind.as_str() {
                 "task" | "project" | "document" => row.target_id.is_some_and(|id| {
-                    mentions.iter().any(|m| m.kind == row.target_kind && m.target_id == Some(id))
+                    mentions
+                        .iter()
+                        .any(|m| m.kind == row.target_kind && m.target_id == Some(id))
                 }),
-                "date" => mentions.iter().any(|m| m.kind == "date" && m.label == row.target_label),
+                "date" => mentions
+                    .iter()
+                    .any(|m| m.kind == "date" && m.label == row.target_label),
                 _ => true,
             },
             _ => true,
         };
         if !alive {
-            conn.execute("DELETE FROM document_references WHERE id = ?", params![row.id])?;
+            conn.execute(
+                "DELETE FROM document_references WHERE id = ?",
+                params![row.id],
+            )?;
         }
     }
 
@@ -2404,9 +2785,11 @@ fn reconcile_references(conn: &Connection, document_id: i64, body: &str, now: &s
     // (the invalid placeholder) with its last known label.
     for (task_id, position) in &cards {
         let title = conn
-            .query_row("SELECT title FROM tasks WHERE id = ?", params![task_id], |row| {
-                row.get::<_, String>(0)
-            })
+            .query_row(
+                "SELECT title FROM tasks WHERE id = ?",
+                params![task_id],
+                |row| row.get::<_, String>(0),
+            )
             .unwrap_or_default();
         upsert_reference(
             conn,
@@ -2456,7 +2839,11 @@ fn upsert_reference(
         Some(row) => {
             // A target gone from the database (permanently deleted Task)
             // keeps the row's last known label.
-            let label = if label.is_empty() { row.target_label.as_str() } else { label };
+            let label = if label.is_empty() {
+                row.target_label.as_str()
+            } else {
+                label
+            };
             conn.execute(
                 "UPDATE document_references SET position = ?, target_label = ? WHERE id = ?",
                 params![position as i64, label, row.id],
@@ -2497,7 +2884,11 @@ fn task_from_row(row: &Row<'_>) -> std::result::Result<Task, rusqlite::Error> {
 }
 
 fn tag_from_row(row: &Row<'_>) -> std::result::Result<Tag, rusqlite::Error> {
-    Ok(Tag { id: row.get(0)?, name: row.get(1)?, color: row.get(2)? })
+    Ok(Tag {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        color: row.get(2)?,
+    })
 }
 
 fn kb_from_row(row: &Row<'_>) -> std::result::Result<KnowledgeBase, rusqlite::Error> {
@@ -2556,9 +2947,14 @@ fn flatten_catalog(nodes: Vec<CatalogNode>) -> Vec<CatalogEntry> {
         depth: usize,
         outline: &mut Vec<CatalogEntry>,
     ) {
-        let Some(level) = children.get(&parent) else { return };
+        let Some(level) = children.get(&parent) else {
+            return;
+        };
         for node in level {
-            outline.push(CatalogEntry { node: (*node).clone(), depth });
+            outline.push(CatalogEntry {
+                node: (*node).clone(),
+                depth,
+            });
             walk(children, Some(node.id), depth + 1, outline);
         }
     }
@@ -2568,7 +2964,10 @@ fn flatten_catalog(nodes: Vec<CatalogNode>) -> Vec<CatalogEntry> {
             Some(parent) => !ids.contains_key(&parent),
         };
         if visible_root {
-            outline.push(CatalogEntry { node: (*node).clone(), depth: 0 });
+            outline.push(CatalogEntry {
+                node: (*node).clone(),
+                depth: 0,
+            });
             walk(&children, Some(node.id), 1, &mut outline);
         }
     }

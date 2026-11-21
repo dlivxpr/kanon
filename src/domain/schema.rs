@@ -6,7 +6,9 @@
 //! preferences live in one database and commit atomically.
 
 /// The schema version `user_version` is set to after migration.
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 5;
+/// SQLite file identity for recognizing Kanon workspace backups.
+pub const APPLICATION_ID: i32 = 0x4b41_4e4f; // KANO
 
 /// The complete workspace schema, applied inside one transaction.
 pub const SCHEMA: &str = "
@@ -51,6 +53,20 @@ CREATE TABLE IF NOT EXISTS documents (
 );
 CREATE INDEX IF NOT EXISTS idx_documents_book ON documents(book_id);
 
+CREATE INDEX IF NOT EXISTS idx_catalog_nodes_document ON catalog_nodes(document_id);
+CREATE TRIGGER IF NOT EXISTS sync_catalog_document_title
+AFTER UPDATE OF title ON documents
+WHEN OLD.title IS NOT NEW.title
+BEGIN
+    UPDATE catalog_nodes SET title = NEW.title WHERE document_id = NEW.id;
+END;
+
+CREATE TABLE IF NOT EXISTS document_visits (
+    document_id INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+    visit_order INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_document_visit_order ON document_visits(visit_order);
+
 CREATE TABLE IF NOT EXISTS document_revisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     document_id INTEGER NOT NULL REFERENCES documents(id),
@@ -83,6 +99,7 @@ CREATE TABLE IF NOT EXISTS projects (
     linked_book_id INTEGER REFERENCES knowledge_bases(id),
     linked_group_node_id INTEGER REFERENCES catalog_nodes(id),
     sort_order INTEGER NOT NULL DEFAULT 0,
+    favorited INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     trashed_at TEXT

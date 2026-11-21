@@ -7,20 +7,23 @@
 //! from a second tab focuses the tab that already holds the lock.
 
 mod editing;
+mod export;
 mod history;
+mod insert;
 pub(crate) mod kanon;
 mod mention;
 mod reading;
 mod task_card;
+pub(crate) mod templates;
 
 use nsh_base::rich_editor::{
     extensions::{
         extension::{Extension, ExtensionManager},
-        kit::{starter_kit, table_kit},
+        kit::{starter_kit_extensions, table_kit},
         suggestion::{SuggestionOptions, mention_node, suggestion},
     },
-    formats::{DocFormat, MarkdownFormat},
-    model::{Fragment, Node},
+    formats::{DocFormat, MarkdownFormat, PlainTextFormat},
+    model::Node,
     state::{EditorState, EditorStateConfig},
     view::{EditorSession, NodeViews},
 };
@@ -33,6 +36,13 @@ pub(crate) const SLASH_KEY: &str = "slash";
 pub(crate) const MENTION_KEY: &str = "mention";
 pub(crate) use kanon::CARD_NODE;
 
+fn wide_paper(store: Store) -> bool {
+    store
+        .preference(crate::shell::store::PREF_DOCUMENT_WIDTH)
+        .as_deref()
+        == Some("wide")
+}
+
 /// One Document tab: reading chrome or editing chrome, by lock ownership.
 pub fn document_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoElement {
     let is_editor = move || {
@@ -42,6 +52,32 @@ pub fn document_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEl
             .iter()
             .any(|lock| lock.tab_id == tab_id && lock.document_id == document_id)
     };
+    let edit = move || {
+        if !is_editor()
+            && store.document(document_id).is_some()
+            && let crate::shell::store::EditOutcome::FocusOther(other) =
+                store.request_edit(tab_id, document_id)
+        {
+            store.activate_tab_by_id(other);
+        }
+    };
+    use nsh_core::{element::KeyOptions, keymap::When};
+    on_key_with(
+        "e",
+        KeyOptions {
+            when: When::NotEditing,
+            ..Default::default()
+        },
+        move |_| edit(),
+    );
+    on_key_with(
+        "mod+e",
+        KeyOptions {
+            when: When::Always,
+            ..Default::default()
+        },
+        move |_| edit(),
+    );
     dynamic(move || {
         // Only the lock selects the chrome; building the content reads
         // workspace signals (through store.document's bump) and must not
@@ -61,28 +97,74 @@ pub fn document_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEl
 /// Checklist Items, marks, history, Markdown shortcuts) plus tables, the
 /// `/` block-insertion suggestion, the Linked Task Card node and the `@`
 /// inline-mention suggestion.
-fn build_extensions() -> ExtensionManager {
-    ExtensionManager::with_core(vec![
-        starter_kit(),
+fn build_extensions(finish_requested: Option<Signal<u64>>) -> ExtensionManager {
+    let mut extensions = vec![
+        Extension::new("starterKit").add_extensions(|_| {
+            starter_kit_extensions()
+                .into_iter()
+                .map(|(name, ext)| {
+                    if name == "blockquote" {
+                        // Markdown represents an empty quote as a block with no children.
+                        let mut spec = ext.node_spec().expect("blockquote node spec");
+                        spec.content = Some("block*".into());
+                        ext.with_node_spec(move |_| spec.clone())
+                    } else {
+                        ext
+                    }
+                })
+                .collect()
+        }),
         table_kit(),
         Extension::node(kanon::CARD_NODE, |_| kanon::card_spec()),
-        Extension::node(kanon::MENTION_NODE, |_| mention_node(kanon::MENTION_NODE, "@").1),
-        Extension::new("kanonSlash").with_priority(1000).add_plugins(|_| {
-            let mut slash = SuggestionOptions::default();
-            slash.key = SLASH_KEY.into();
-            slash.trigger.char = "/".into();
-            slash.trigger.allowed_prefixes = None;
-            vec![suggestion(slash)]
+        Extension::node(kanon::MENTION_NODE, |_| {
+            mention_node(kanon::MENTION_NODE, "@").1
         }),
-        Extension::new("kanonMention").with_priority(1000).add_plugins(|_| {
-            let mut mention = SuggestionOptions::default();
-            mention.key = MENTION_KEY.into();
-            mention.trigger.char = "@".into();
-            mention.trigger.allowed_prefixes = None;
-            vec![suggestion(mention)]
-        }),
-    ])
-    .expect("the kanon editor extensions build")
+        Extension::new("kanonSlash")
+            .with_priority(1000)
+            .add_plugins(|_| {
+                let mut slash = SuggestionOptions::default();
+                slash.key = SLASH_KEY.into();
+                slash.trigger.char = "/".into();
+                slash.trigger.allowed_prefixes = None;
+                slash.capture_keys = ["ArrowUp", "ArrowDown", "Enter"].map(str::to_owned).into();
+                slash.allow = Some(std::sync::Arc::new(|state, range, _| {
+                    state
+                        .doc()
+                        .resolve(range.from)
+                        .is_ok_and(|pos| pos.parent().ty().name() != "codeBlock")
+                }));
+                vec![suggestion(slash)]
+            }),
+        Extension::new("kanonMention")
+            .with_priority(1000)
+            .add_plugins(|_| {
+                let mut mention = SuggestionOptions::default();
+                mention.key = MENTION_KEY.into();
+                mention.trigger.char = "@".into();
+                mention.trigger.allowed_prefixes = None;
+                vec![suggestion(mention)]
+            }),
+    ];
+    if let Some(requested) = finish_requested {
+        // NSH's focused RichEditor takes modified characters before window shortcuts.
+        // Handle Mod+E through its own keymap and let the view finish the save.
+        extensions.push(
+            Extension::new("kanonFinishEditing")
+                .with_priority(1000)
+                .add_keyboard_shortcuts(move |_| {
+                    vec![(
+                        "Mod-e".into(),
+                        nsh_base::rich_editor::commands::command(move |_, dispatch| {
+                            if dispatch.is_some() {
+                                requested.update(|sequence| *sequence += 1);
+                            }
+                            true
+                        }),
+                    )]
+                }),
+        );
+    }
+    ExtensionManager::with_core(extensions).expect("the kanon editor extensions build")
 }
 
 /// A session over the committed markdown body. `node_views` lets the
@@ -90,16 +172,30 @@ fn build_extensions() -> ExtensionManager {
 /// renders Checklist Item checkboxes itself; both tabs render Linked
 /// Task Cards).
 pub(crate) fn build_session(body: &str, node_views: NodeViews) -> EditorSession {
-    let manager = build_extensions();
+    build_session_with_shortcut(body, node_views, None)
+}
+
+fn build_session_with_shortcut(
+    body: &str,
+    node_views: NodeViews,
+    finish_requested: Option<Signal<u64>>,
+) -> EditorSession {
+    let manager = build_extensions(finish_requested);
     let schema = manager.schema().clone();
     let format = MarkdownFormat::default();
-    let doc = format
-        .parse(&schema, body)
-        .unwrap_or_else(|_| schema.top_node_type().create(None, Fragment::empty(), Vec::new()).expect("empty doc"));
+    let doc = format.parse(&schema, body).unwrap_or_else(|err| {
+        log::warn!("Cannot parse document Markdown; showing source as text: {err}");
+        PlainTextFormat::default()
+            .parse(&schema, body)
+            .expect("the editor schema supports paragraphs of plain text")
+    });
     let doc = kanon::materialize_markers(&schema, &doc);
-    let state =
-        EditorState::create(EditorStateConfig::new(schema).doc(doc).plugins(manager.plugins()))
-            .expect("the editor state builds");
+    let state = EditorState::create(
+        EditorStateConfig::new(schema)
+            .doc(doc)
+            .plugins(manager.plugins()),
+    )
+    .expect("the editor state builds");
     EditorSession::new(state, node_views)
 }
 
@@ -135,7 +231,9 @@ pub(crate) fn heading_position(doc: &Node, ordinal: usize) -> Option<usize> {
 pub(crate) fn reveal_heading(session: &EditorSession, ordinal: usize) {
     use nsh_base::rich_editor::commands::tiptap;
     let state = session.state();
-    let Some(pos) = heading_position(state.doc(), ordinal) else { return };
+    let Some(pos) = heading_position(state.doc(), ordinal) else {
+        return;
+    };
     let at = (pos + 2).min(state.doc().node_size().saturating_sub(2));
     session.run(&tiptap::set_text_selection(at, at));
     session.focus();
@@ -151,11 +249,18 @@ mod tests {
         let session = build_session("# 一\n\n段落\n\n## 二\n\n### 三\n", NodeViews::new());
         let state = session.state();
         let doc = state.doc();
-        let sizes = doc.content().iter().map(|child| child.node_size()).collect::<Vec<_>>();
+        let sizes = doc
+            .content()
+            .iter()
+            .map(|child| child.node_size())
+            .collect::<Vec<_>>();
         assert_eq!(sizes.len(), 4);
         assert_eq!(heading_position(doc, 0), Some(0));
         assert_eq!(heading_position(doc, 1), Some(sizes[0] + sizes[1]));
-        assert_eq!(heading_position(doc, 2), Some(sizes[0] + sizes[1] + sizes[2]));
+        assert_eq!(
+            heading_position(doc, 2),
+            Some(sizes[0] + sizes[1] + sizes[2])
+        );
         assert_eq!(heading_position(doc, 3), None);
     }
 
@@ -165,11 +270,31 @@ mod tests {
         let session = build_session(body, NodeViews::new());
         let markdown = doc_markdown(&session);
         assert!(markdown.contains("# 标题"), "headings serialize");
-        assert!(markdown.contains("- [ ] 清单项") && markdown.contains("- [x] 已完成"), "checklist states serialize");
-        assert!(markdown.contains("# not a heading"), "code fences keep their text");
+        assert!(
+            markdown.contains("- [ ] 清单项") && markdown.contains("- [x] 已完成"),
+            "checklist states serialize"
+        );
+        assert!(
+            markdown.contains("# not a heading"),
+            "code fences keep their text"
+        );
         fn has_table(node: &Node) -> bool {
             node.ty().name() == "table" || node.content().iter().any(has_table)
         }
-        assert!(has_table(session.state().doc()), "tables parse into table nodes");
+        assert!(
+            has_table(session.state().doc()),
+            "tables parse into table nodes"
+        );
+    }
+
+    #[test]
+    fn empty_quote_reopens_with_an_editable_paragraph_and_keeps_following_content() {
+        let session = build_session(">\n\n# 后续标题\n", NodeViews::new());
+        let state = session.state();
+        let quote = state.doc().child(0);
+        assert_eq!(quote.ty().name(), "blockquote");
+        assert_eq!(quote.child(0).ty().name(), "paragraph");
+        let reopened = build_session(&doc_markdown(&session), NodeViews::new());
+        assert_eq!(reopened.state().doc().child(1).text_content(), "后续标题");
     }
 }

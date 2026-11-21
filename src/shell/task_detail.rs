@@ -44,6 +44,7 @@ pub fn task_detail(store: Store, id: i64) -> impl IntoElement {
             .child(subtasks_section(store, id, aggregate))
             .child(tags_section(store, id, aggregate))
             .child(memo_field(store, id, aggregate))
+            .child(linked_documents_section(store, id))
             .child(trash_row(store, id)),
     )
 }
@@ -236,6 +237,7 @@ fn scheduling_section(store: Store, id: i64, aggregate: Detail) -> impl IntoElem
             aggregate,
             "排期",
             "排期日 (YYYY-MM-DD)",
+            "清除排期",
             |task| task.scheduled_date,
             |task| task.scheduled_time,
             |date| TaskPatch {
@@ -253,6 +255,7 @@ fn scheduling_section(store: Store, id: i64, aggregate: Detail) -> impl IntoElem
             aggregate,
             "截止",
             "截止日 (YYYY-MM-DD)",
+            "清除截止",
             |task| task.due_date,
             |task| task.due_time,
             |date| TaskPatch {
@@ -273,6 +276,7 @@ fn date_time_editor(
     aggregate: Detail,
     label: &'static str,
     date_placeholder: &'static str,
+    clear_label: &'static str,
     date_of: fn(&crate::domain::Task) -> Option<LocalDate>,
     time_of: fn(&crate::domain::Task) -> Option<LocalTime>,
     date_patch: fn(Option<LocalDate>) -> TaskPatch,
@@ -404,7 +408,7 @@ fn date_time_editor(
                         !date_draft.get().trim().is_empty() || !time_draft.get().trim().is_empty()
                     },
                     move || {
-                        panel_icon_button("✕", "清除日期", move || {
+                        panel_icon_button("✕", clear_label, move || {
                             date_draft.set(String::new());
                             time_draft.set(String::new());
                             store.update_task(id, &date_patch(None));
@@ -755,6 +759,52 @@ fn memo_field(store: Store, id: i64, aggregate: Detail) -> impl IntoElement {
         .focus(|s| s.border_color(tokens::accent()))
         .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
         .label("备注")
+}
+
+/// The Documents that embed this Task as a Linked Task Card
+/// (docs/ui-design.md §4.6 任务详情「查看/跳转关联文档」).
+fn linked_documents_section(store: Store, id: i64) -> impl IntoElement {
+    let docs = computed(move || store.task_documents(id, None));
+    view()
+        .flex_col()
+        .gap_1()
+        .child(section_heading("关联文档"))
+        .child(when(
+            move || docs.with(Vec::is_empty),
+            move || {
+                text("还没有文档关联此任务。")
+                    .text_size(px(11.0))
+                    .text_color(tokens::fg_muted())
+            },
+        ))
+        .child(dynamic(move || {
+            view().flex_col().gap(px(2.0)).children(
+                docs.get()
+                    .into_iter()
+                    .map(|(document_id, title)| {
+                        let label = title.clone();
+                        button()
+                            .on_press(move || store.open_document(document_id))
+                            .accessibility_label(Some(format!("打开文档 {label}").into()))
+                            .w_full()
+                            .items_center()
+                            .px_2()
+                            .py_1()
+                            .rounded(tokens::radius_row())
+                            .bg(move || theme().background.opacity(0.0))
+                            .hover(|s| s.bg(tokens::control_bg()))
+                            .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
+                            .child(
+                                text(title.clone())
+                                    .text_size(px(13.0))
+                                    .text_color(tokens::fg_body())
+                                    .number_of_lines(1),
+                            )
+                            .into_element()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        }))
 }
 
 fn trash_row(store: Store, id: i64) -> impl IntoElement {

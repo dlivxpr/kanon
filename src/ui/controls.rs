@@ -31,7 +31,11 @@ pub fn app_button(
 ) -> nsh_base::ButtonElement {
     button_base(kind, on_press)
         .accessibility_label(Some(label.clone().into()))
-        .child(text(label.clone().into()).text_size(px(13.0)).text_color(move || fg_of(kind)))
+        .child(
+            text(label.clone().into())
+                .text_size(tokens::text_px(13.0))
+                .text_color(move || fg_of(kind)),
+        )
 }
 
 /// The same button with a label that follows a signal (counts, states).
@@ -42,14 +46,17 @@ pub fn app_button_with(
 ) -> nsh_base::ButtonElement {
     button_base(kind, on_press)
         .accessibility_label(move || Some(label()))
-        .child(text(label).text_size(px(13.0)).text_color(move || fg_of(kind)))
+        .child(
+            text(label)
+                .text_size(tokens::text_px(13.0))
+                .text_color(move || fg_of(kind)),
+        )
 }
 
 fn fg_of(kind: ButtonKind) -> nsh_core::element::AdaptiveColor {
     match kind {
-        ButtonKind::Primary | ButtonKind::Positive | ButtonKind::Danger => {
-            theme().primary_foreground
-        }
+        ButtonKind::Positive => tokens::positive_foreground(),
+        ButtonKind::Primary | ButtonKind::Danger => theme().primary_foreground,
         ButtonKind::Soft | ButtonKind::Ghost => tokens::fg_primary(),
     }
 }
@@ -79,7 +86,7 @@ fn hover_bg_of(kind: ButtonKind) -> nsh_core::element::AdaptiveColor {
 fn button_base(kind: ButtonKind, on_press: impl Fn() + 'static) -> nsh_base::ButtonElement {
     button()
         .on_press(on_press)
-        .h(px(32.0))
+        .h(tokens::control_h())
         .px_4()
         .items_center()
         .justify_center()
@@ -90,7 +97,10 @@ fn button_base(kind: ButtonKind, on_press: impl Fn() + 'static) -> nsh_base::But
         .hover(move |s| s.bg(hover_bg_of(kind)))
         // Press feedback per docs/ui-design.md §6.2: scale to 0.97 on
         // the fast token (reduced motion: instant, wash only).
-        .active(move |s| s.opacity(0.85).scale(0.97))
+        .active(|s| {
+            s.opacity(0.85)
+                .scale(if reduce_motion() { 1.0 } else { 0.97 })
+        })
         .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
         .disabled_style(|s| s.opacity(0.5))
         .transition_colors()
@@ -98,28 +108,55 @@ fn button_base(kind: ButtonKind, on_press: impl Fn() + 'static) -> nsh_base::But
         .duration(tokens::ms(tokens::MOTION_FAST_MS))
 }
 
-/// A 28 px square icon button for toolbars and tab chrome.
-pub fn icon_button(
-    glyph: impl IntoReactive<SharedString>,
-    label: &'static str,
-    on_press: impl Fn() + 'static,
-) -> nsh_base::ButtonElement {
-    button()
-        .on_press(on_press)
-        .accessibility_label(Some(label.into()))
-        .size(px(28.0))
+/// A themed modal card; NSH owns focus and dismissal.
+pub(crate) fn dialog_card(
+    title: impl Into<SharedString>,
+    description: &'static str,
+    role: AccessibilityRole,
+    on_cancel: impl Fn() + 'static,
+    content: impl IntoElement,
+) -> impl IntoElement {
+    let title = title.into();
+    nsh_base::dialog()
+        .role(role)
+        .label(title.clone())
+        .accessibility_description(description)
+        .animation(if reduce_motion() {
+            ModalAnimation::None
+        } else {
+            ModalAnimation::Fade
+        })
+        .on_cancel(on_cancel)
+        .flex_1()
+        .p_4()
         .items_center()
         .justify_center()
-        .rounded(move || theme().radius)
-        .bg(move || theme().background.opacity(0.0))
-        .text_color(tokens::shell_muted)
-        .hover(|s| s.bg(tokens::shell_surface_active()).text_color(tokens::shell_fg()))
-        .active(|s| s.opacity(0.7).scale(0.95))
-        .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
-        .transition_colors()
-        .transition_transform()
-        .duration(tokens::ms(tokens::MOTION_FAST_MS))
-        .child(text(glyph).text_size(px(14.0)))
+        .bg(tokens::overlay)
+        .child(
+            view()
+                .w_full()
+                .max_w(px(420.0))
+                .gap_3()
+                .p_5()
+                .rounded(tokens::radius_panel())
+                .border_1()
+                .border_color(tokens::border_default)
+                .bg(tokens::panel_raised)
+                .shadow_lg()
+                .child(
+                    text(title)
+                        .role(AccessibilityRole::Header)
+                        .text_size(tokens::text_px(20.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(tokens::fg_primary),
+                )
+                .child(
+                    text(description)
+                        .text_size(tokens::text_px(14.0))
+                        .text_color(tokens::fg_muted),
+                )
+                .child(content),
+        )
 }
 
 /// A quiet icon button that lives on a panel (not the dark shell).
@@ -137,13 +174,19 @@ pub fn panel_icon_button(
         .rounded(move || theme().radius)
         .bg(move || theme().background.opacity(0.0))
         .text_color(tokens::fg_muted)
-        .hover(|s| s.bg(tokens::control_hover()).text_color(tokens::fg_primary()))
-        .active(|s| s.opacity(0.7).scale(0.95))
+        .hover(|s| {
+            s.bg(tokens::control_hover())
+                .text_color(tokens::fg_primary())
+        })
+        .active(|s| {
+            s.opacity(0.7)
+                .scale(if reduce_motion() { 1.0 } else { 0.95 })
+        })
         .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
         .transition_colors()
         .transition_transform()
         .duration(tokens::ms(tokens::MOTION_FAST_MS))
-        .child(text(glyph).text_size(px(13.0)))
+        .child(text(glyph).text_size(tokens::text_px(13.0)))
 }
 
 /// The app's text field: 32 px pill on a control background.
@@ -158,9 +201,9 @@ pub fn input_field(
         .placeholder(placeholder)
         .placeholder_color(|| color(theme().muted_foreground))
         .caret_color(|| color(theme().primary))
-        .h(px(32.0))
+        .h(tokens::control_h())
         .px_3()
-        .text_size(px(13.0))
+        .text_size(tokens::text_px(13.0))
         .rounded(move || theme().radius)
         .bg(tokens::control_bg)
         .border_1()
@@ -191,9 +234,9 @@ pub fn submit_field(
         .label(move || label.clone())
         .placeholder_color(|| color(theme().muted_foreground))
         .caret_color(|| color(theme().primary))
-        .h(px(32.0))
+        .h(tokens::control_h())
         .px_3()
-        .text_size(px(13.0))
+        .text_size(tokens::text_px(13.0))
         .rounded(move || theme().radius)
         .bg(tokens::control_bg)
         .border_1()
@@ -208,7 +251,15 @@ pub fn submit_field(
 
 /// A rounded workbench panel (main canvas, right context panel).
 pub fn panel() -> View {
-    view().flex_1().rounded(tokens::radius_panel()).bg(tokens::panel_bg()).min_w(px(0.0)).min_h(px(0.0))
+    view()
+        .flex_1()
+        .rounded(tokens::radius_panel())
+        .border_1()
+        .border_color(tokens::border_subtle)
+        .overflow_hidden()
+        .bg(tokens::panel_bg())
+        .min_w(px(0.0))
+        .min_h(px(0.0))
 }
 
 /// A small label chip (a Task's Tag, `设计`).
@@ -218,7 +269,11 @@ pub fn chip(label: impl IntoReactive<SharedString>) -> impl IntoElement {
         .py(px(1.0))
         .rounded(px(6.0))
         .bg(tokens::info_soft())
-        .child(text(label).text_size(px(11.0)).text_color(tokens::info()))
+        .child(
+            text(label)
+                .text_size(tokens::text_px(11.0))
+                .text_color(tokens::info()),
+        )
 }
 
 /// A red overdue badge (`逾期`).
@@ -228,34 +283,55 @@ pub fn overdue_badge() -> impl IntoElement {
         .py(px(1.0))
         .rounded(px(6.0))
         .bg(tokens::accent_soft())
-        .child(text("逾期").text_size(px(11.0)).text_color(tokens::accent()))
+        .child(
+            text("逾期")
+                .text_size(tokens::text_px(11.0))
+                .text_color(tokens::accent()),
+        )
 }
 
 /// The task circle: a quick checkbox that toggles `done ↔ todo`.
 ///
 /// `checked` is the binding; `label` names the control for keyboard and
 /// screen-reader users (and the headless tests).
-pub fn task_circle(
+pub fn task_circle<M>(
     checked: impl Fn() -> bool + Copy + 'static,
-    label: impl Into<SharedString>,
+    label: impl nsh_core::element::IntoProp<Option<SharedString>, M>,
     on_toggle: impl Fn() + 'static,
 ) -> nsh_base::CheckboxElement {
     nsh_base::checkbox()
         .checked(checked)
         .on_change(move |_: &bool| on_toggle())
-        .accessibility_label(Some(label.into()))
+        .accessibility_label(label)
         .size(px(20.0))
         .items_center()
         .justify_center()
         .rounded_full()
         .border_2()
-        .border_color(move || if checked() { tokens::positive() } else { tokens::border_default() })
+        .border_color(move || {
+            if checked() {
+                tokens::positive()
+            } else {
+                tokens::border_default()
+            }
+        })
         .bg(move || {
-            if checked() { tokens::positive() } else { theme().background.opacity(0.0) }
+            if checked() {
+                tokens::positive()
+            } else {
+                theme().background.opacity(0.0)
+            }
         })
         .indicator_style(|s| s.size(px(16.0)).items_center().justify_center())
-        .indicator(text(move || if checked() { "✓" } else { "" }).text_size(px(12.0)).text_color(theme().primary_foreground))
-        .active(|s| s.scale(0.9))
+        .indicator(
+            text(move || if checked() { "✓" } else { "" })
+                .text_size(tokens::text_px(12.0))
+                .text_color(tokens::positive_foreground),
+        )
+        .active(|s| {
+            s.opacity(0.8)
+                .scale(if reduce_motion() { 1.0 } else { 0.9 })
+        })
         .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
         .transition_colors()
         .transition_transform()
@@ -270,7 +346,7 @@ pub fn list_row() -> View {
         .gap_3()
         .px_3()
         .py_2()
-        .min_h(px(50.0))
+        .min_h(tokens::row_min_h())
         .rounded(tokens::radius_row())
         .hover(|s| s.bg(tokens::control_bg()))
         .transition_colors()
@@ -280,18 +356,30 @@ pub fn list_row() -> View {
 /// A section heading inside a panel (`今天`, `收件箱`).
 pub fn section_heading(label: impl IntoReactive<SharedString>) -> impl IntoElement {
     text(label)
-        .text_size(px(13.0))
+        .text_size(tokens::text_px(13.0))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(tokens::fg_muted())
 }
 
 /// The centered empty state of an unused surface or unreleased view.
-pub fn empty_state(title: impl IntoReactive<SharedString>, hint: impl IntoReactive<SharedString>) -> impl IntoElement {
+pub fn empty_state(
+    title: impl IntoReactive<SharedString>,
+    hint: impl IntoReactive<SharedString>,
+) -> impl IntoElement {
     view()
         .flex_1()
         .items_center()
         .justify_center()
         .gap_2()
-        .child(text(title).text_size(px(16.0)).font_weight(FontWeight::SEMIBOLD).text_color(tokens::fg_muted()))
-        .child(text(hint).text_size(px(13.0)).text_color(tokens::fg_muted()))
+        .child(
+            text(title)
+                .text_size(tokens::text_px(16.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(tokens::fg_muted()),
+        )
+        .child(
+            text(hint)
+                .text_size(tokens::text_px(13.0))
+                .text_color(tokens::fg_muted()),
+        )
 }

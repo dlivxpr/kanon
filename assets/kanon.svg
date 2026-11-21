@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>Kanon — 书页与勾</title>
+  <defs>
+    <linearGradient id="cover" x2="0.84" y2="1">
+      <stop stop-color="#354333"/>
+      <stop offset="1" stop-color="#191f19"/>
+    </linearGradient>
+  </defs>
+  <rect x="54" y="68" width="916" height="916" rx="210" fill="#121711" opacity=".24"/>
+  <rect x="54" y="46" width="916" height="916" rx="210" fill="url(#cover)"/>
+  <rect x="57" y="49" width="910" height="910" rx="207" fill="none" stroke="#879683" stroke-opacity=".3" stroke-width="6"/>
+  <!-- The offset sheets remain legible at taskbar size. -->
+  <rect x="292" y="225" width="473" height="567" rx="69" fill="#182219"/>
+  <rect x="267" y="204" width="473" height="567" rx="69" fill="#8eab8e"/>
+  <rect x="236" y="182" width="473" height="567" rx="69" fill="#c0cfb0"/>
+  <rect x="212" y="166" width="473" height="567" rx="69" fill="#edf0e4"/>
+  <path d="M276 167c-35 3-64 32-64 69v428c0 36 28 66 64 69Z" fill="#dbe5d0"/>
+  <!-- A book spine and a folded K whose lower stroke resolves to a check. -->
+  <path d="M357 304v292m0-111 205-183m-151 135 109 125 207-240" fill="none" stroke="#29382a" stroke-width="66" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="m520 562 207-240" fill="none" stroke="#ff6158" stroke-width="66" stroke-linecap="round"/>
+</svg>

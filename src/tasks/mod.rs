@@ -6,93 +6,109 @@
 use nsh_base::{button, theme};
 use nsh_core::prelude::*;
 
-use crate::domain::{Priority, ProjectFilter, TaskAggregate, TaskFilter, TaskGroups, TaskSort, TaskStatus};
-use crate::ui::controls::{empty_state, section_heading};
+use crate::domain::{
+    Priority, ProjectFilter, TaskAggregate, TaskFilter, TaskGroups, TaskSort, TaskStatus,
+};
+use crate::ui::controls::{ButtonKind, app_button, empty_state, section_heading};
 use crate::ui::theme as tokens;
 
 use super::shell::store::Store;
 use super::shell::task_row::task_row;
 
 /// The Tasks view for the active tab.
-pub fn tasks_view(store: Store) -> impl IntoElement {
+pub fn tasks_view(store: Store, create_task: impl Fn() + 'static) -> impl IntoElement {
     let filter = signal(TaskFilter::default());
     let sort = signal(TaskSort::default());
-    // One computed for the whole view: the unfiltered total drives the
-    // empty states, the filtered + sorted groups drive the sections.
+    // The page summary counts all unfinished tasks, independent of filters.
+    // The filtered groups only control which sections and rows are shown.
     let data = computed(move || {
         store.bump.get();
         let all = store.task_groups();
         let total = all.total();
-        (all.filtered(&filter.get()).sorted(sort.get()), total)
-    });
-    view()
-        .flex_1()
-        .min_h(px(0.0))
-        .child(
-            scroll()
-                .flex_1()
-                .child(
-                    view()
-                        .flex_col()
-                        .gap_4()
-                        .p_5()
-                        .max_w(px(860.0))
-                        .w_full()
-                        .items_stretch()
-                        .self_center()
-                        .child(header(data))
-                        .child(filter_bar(store, filter, sort))
-                        .child(when(
-                            move || data.get().1 == 0,
-                            || {
-                                empty_state(
-                                    "暂无任务",
-                                    "在「今天」视图添加任务，或用右侧任务速览的速记框收进收件箱。",
-                                )
-                            },
-                        ))
-                        .child(when(
-                            move || data.get().1 > 0 && groups_total(&data.get().0) == 0,
-                            || {
-                                empty_state(
-                                    "没有符合筛选的任务",
-                                    "调整上方的状态、优先级或项目筛选条件。",
-                                )
-                            },
-                        ))
-                        .child(group_section(store, "逾期", move || data.get().0.overdue))
-                        .child(group_section(store, "今天", move || data.get().0.today))
-                        .child(group_section(store, "即将到来", move || data.get().0.upcoming))
-                        .child(group_section(store, "收件箱", move || data.get().0.inbox))
-                        .child(group_section(store, "未排期", move || data.get().0.unscheduled))
-                        .child(group_section(store, "已完成", move || data.get().0.done))
-                        .child(group_section(store, "已取消", move || data.get().0.cancelled)),
-                ),
+        let active = all.total_active();
+        (
+            all.filtered(&filter.get()).sorted(sort.get()),
+            total,
+            active,
         )
+    });
+    view().flex_1().min_h(px(0.0)).child(
+        scroll().flex_1().child(
+            view()
+                .flex_col()
+                .gap_4()
+                .p_5()
+                .max_w(px(860.0))
+                .w_full()
+                .items_stretch()
+                .self_center()
+                .child(header(data, create_task))
+                .child(filter_bar(store, filter, sort))
+                .child(when(
+                    move || data.get().1 == 0,
+                    || {
+                        empty_state(
+                            "暂无任务",
+                            "在「今天」视图添加任务，或用右侧任务速览的速记框收进收件箱。",
+                        )
+                    },
+                ))
+                .child(when(
+                    move || data.get().1 > 0 && groups_total(&data.get().0) == 0,
+                    || {
+                        empty_state(
+                            "没有符合筛选的任务",
+                            "调整上方的状态、优先级或项目筛选条件。",
+                        )
+                    },
+                ))
+                .child(group_section(store, "逾期", move || data.get().0.overdue))
+                .child(group_section(store, "今天", move || data.get().0.today))
+                .child(group_section(store, "即将到来", move || {
+                    data.get().0.upcoming
+                }))
+                .child(group_section(store, "收件箱", move || {
+                    data.get().0.inbox
+                }))
+                .child(group_section(store, "未排期", move || {
+                    data.get().0.unscheduled
+                }))
+                .child(group_section(store, "已完成", move || data.get().0.done))
+                .child(group_section(store, "已取消", move || {
+                    data.get().0.cancelled
+                })),
+        ),
+    )
 }
 
 fn groups_total(groups: &TaskGroups) -> usize {
     groups.total()
 }
 
-fn header(data: Memo<(TaskGroups, usize)>) -> impl IntoElement {
+fn header(
+    data: Memo<(TaskGroups, usize, usize)>,
+    create_task: impl Fn() + 'static,
+) -> impl IntoElement {
     view()
         .flex_row()
         .items_center()
         .gap_2()
-        .child(text("待办").text_size(px(28.0)).font_weight(FontWeight::BOLD).text_color(tokens::fg_primary()))
         .child(
-            text(move || {
-                let (groups, _) = data.get();
-                let active = groups.total_active();
-                match active {
-                    0 => "没有未完成的任务".to_owned(),
-                    count => format!("{count} 项未完成任务"),
-                }
+            text("待办")
+                .text_size(px(28.0))
+                .font_weight(FontWeight::BOLD)
+                .text_color(tokens::fg_primary()),
+        )
+        .child(
+            text(move || match data.with(|(_, _, active)| *active) {
+                0 => "没有未完成的任务".to_owned(),
+                count => format!("{count} 项未完成任务"),
             })
             .text_size(px(13.0))
             .text_color(tokens::fg_muted()),
         )
+        .child(view().flex_1())
+        .child(app_button(ButtonKind::Primary, "新建任务", create_task))
 }
 
 /// The status / priority / Project filter rows and the sort row. Every
@@ -123,7 +139,13 @@ fn filter_bar(
                 ],
                 "状态筛选",
                 move |index| {
-                    let status = [None, Some(TaskStatus::Todo), Some(TaskStatus::Doing), Some(TaskStatus::Done), Some(TaskStatus::Cancelled)][index as usize];
+                    let status = [
+                        None,
+                        Some(TaskStatus::Todo),
+                        Some(TaskStatus::Doing),
+                        Some(TaskStatus::Done),
+                        Some(TaskStatus::Cancelled),
+                    ][index as usize];
                     filter.update(|f| f.status = status);
                 },
             )
@@ -143,7 +165,13 @@ fn filter_bar(
                 ],
                 "优先级筛选",
                 move |index| {
-                    let priority = [None, Some(Priority::None), Some(Priority::Low), Some(Priority::Medium), Some(Priority::High)][index as usize];
+                    let priority = [
+                        None,
+                        Some(Priority::None),
+                        Some(Priority::Low),
+                        Some(Priority::Medium),
+                        Some(Priority::High),
+                    ][index as usize];
                     filter.update(|f| f.priority = priority);
                 },
             )
@@ -155,7 +183,10 @@ fn filter_bar(
             // Project (was the ("全部", -1)/("无项目", -2) sentinel
             // tuples plus parallel arrays).
             let options = std::iter::once(("全部".to_owned(), ProjectScope::All))
-                .chain(std::iter::once(("无项目".to_owned(), ProjectScope::Unassigned)))
+                .chain(std::iter::once((
+                    "无项目".to_owned(),
+                    ProjectScope::Unassigned,
+                )))
                 .chain(
                     store
                         .projects()
@@ -164,12 +195,9 @@ fn filter_bar(
                 )
                 .map(|(name, scope)| (name, scope, current.project == scope.to_filter()))
                 .collect::<Vec<_>>();
-            chip_row_owned(
-                "项目",
-                options,
-                "项目筛选",
-                move |scope| filter.update(|f| f.project = scope.to_filter()),
-            )
+            chip_row_owned("项目", options, "项目筛选", move |scope| {
+                filter.update(|f| f.project = scope.to_filter())
+            })
             .into_element()
         }))
         .child(dynamic(move || {
@@ -185,7 +213,14 @@ fn filter_bar(
                 ],
                 "排序方式",
                 move |index| {
-                    sort.set([TaskSort::Manual, TaskSort::CreatedAt, TaskSort::DueDate, TaskSort::Priority][index as usize]);
+                    sort.set(
+                        [
+                            TaskSort::Manual,
+                            TaskSort::CreatedAt,
+                            TaskSort::DueDate,
+                            TaskSort::Priority,
+                        ][index as usize],
+                    );
                 },
             )
             .into_element()
@@ -242,13 +277,25 @@ fn chip_row_owned<S: Copy + 'static>(
                         .rounded_full()
                         .border_1()
                         .border_color(move || {
-                            if selected { tokens::accent() } else { tokens::border_default() }
+                            if selected {
+                                tokens::accent()
+                            } else {
+                                tokens::border_default()
+                            }
                         })
                         .bg(move || {
-                            if selected { tokens::accent_soft() } else { theme().background.opacity(0.0) }
+                            if selected {
+                                tokens::accent_soft()
+                            } else {
+                                theme().background.opacity(0.0)
+                            }
                         })
                         .text_color(move || {
-                            if selected { tokens::accent() } else { tokens::fg_body() }
+                            if selected {
+                                tokens::accent()
+                            } else {
+                                tokens::fg_body()
+                            }
                         })
                         .hover(|s| s.bg(tokens::control_bg()))
                         .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
@@ -294,10 +341,17 @@ fn group_section(
                         .flex_row()
                         .items_center()
                         .justify_between()
-                        .child(section_heading(title))
+                        .child(
+                            // docs/kanon.html `groupsList` names each
+                            // section with a page-level `<h2>`.
+                            text(title)
+                                .text_size(px(18.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(tokens::fg_primary()),
+                        )
                         .child(
                             text(move || format!("{}", items().len()))
-                                .text_size(px(11.0))
+                                .text_size(px(12.0))
                                 .text_color(tokens::fg_muted()),
                         ),
                 )
@@ -305,7 +359,7 @@ fn group_section(
                     items,
                     |aggregate: &crate::domain::TaskAggregate| aggregate.task.id,
                     move |aggregate, _index| {
-                        task_row(store, aggregate.with(|a| a.clone())).into_element()
+                        task_row(store, aggregate.with(|a| a.task.id)).into_element()
                     },
                 ))
         },

@@ -4,8 +4,9 @@
 //! and the root component (AGENTS.md); the domain lives in `domain/`, the
 //! styled control layer in `ui/`, and the workbench shell in `shell/`.
 
-pub mod domain;
+mod desktop;
 mod document;
+pub mod domain;
 mod kb;
 mod projects;
 mod shell;
@@ -23,10 +24,9 @@ use domain::{Clock, FixedClock, LocalDateTime, SystemClock, Workspace};
 
 /// How the root learns where its workspace lives and what time it is.
 ///
-/// `Default` (what `open(".")` in `*.test.tsx` and `Root::of::<App>()`
-/// use) opens an ephemeral in-memory workspace on the system clock; the
-/// desktop launcher and the Rust headless tests pin a real file path and,
-/// for deterministic tests, a fixed local datetime.
+/// Headless roots without a host data directory use an isolated workspace.
+/// Desktop runners keep their workspace on disk; tests may supply a path
+/// and a fixed local datetime explicitly.
 #[derive(Clone, PartialEq, Props)]
 pub struct AppProps {
     /// The workspace SQLite file, or `None` for in-memory.
@@ -54,7 +54,12 @@ fn default_workspace_path() -> Option<String> {
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(std::path::PathBuf::from)?;
-    Some(home.join(".kanon").join("workspace.sqlite3").to_string_lossy().into_owned())
+    Some(
+        home.join(".kanon")
+            .join("workspace.sqlite3")
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 /// The NSH UI set that registers the application's Rust root.
@@ -66,6 +71,7 @@ fn native(registry: &mut Registry) {
 /// The application's root component: the multi-tab workbench shell.
 #[component]
 pub fn App(props: AppProps) -> impl IntoElement {
+    desktop::install_tray();
     let clock: Arc<dyn Clock> = match props.fixed_now.get_untracked() {
         Some(text) => match LocalDateTime::parse(&text) {
             Some(fixed) => FixedClock::at(fixed),
@@ -77,7 +83,13 @@ pub fn App(props: AppProps) -> impl IntoElement {
         },
         None => Arc::new(SystemClock),
     };
-    let workspace = match props.workspace_path.get_untracked() {
+    let path = props
+        .workspace_path
+        .get_untracked()
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("KANON_WORKSPACE_PATH").map(std::path::PathBuf::from))
+        .or_else(|| nsh_core::element::data_dir().map(|dir| dir.join("workspace.sqlite3")));
+    let workspace = match path {
         Some(path) => Workspace::open(Path::new(&path), clock),
         None => Workspace::open_in_memory_with_clock(clock),
     };

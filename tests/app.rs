@@ -228,7 +228,7 @@ fn kb_shelf_creates_opens_and_edits_a_book() -> Result<(), String> {
     // Favorite it; the shelf lists it under 常用.
     app.press("收藏本书")?;
     app.press("id:nav-知识库")?;
-    app.wait_for("常用")?;
+    app.wait_for("常用知识库")?;
     app.wait_for("产品手册 v2")?;
     app.wait_for("0 篇文档 · 0 字")?;
     let _ = std::fs::remove_file(path);
@@ -329,11 +329,12 @@ fn completing_the_only_task_leaves_no_inbox_items_and_the_detail_stays_open() ->
     app.press("label:打开任务 唯一的任务 >> nth=0")?;
     app.wait_for("任务详情")?;
     app.press("已完成")?;
-    app.wait_for("没有未完成的任务")?;
-    // The completed task still renders in the detail editor rather than
-    // dropping the panel or falling back to a stale project.
-    app.wait_for("唯一的任务")?;
+    app.wait_for("label:收件箱 0 项任务")?;
+    // The completed task still renders in the detail editor.
+    app.wait_for("label:完成 唯一的任务")?;
     app.wait_for("已完成")?;
+    app.press("label:关闭任务详情")?;
+    app.wait_for("暂无符合条件的任务。")?;
     Ok(())
 }
 
@@ -642,6 +643,14 @@ fn catalog_locates_the_current_document() -> Result<(), String> {
         "locate expanded the chain to the current document"
     );
 
+    app.press("id:catalog-tree >> label:节点菜单 >> nth=0")?;
+    app.press("role:menuitem[重命名]")?;
+    app.clear("label:重命名，回车确认")?;
+    app.type_text("label:重命名，回车确认", "改名后的分组")?;
+    app.press_key("enter")?;
+    app.wait_for("id:catalog-tree >> label:改名后的分组")?;
+    assert!(tree_shows(&app, "子文档"), "renaming preserves children");
+
     let _ = std::fs::remove_file(path);
     Ok(())
 }
@@ -759,7 +768,7 @@ fn knowledge_base_flow_survives_restart() -> Result<(), String> {
     let mut app = start_sized(&path, "2026-11-20 09:30", 1440.0);
     app.wait_for("今天")?;
     app.press("id:nav-知识库")?;
-    app.wait_for("常用")?;
+    app.wait_for("常用知识库")?;
     app.wait_for("打开知识库 持久化")?;
     app.wait_for("3 篇文档 · 0 字")?;
 
@@ -842,6 +851,11 @@ fn responsive_rules_collapse_sidebar_and_overlay_catalog() -> Result<(), String>
     // shows in the tab strip.)
     assert!(app.shows("即将到来"), "sidebar labels at 1440 px");
     assert!(app.screen().matches("id:catalog-inline").unwrap_or(false));
+    app.press("label:收起目录")?;
+    app.wait_for_gone("id:catalog-inline", Duration::from_secs(2))?;
+    app.wait_for("这本知识库还没有简介。")?;
+    app.press("label:展开目录")?;
+    app.wait_for("id:catalog-inline")?;
 
     // 960–1439: the outer sidebar auto-collapses to the icon rail; the
     // catalog stays inline.
@@ -864,7 +878,7 @@ fn responsive_rules_collapse_sidebar_and_overlay_catalog() -> Result<(), String>
         app.shows("这本知识库还没有简介。"),
         "main pane keeps its content"
     );
-    app.press("☰ 目录")?;
+    app.press("label:展开目录")?;
     app.wait_for("id:catalog-overlay")?;
     app.press("关闭目录")?;
     app.wait_for_gone("id:catalog-overlay", Duration::from_secs(2))?;
@@ -1381,6 +1395,7 @@ fn trashed_linked_task_card_degrades_recovers_and_stays_invalid_after_delete() -
     app.press("id:nav-回收站")?;
     app.wait_for("写周报")?;
     app.press("彻底删除")?;
+    app.press("确认删除")?;
     app.wait_for_gone("写周报", Duration::from_secs(2))?;
     app.press("id:nav-知识库")?;
     app.wait_for("全部知识库")?;
@@ -1456,6 +1471,7 @@ fn inline_mentions_flow_and_feed_the_backlinks_panel() -> Result<(), String> {
 
     // The target Document's right panel lists the backlink.
     app.press("id:catalog-tree >> text:手册正文")?;
+    app.press("label:关联与反链")?;
     app.wait_for("反向链接")?;
     app.wait_for("label:打开文档 计划")?;
     // Jump through the backlink into the source Document.
@@ -1601,6 +1617,9 @@ fn open_project(app: &mut Headless) -> Result<(), String> {
 /// Trashes the project's linked grouping node through the book's catalog
 /// row menu.
 fn trash_linked_group(app: &mut Headless) -> Result<(), String> {
+    // The project catalog starts at the bound group's children. Open
+    // the owning book to manage the group itself.
+    app.press("📚 手册 / 第一章")?;
     app.press("id:catalog-tree >> label:第一章")?;
     app.wait_for("节点菜单")?;
     app.press("id:catalog-tree >> label:节点菜单")?;
@@ -1684,6 +1703,13 @@ fn project_sub_views_show_metrics_quick_add_milestones_and_kanban_moves() -> Res
     app.type_text("text:添加项目任务，回车创建", "走查")?;
     app.press("id:project-quick-add")?;
     app.wait_for("走查")?;
+    app.press("label:按里程碑分组")?;
+    app.wait_for("阶段一")?;
+    app.wait_for("未分配里程碑")?;
+    app.press("label:筛选项目任务 已完成")?;
+    app.wait_for("没有符合筛选的项目任务")?;
+    app.press("label:筛选项目任务 全部")?;
+    app.wait_for("label:打开任务 走查")?;
 
     // Kanban: move the new card across lanes.
     app.press("看板")?;
@@ -1863,7 +1889,7 @@ fn trashing_a_project_keeps_its_tasks_visible_and_restore_is_lossless() -> Resul
 
     // Back cannot reopen the trashed Project: its route was purged from
     // the tab history, so the step lands on the previous destination.
-    app.press("←")?;
+    app.press("label:后退")?;
     app.wait_for_gone("项目菜单", Duration::from_secs(2))?;
 
     // Restore from the Trash screen; the task never lost its assignment.
@@ -1905,6 +1931,12 @@ fn permanent_project_deletion_detaches_tasks_but_preserves_the_knowledge_base() 
     app.press("id:nav-回收站")?;
     app.wait_for("短项目")?;
     app.press("id:project-delete-1")?;
+    app.wait_for("彻底删除项目？")?;
+    app.press("取消")?;
+    app.wait_for_gone("彻底删除项目？", Duration::from_secs(2))?;
+    app.wait_for("短项目")?;
+    app.press("id:project-delete-1")?;
+    app.press("确认删除")?;
     app.wait_for_gone("短项目", Duration::from_secs(2))?;
 
     // The task survives, now without a project…
@@ -1960,6 +1992,34 @@ fn trashing_the_linked_grouping_node_shows_the_recoverable_notice() -> Result<()
 }
 
 #[test]
+fn a_project_can_restore_its_trashed_knowledge_base_before_creating_documents() -> Result<(), String>
+{
+    let path = temp_db("project-book-trash");
+    let now = "2026-11-20 09:00";
+    seed(&path, now, |ws| {
+        let book = ws.create_knowledge_base("项目手册").unwrap();
+        let project = ws
+            .create_project("绑定项目", "#547093", "📌", Some(book.id), None)
+            .unwrap();
+        ws.trash_knowledge_base(book.id).unwrap();
+        assert!(
+            ws.create_document_for_project(project.id, "隐形文档")
+                .is_err()
+        );
+    });
+    let mut app = start_sized(&path, now, 1440.0);
+    open_project(&mut app)?;
+    app.press("关联文档")?;
+    app.wait_for("关联知识库「项目手册」在回收站中")?;
+    assert!(!app.shows("id:project-doc-create"));
+    app.press("恢复知识库")?;
+    app.wait_for("id:project-doc-create")?;
+    drop(app);
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[test]
 fn permanently_deleting_the_linked_grouping_node_resets_the_project_to_unbound()
 -> Result<(), String> {
     let path = temp_db("proj-node-delete-ui");
@@ -1981,6 +2041,8 @@ fn permanently_deleting_the_linked_grouping_node_resets_the_project_to_unbound()
     app.press("id:nav-回收站")?;
     app.wait_for("第一章")?;
     app.press("id:node-delete-1")?;
+    app.wait_for("彻底删除目录？")?;
+    app.press("确认删除")?;
     app.wait_for_gone("第一章", Duration::from_secs(2))?;
 
     // The project is cleanly unbound — never widened to the whole book.
@@ -2016,8 +2078,8 @@ fn rebinding_a_project_to_a_grouping_node_scopes_new_documents() -> Result<(), S
     app.wait_for("编辑项目")?;
     app.press("关联目录分组")?;
     app.press("id:project-book-picker")?;
-    app.wait_for("手册")?;
-    app.press("手册")?;
+    app.wait_for("role:menuitem[手册]")?;
+    app.press("role:menuitem[手册]")?;
     app.press("id:project-node-picker")?;
     app.wait_for("第一章")?;
     app.press("第一章")?;
@@ -2028,6 +2090,97 @@ fn rebinding_a_project_to_a_grouping_node_scopes_new_documents() -> Result<(), S
     app.wait_for("📚 手册 / 第一章")?;
     app.press("关联文档")?;
     app.wait_for("新建文档将落在关联目录「第一章」下")?;
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[test]
+fn recent_browsing_survives_restart_without_listing_unvisited_documents() -> Result<(), String> {
+    let path = temp_db("recent-browsing");
+    let now = "2026-11-20 09:00";
+    seed(&path, now, |ws| {
+        let book = ws.create_knowledge_base("浏览记录").expect("book");
+        ws.create_document(book.id, None, "待浏览文档")
+            .expect("first document");
+        ws.create_document(book.id, None, "从未打开的文档")
+            .expect("other document");
+    });
+
+    {
+        let mut app = start_sized(&path, now, 1440.0);
+        app.wait_for("id:nav-开始")?;
+        app.press("id:nav-开始")?;
+        app.wait_for("待浏览文档")?;
+        app.press("待浏览文档")?;
+        app.wait_for("label:收藏文档")?;
+        app.press("label:收藏文档")?;
+        app.wait_for("label:取消收藏文档")?;
+    }
+
+    let mut app = start_sized(&path, now, 1440.0);
+    app.wait_for("id:nav-开始")?;
+    app.press("id:nav-开始")?;
+    app.wait_for("最近浏览")?;
+    app.press("最近浏览")?;
+    app.wait_for("待浏览文档")?;
+    assert!(!app.shows("从未打开的文档"));
+    app.press("已收藏")?;
+    app.wait_for("待浏览文档")?;
+    assert!(!app.shows("从未打开的文档"));
+    drop(app);
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[test]
+fn choosing_calendar_startup_and_week_range_survives_restart() -> Result<(), String> {
+    let path = temp_db("startup-calendar");
+    let now = "2026-11-20 09:00";
+    {
+        let mut app = start_sized(&path, now, 1440.0);
+        app.wait_for("id:nav-设置")?;
+        app.press("id:nav-设置")?;
+        app.press("label:通用")?;
+        app.wait_for("默认日历视图")?;
+        app.press("label:默认日历视图")?;
+        app.press("text:周视图")?;
+        app.press("label:每周起始日")?;
+        app.press("text:周日")?;
+        app.press("label:启动页")?;
+        app.press("role:listbox >> text:日历")?;
+    }
+
+    let mut app = start_sized(&path, now, 1440.0);
+    app.wait_for("id:calendar")?;
+    app.wait_for("11月15日 — 11月21日")?;
+    app.press("label:迷你日历")?;
+    app.wait_for("id:mini-calendar >> id:mini-day-2026-11-01")?;
+    assert!(!app.shows("id:mini-day-2026-10-26"));
+    drop(app);
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
+#[test]
+fn context_panel_remembers_task_and_settings_scenes_separately() -> Result<(), String> {
+    let path = temp_db("panel-scenes");
+    let now = "2026-11-20 09:00";
+    let mut app = start_sized(&path, now, 1440.0);
+    app.wait_for("任务速览")?;
+    app.press("label:迷你日历")?;
+    app.wait_for("id:mini-calendar")?;
+    app.press("id:nav-设置")?;
+    app.wait_for("启动页")?;
+    app.wait_for_gone("id:context-pane", Duration::from_secs(2))?;
+    app.press("id:inbox-badge")?;
+    app.wait_for("任务速览")?;
+    app.wait_for("自定义你的 Kanon 工作区")?;
+    assert!(!app.shows("label:显示任务速览"));
+    app.press("id:nav-今天")?;
+    app.wait_for("id:mini-calendar")?;
+    app.press("id:nav-设置")?;
+    app.wait_for("任务速览")?;
+    drop(app);
     let _ = std::fs::remove_file(path);
     Ok(())
 }

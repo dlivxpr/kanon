@@ -88,7 +88,7 @@ impl NodeView for TaskCardView {
                                 .items_center()
                                 .child(
                                     text(label)
-                                        .text_size(px(14.0))
+                                        .text_size(tokens::text_px(14.0))
                                         .text_color(move || {
                                             if done() {
                                                 tokens::fg_muted()
@@ -96,7 +96,12 @@ impl NodeView for TaskCardView {
                                                 tokens::fg_primary()
                                             }
                                         }),
-                                ),
+                                )
+                        )
+                        .child(
+                            text("关联任务")
+                                .text_size(tokens::text_px(11.0))
+                                .text_color(tokens::fg_muted()),
                         )
                         .child(when(
                             move || {
@@ -112,12 +117,12 @@ impl NodeView for TaskCardView {
                     .gap_2()
                     .child(
                         text("任务已移除")
-                            .text_size(px(12.0))
+                            .text_size(tokens::text_px(12.0))
                             .text_color(tokens::fg_muted()),
                     )
                     .child(
                         text(placeholder_title())
-                            .text_size(px(13.0))
+                            .text_size(tokens::text_px(13.0))
                             .text_color(tokens::fg_muted())
                             .number_of_lines(1),
                     )

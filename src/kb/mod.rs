@@ -4,15 +4,16 @@
 //! in-book filtering, locate-current, expand/collapse-all, per-node
 //! expand state persisted in SQLite).
 
-use nsh_base::{menu, menu_item, menu_separator, theme};
+use nsh_base::{context_menu, menu, menu_item, menu_separator, theme};
 use nsh_core::prelude::*;
+use nsh_core::{TouchEvent, TouchPhase};
 
 use crate::domain::{BookStats, CatalogEntry, KnowledgeBase, KnowledgeBasePatch};
 use crate::shell::store::Store;
 use crate::shell::tabs::Route;
 use crate::ui::controls::{
-    app_button, empty_state, input_field, submit_field, panel_icon_button,
-    section_heading, ButtonKind,
+    ButtonKind, app_button, empty_state, input_field, panel_icon_button, section_heading,
+    submit_field,
 };
 use crate::ui::theme as tokens;
 
@@ -41,7 +42,7 @@ pub enum CatalogNav {
     /// root.
     Book,
     /// A Project's Linked Documents sub-view: 首页 clears the open
-    /// document back to the view's landing, documents open inside the
+    /// document back to the scoped book home, documents open inside the
     /// sub-view (per tab), and root-level creations land under the
     /// linked grouping node (`None` when bound to the whole book).
     Project { linked_node: Option<i64> },
@@ -62,7 +63,88 @@ struct CatalogCtx {
     nav: CatalogNav,
     filter: Signal<String>,
     pending: Signal<Option<PendingCreate>>,
-    located: Signal<Option<i64>>,
+    /// The row being renamed (`None` while no rename is pending); the
+    /// rename field takes the row's place, like `book_edit_form` on the
+    /// shelf.
+    renaming: Signal<Option<i64>>,
+    /// The rename field's draft: only one row renames at a time, so the
+    /// rows share it.
+    rename_draft: Signal<String>,
+    /// Locate-current's target: the row with this node id reveals itself
+    /// (expands the chain first, then scrolls itself into view).
+    reveal: Signal<Option<i64>>,
+    /// The row drag's shared state (measure registry, live target,
+    /// dragged node), like the board's `BoardDrag`.
+    drag: CatalogDrag,
+}
+
+/// Where a dragged row would land on its target (docs/kanon.html's
+/// catalog drop: the top quarter inserts before, the center half nests
+/// as a child, the bottom quarter inserts after).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DropZone {
+    Before,
+    Child,
+    After,
+}
+
+/// The row under the dragged node and the zone the drop commits.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DropTarget {
+    node: i64,
+    zone: DropZone,
+}
+
+/// The catalog row drag's shared state: every mounted row's ref for the
+/// pan-start measurement, the measured rectangles for the release
+/// hit-test, the dragged node, and the live target for the row
+/// highlight. Rows register/unregister themselves; the pan lives on each
+/// row like the board card's, committed through
+/// `Store::move_catalog_node`.
+#[derive(Clone, Copy)]
+struct CatalogDrag {
+    /// Mounted rows' element refs, keyed by node id.
+    rows: Stored<Vec<(i64, ElementRef)>>,
+    /// Row bounds in root coordinates, measured when a drag starts.
+    rects: Signal<Vec<(i64, Bounds<Points>)>>,
+    /// The node being dragged (`None` while no drag runs).
+    active: Signal<Option<i64>>,
+    /// The drop target under the pointer, for the row highlight.
+    target: Signal<Option<DropTarget>>,
+}
+
+impl CatalogDrag {
+    fn new() -> Self {
+        Self {
+            rows: stored(Vec::new()),
+            rects: signal(Vec::new()),
+            active: signal(None),
+            target: signal(None),
+        }
+    }
+
+    /// Remeasures every mounted row; unmounted rows (filtered or
+    /// trashed) drop out of the hit-test.
+    fn measure_rows(&self) {
+        let rects = self.rects;
+        let rows = self.rows.get();
+        rects.set(Vec::new());
+        spawn(async move {
+            let mut measured = Vec::with_capacity(rows.len());
+            for (node, reference) in rows {
+                if let Some(measurement) = reference.measure().await {
+                    measured.push((
+                        node,
+                        Bounds {
+                            origin: measurement.page,
+                            size: measurement.frame.size,
+                        },
+                    ));
+                }
+            }
+            rects.set(measured);
+        });
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -77,7 +159,12 @@ pub fn kb_shelf(store: Store) -> impl IntoElement {
     let draft = signal(String::new());
     let editing = signal(None::<i64>);
     let books = move || store.knowledge_bases();
-    let favorites = move || books().into_iter().filter(|kb| kb.favorited).collect::<Vec<_>>();
+    let favorites = move || {
+        books()
+            .into_iter()
+            .filter(|kb| kb.favorited)
+            .collect::<Vec<_>>()
+    };
 
     view().flex_1().min_h(px(0.0)).child(
         scroll().flex_1().child(
@@ -95,7 +182,7 @@ pub fn kb_shelf(store: Store) -> impl IntoElement {
                         .justify_between()
                         .child(
                             text("知识库")
-                                .text_size(px(24.0))
+                                .text_size(px(28.0))
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(tokens::fg_primary()),
                         )
@@ -106,15 +193,31 @@ pub fn kb_shelf(store: Store) -> impl IntoElement {
                                 .gap_2()
                                 .child(when(
                                     move || grid.get(),
-                                    move || panel_icon_button("☰", "切换为列表视图", move || grid.set(false)),
+                                    move || {
+                                        panel_icon_button(
+                                            "☰",
+                                            "切换为列表视图",
+                                            move || grid.set(false),
+                                        )
+                                    },
                                 ))
                                 .child(when(
                                     move || !grid.get(),
-                                    move || panel_icon_button("▦", "切换为卡片网格", move || grid.set(true)),
+                                    move || {
+                                        panel_icon_button(
+                                            "▦",
+                                            "切换为卡片网格",
+                                            move || grid.set(true),
+                                        )
+                                    },
                                 ))
-                                .child(app_button(ButtonKind::Primary, "＋ 新建知识库", move || {
-                                    creating.set(true);
-                                })),
+                                .child(app_button(
+                                    ButtonKind::Primary,
+                                    "＋ 新建知识库",
+                                    move || {
+                                        creating.set(true);
+                                    },
+                                )),
                         ),
                 )
                 .child(when(
@@ -158,14 +261,38 @@ pub fn kb_shelf(store: Store) -> impl IntoElement {
                         view()
                             .flex_col()
                             .gap_2()
-                            .child(section_heading("常用"))
+                            .child(section_heading("常用知识库"))
                             .child(dynamic(move || {
-                                view().flex_col().gap_2().children(
-                                    favorites()
-                                        .into_iter()
-                                        .map(|kb| book_card(store, kb, grid, editing).into_element())
-                                        .collect::<Vec<_>>(),
-                                )
+                                if grid.get() {
+                                    view()
+                                        .flex_row()
+                                        .flex_wrap()
+                                        .gap_3()
+                                        .children(
+                                            favorites()
+                                                .into_iter()
+                                                .map(|kb| {
+                                                    book_card(store, kb, grid, editing)
+                                                        .into_element()
+                                                })
+                                                .collect::<Vec<_>>(),
+                                        )
+                                        .into_element()
+                                } else {
+                                    view()
+                                        .flex_col()
+                                        .gap_2()
+                                        .children(
+                                            favorites()
+                                                .into_iter()
+                                                .map(|kb| {
+                                                    book_card(store, kb, grid, editing)
+                                                        .into_element()
+                                                })
+                                                .collect::<Vec<_>>(),
+                                        )
+                                        .into_element()
+                                }
                             }))
                     },
                 ))
@@ -184,12 +311,34 @@ pub fn kb_shelf(store: Store) -> impl IntoElement {
                             },
                         ))
                         .child(dynamic(move || {
-                            view().flex_col().gap_2().children(
-                                books()
-                                    .into_iter()
-                                    .map(|kb| book_card(store, kb, grid, editing).into_element())
-                                    .collect::<Vec<_>>(),
-                            )
+                            if grid.get() {
+                                view()
+                                    .flex_row()
+                                    .flex_wrap()
+                                    .gap_3()
+                                    .children(
+                                        books()
+                                            .into_iter()
+                                            .map(|kb| {
+                                                book_card(store, kb, grid, editing).into_element()
+                                            })
+                                            .collect::<Vec<_>>(),
+                                    )
+                                    .into_element()
+                            } else {
+                                view()
+                                    .flex_col()
+                                    .gap_2()
+                                    .children(
+                                        books()
+                                            .into_iter()
+                                            .map(|kb| {
+                                                book_card(store, kb, grid, editing).into_element()
+                                            })
+                                            .collect::<Vec<_>>(),
+                                    )
+                                    .into_element()
+                            }
                         })),
                 ),
         ),
@@ -208,125 +357,157 @@ fn book_card(
     let id = kb.id;
     let title = kb.name.clone();
     let is_editing = move || editing.get() == Some(id);
-    let card = move || {
-        let open = move || store.open_book(id);
-        view()
+    let open = move || store.open_book(id);
+    let card_children = move || -> Vec<AnyElement> {
+        vec![
+            text(move || {
+                store
+                    .knowledge_base(id)
+                    .map(|kb| kb.icon)
+                    .unwrap_or_else(|| "📕".to_owned())
+            })
+            .text_size(px(20.0))
+            .into_element(),
+            view()
+                .flex_1()
+                .min_w(px(0.0))
+                .gap_1()
+                .child(
+                    nsh_base::button()
+                        .on_press(open)
+                        .accessibility_label(Some(format!("打开知识库 {title}").into()))
+                        .items_center()
+                        .child(
+                            text(title.clone())
+                                .text_size(px(14.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(tokens::fg_primary())
+                                .number_of_lines(1),
+                        ),
+                )
+                .child(
+                    text(move || {
+                        store
+                            .knowledge_base(id)
+                            .map(|kb| kb.description)
+                            .filter(|desc| !desc.is_empty())
+                            .unwrap_or_else(|| "这本知识库还没有简介".to_owned())
+                    })
+                    .text_size(px(12.0))
+                    .text_color(tokens::fg_muted())
+                    .number_of_lines(1),
+                )
+                .child(stats_line(store, id))
+                .into_element(),
+            nsh_base::button()
+                .on_press(move || {
+                    let favorited = store.knowledge_base(id).is_some_and(|kb| kb.favorited);
+                    store.set_kb_favorite(id, !favorited);
+                })
+                .accessibility_label(Some(format!("收藏 {title}").into()))
+                .size(px(26.0))
+                .items_center()
+                .justify_center()
+                .rounded(tokens::radius_row())
+                .text_color(move || {
+                    if store.knowledge_base(id).is_some_and(|kb| kb.favorited) {
+                        tokens::warning()
+                    } else {
+                        tokens::fg_muted()
+                    }
+                })
+                .hover(|s| s.bg(tokens::control_bg()))
+                .child(
+                    text(move || {
+                        if store.knowledge_base(id).is_some_and(|kb| kb.favorited) {
+                            "★"
+                        } else {
+                            "☆"
+                        }
+                    })
+                    .text_size(px(14.0)),
+                )
+                .into_element(),
+            menu()
+                .offset(px(4.0))
+                .popup_style(|s| {
+                    s.p_1()
+                        .rounded(tokens::radius_card())
+                        .bg(theme().popover)
+                        .shadow_md()
+                        .w(px(180.0))
+                })
+                .trigger(
+                    panel_icon_button("⋯", "更多", || {})
+                        .accessibility_label(Some(format!("更多 {title}").into())),
+                )
+                .child(
+                    menu_item()
+                        .on_select(move || editing.set(Some(id)))
+                        .px_3()
+                        .py_2()
+                        .rounded(tokens::radius_row())
+                        .hover(|s| s.bg(tokens::control_hover()))
+                        .child(
+                            text("编辑信息")
+                                .text_size(px(13.0))
+                                .text_color(tokens::fg_primary()),
+                        ),
+                )
+                .child(
+                    menu_item()
+                        .on_select(move || store.trash_knowledge_base(id))
+                        .px_3()
+                        .py_2()
+                        .rounded(tokens::radius_row())
+                        .hover(|s| s.bg(tokens::control_hover()))
+                        .child(
+                            text("移入回收站")
+                                .text_size(px(13.0))
+                                .text_color(tokens::danger()),
+                        ),
+                )
+                .into_element(),
+        ]
+    };
+    // Grid mode draws the prototype's `.tile`: a fixed-width bordered
+    // card; list mode draws its `.listline`: a full-width quiet row.
+    let card_chrome = move |tile: bool| {
+        let row = view()
             .flex_row()
             .items_center()
             .gap_3()
-            .w_full()
             .px_3()
-            .py(move || if grid.get() { px(10.0) } else { px(6.0) })
+            .py(if tile { px(10.0) } else { px(6.0) })
             .rounded(tokens::radius_card())
             .border_1()
-            .border_color(move || {
-                if grid.get() { tokens::border_subtle() } else { theme().background.opacity(0.0) }
+            .border_color(if tile {
+                tokens::border_subtle()
+            } else {
+                theme().background.opacity(0.0)
             })
-            .bg(move || if grid.get() { theme().card } else { theme().background.opacity(0.0) })
+            .bg(if tile {
+                theme().card
+            } else {
+                theme().background.opacity(0.0)
+            })
             .hover(|s| s.bg(tokens::control_hover()))
-            .child(text(move || store.knowledge_base(id).map(|kb| kb.icon).unwrap_or_else(|| "📕".to_owned())).text_size(px(20.0)))
-            .child(
-                view()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .gap_1()
-                    .child(
-                        nsh_base::button()
-                            .on_press(open)
-                            .accessibility_label(Some(format!("打开知识库 {title}").into()))
-                            .items_center()
-                            .child(
-                                text(title.clone())
-                                    .text_size(px(14.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(tokens::fg_primary())
-                                    .number_of_lines(1),
-                            ),
-                    )
-                    .child(
-                        text(move || {
-                            store
-                                .knowledge_base(id)
-                                .map(|kb| kb.description)
-                                .filter(|desc| !desc.is_empty())
-                                .unwrap_or_else(|| "这本知识库还没有简介".to_owned())
-                        })
-                        .text_size(px(12.0))
-                        .text_color(tokens::fg_muted())
-                        .number_of_lines(1),
-                    )
-                    .child(stats_line(store, id)),
-            )
-            .child(
-                nsh_base::button()
-                    .on_press(move || {
-                        let favorited = store.knowledge_base(id).is_some_and(|kb| kb.favorited);
-                        store.set_kb_favorite(id, !favorited);
-                    })
-                    .accessibility_label(Some(format!("收藏 {title}").into()))
-                    .size(px(26.0))
-                    .items_center()
-                    .justify_center()
-                    .rounded(tokens::radius_row())
-                    .text_color(move || {
-                        if store.knowledge_base(id).is_some_and(|kb| kb.favorited) {
-                            tokens::warning()
-                        } else {
-                            tokens::fg_muted()
-                        }
-                    })
-                    .hover(|s| s.bg(tokens::control_bg()))
-                    .child(
-                        text(move || {
-                            if store.knowledge_base(id).is_some_and(|kb| kb.favorited) {
-                                "★"
-                            } else {
-                                "☆"
-                            }
-                        })
-                        .text_size(px(14.0)),
-                    ),
-            )
-            .child(
-                menu()
-                    .offset(px(4.0))
-                    .popup_style(|s| {
-                        s.p_1()
-                            .rounded(tokens::radius_card())
-                            .bg(theme().popover)
-                            .shadow_md()
-                            .w(px(180.0))
-                    })
-                    .trigger(panel_icon_button("⋯", "更多", || {}).accessibility_label(Some(
-                        format!("更多 {title}").into(),
-                    )))
-                    .child(
-                        menu_item()
-                            .on_select(move || editing.set(Some(id)))
-                            .px_3()
-                            .py_2()
-                            .rounded(tokens::radius_row())
-                            .hover(|s| s.bg(tokens::control_hover()))
-                            .child(
-                                text("编辑信息").text_size(px(13.0)).text_color(tokens::fg_primary()),
-                            ),
-                    )
-                    .child(
-                        menu_item()
-                            .on_select(move || store.trash_knowledge_base(id))
-                            .px_3()
-                            .py_2()
-                            .rounded(tokens::radius_row())
-                            .hover(|s| s.bg(tokens::control_hover()))
-                            .child(
-                                text("移入回收站")
-                                    .text_size(px(13.0))
-                                    .text_color(tokens::danger()),
-                            ),
-                    ),
-            )
+            .children(card_children());
+        if tile {
+            row.w(px(216.0)).flex_none().into_element()
+        } else {
+            row.w_full().into_element()
+        }
     };
-    when(is_editing, move || view().child(book_edit_form(store, id, editing))).otherwise(card)
+    when(is_editing, move || {
+        view().child(book_edit_form(store, id, editing))
+    })
+    .otherwise(move || {
+        // A fresh clone per build: the dynamic factory owns its copy
+        // (`otherwise`'s factory stays `Fn`).
+        let card_chrome = card_chrome.clone();
+        dynamic(move || card_chrome(grid.get()))
+    })
 }
 
 fn stats_line(store: Store, book_id: i64) -> impl IntoElement {
@@ -340,9 +521,18 @@ fn stats_line(store: Store, book_id: i64) -> impl IntoElement {
 
 /// The inline edit form of one shelf book: name and description.
 fn book_edit_form(store: Store, id: i64, editing: Signal<Option<i64>>) -> impl IntoElement {
-    let name = signal(store.knowledge_base(id).map(|kb| kb.name).unwrap_or_default());
-    let description =
-        signal(store.knowledge_base(id).map(|kb| kb.description).unwrap_or_default());
+    let name = signal(
+        store
+            .knowledge_base(id)
+            .map(|kb| kb.name)
+            .unwrap_or_default(),
+    );
+    let description = signal(
+        store
+            .knowledge_base(id)
+            .map(|kb| kb.description)
+            .unwrap_or_default(),
+    );
     view()
         .flex_col()
         .gap_2()
@@ -382,7 +572,9 @@ fn book_edit_form(store: Store, id: i64, editing: Signal<Option<i64>>) -> impl I
                     })
                     .test_id("kb-edit-save"),
                 )
-                .child(app_button(ButtonKind::Ghost, "取消", move || editing.set(None))),
+                .child(app_button(ButtonKind::Ghost, "取消", move || {
+                    editing.set(None)
+                })),
         )
 }
 
@@ -403,14 +595,21 @@ pub fn book_shell(
 ) -> impl IntoElement {
     let narrow = move || window().width.0 < NARROW_BREAKPOINT;
     let drawer = signal(false);
-    let on_close = move || drawer.set(false);
+    let hidden = move || store.catalog_hidden(tab_id);
+    let on_close = move || {
+        if narrow() {
+            drawer.set(false);
+        } else {
+            store.set_catalog_hidden(tab_id, true);
+        }
+    };
     view()
         .flex_1()
         .min_w(px(0.0))
         .min_h(px(0.0))
         .flex_row()
         .child(when(
-            move || !narrow(),
+            move || !narrow() && !hidden(),
             move || {
                 catalog_sidebar(store, book_id, focus, false, on_close, nav)
                     .w(px(CATALOG_W))
@@ -424,20 +623,23 @@ pub fn book_shell(
                 .min_h(px(0.0))
                 .relative()
                 .flex_col()
-                .child(when(narrow, move || {
-                    view()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .py_2()
-                        .child(app_button(ButtonKind::Soft, "☰ 目录", move || {
-                            drawer.set(true);
-                        }))
-                }))
+                .child(when(
+                    move || narrow() || hidden(),
+                    move || {
+                        catalog_reopen(move || {
+                            if narrow() {
+                                drawer.set(true);
+                            } else {
+                                store.set_catalog_hidden(tab_id, false);
+                            }
+                        })
+                    },
+                ))
                 .child(match focus {
-                    CatalogFocus::Home => book_home(store, book_id).into_element(),
-                    CatalogFocus::Document(doc_id) => document_view(store, tab_id, doc_id).into_element(),
+                    CatalogFocus::Home => book_home(store, book_id, None, nav).into_element(),
+                    CatalogFocus::Document(doc_id) => {
+                        document_view(store, tab_id, doc_id).into_element()
+                    }
                 })
                 .child(when(
                     move || narrow() && drawer.get(),
@@ -464,6 +666,15 @@ pub fn book_shell(
         )
 }
 
+pub(crate) fn catalog_reopen(open: impl Fn() + 'static) -> impl IntoElement {
+    view()
+        .flex_row()
+        .items_center()
+        .px_3()
+        .py_2()
+        .child(app_button(ButtonKind::Soft, "☰ 目录", open).accessibility_label("展开目录"))
+}
+
 // ---------------------------------------------------------------------
 // The inner catalog sidebar
 // ---------------------------------------------------------------------
@@ -482,10 +693,28 @@ pub fn catalog_sidebar(
     let filter = signal(String::new());
     let pending = signal(None::<PendingCreate>);
     let draft = signal(String::new());
-    let located = signal(None::<i64>);
-    let outline = move || store.catalog_outline(book_id);
-    let visible =
-        computed(move || visible_entries(&outline(), &filter.get()));
+    let renaming = signal(None::<i64>);
+    let rename_draft = signal(String::new());
+    let reveal = signal(None::<i64>);
+    let drag = CatalogDrag::new();
+    let dismiss_overlay = move || {
+        if overlay {
+            on_close();
+        }
+    };
+    let outline = move || {
+        let entries = store.catalog_outline(book_id);
+        // A Project's Linked Documents sub-view browses only the linked
+        // grouping node's subtree, like the prototype's
+        // `tree(book, projectGroup)` (docs/kanon.html).
+        match nav {
+            CatalogNav::Project {
+                linked_node: Some(root),
+            } => scope_to_subtree(&entries, root),
+            _ => entries,
+        }
+    };
+    let visible = computed(move || visible_entries(&outline(), &filter.get()));
     let all_expanded = move || {
         let entries = outline();
         !entries.is_empty() && entries.iter().all(|entry| entry.node.expanded)
@@ -506,8 +735,7 @@ pub fn catalog_sidebar(
         .border_r_1()
         .border_color(tokens::border_subtle())
         .child(
-            // The book switcher row: quick book switching (+ close when
-            // the catalog overlays the main pane).
+            // The close action folds the inline panel or dismisses the drawer.
             view()
                 .flex_row()
                 .items_center()
@@ -515,119 +743,218 @@ pub fn catalog_sidebar(
                 .px_2()
                 .py_2()
                 .child(book_switcher(store, book_id).flex_1().min_w(px(0.0)))
-                .child(when(
-                    move || overlay,
-                    move || panel_icon_button("✕", "收起目录", on_close),
-                )),
+                .child(panel_icon_button("✕", "收起目录", on_close)),
         )
         .child(
-            // The tool row: in-book filter, or the quick-create row
-            // while a creation is pending.
-            view().px_2().pb_2().child(when(
-                move || pending.get().is_some(),
-                move || {
-                    let kind = pending.get().expect("pending");
-                    let (label, placeholder): (String, String) = match kind {
-                        PendingCreate::Document { parent } => match parent.or(root_parent) {
-                            Some(parent) => (
-                                "新建文档".to_owned(),
-                                format!(
-                                    "在「{}」下新建文档，回车创建",
-                                    node_title(&outline(), parent)
+            // The tool row (docs/ui-design.md §3.3): the in-book filter
+            // beside the `+` quick-create menu, or the quick-create row
+            // itself while a creation is pending.
+            view()
+                .px_2()
+                .pb_2()
+                .child(when(
+                    move || pending.get().is_some(),
+                    move || {
+                        let kind = pending.get().expect("pending");
+                        let (label, placeholder): (String, String) = match kind {
+                            PendingCreate::Document { parent } => match parent.or(root_parent) {
+                                Some(parent) => (
+                                    "新建文档".to_owned(),
+                                    format!(
+                                        "在「{}」下新建文档，回车创建",
+                                        node_title(store, &outline(), parent)
+                                    ),
                                 ),
-                            ),
-                            None => (
-                                "新建文档".to_owned(),
-                                "在目录顶部新建文档，回车创建".to_owned(),
-                            ),
-                        },
-                        PendingCreate::Group { parent } => match parent {
-                            Some(parent) => (
-                                "新建子分组".to_owned(),
-                                format!(
-                                    "在「{}」下新建分组，回车创建",
-                                    node_title(&outline(), parent)
+                                None => (
+                                    "新建文档".to_owned(),
+                                    "在目录顶部新建文档，回车创建".to_owned(),
                                 ),
-                            ),
-                            None => (
-                                "新建分组".to_owned(),
-                                "在目录顶部新建分组，回车创建".to_owned(),
-                            ),
-                        },
-                    };
-                    view()
-                        .flex_col()
-                        .gap_1()
-                        .child(text(label).text_size(px(11.0)).text_color(tokens::fg_muted()))
-                        .child(
-                            view()
-                                .flex_row()
-                                .items_center()
-                                .gap_1()
-                                .child(submit_field(
-                                    placeholder,
-                                    move || draft.get(),
-                                    move |text: &str| draft.set(text.to_owned()),
-                                    move |text: &str| {
-                                        commit_create(store, book_id, kind, text, root_parent);
-                                        draft.set(String::new());
+                            },
+                            PendingCreate::Group { parent } => match parent {
+                                Some(parent) => (
+                                    "新建子分组".to_owned(),
+                                    format!(
+                                        "在「{}」下新建分组，回车创建",
+                                        node_title(store, &outline(), parent)
+                                    ),
+                                ),
+                                None => (
+                                    "新建分组".to_owned(),
+                                    "在目录顶部新建分组，回车创建".to_owned(),
+                                ),
+                            },
+                        };
+                        view()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                text(label)
+                                    .text_size(px(11.0))
+                                    .text_color(tokens::fg_muted()),
+                            )
+                            .child(
+                                view()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(submit_field(
+                                        placeholder,
+                                        move || draft.get(),
+                                        move |text: &str| draft.set(text.to_owned()),
+                                        move |text: &str| {
+                                            commit_create(store, book_id, kind, text, root_parent);
+                                            draft.set(String::new());
+                                            pending.set(None);
+                                        },
+                                    ))
+                                    .child(
+                                        app_button(ButtonKind::Positive, "创建", move || {
+                                            commit_create(
+                                                store,
+                                                book_id,
+                                                kind,
+                                                &draft.get(),
+                                                root_parent,
+                                            );
+                                            draft.set(String::new());
+                                            pending.set(None);
+                                        })
+                                        .test_id("catalog-create"),
+                                    )
+                                    .child(panel_icon_button("✕", "取消创建", move || {
                                         pending.set(None);
-                                    },
-                                ))
-                                .child(
-                                    app_button(ButtonKind::Positive, "创建", move || {
-                                        commit_create(store, book_id, kind, &draft.get(), root_parent);
                                         draft.set(String::new());
-                                        pending.set(None);
-                                    })
-                                    .test_id("catalog-create"),
+                                    })),
+                            )
+                    },
+                ))
+                .child(when(
+                    move || pending.get().is_none(),
+                    move || {
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                input_field(
+                                    "筛选目录",
+                                    move || filter.get(),
+                                    move |text: &str| filter.set(text.to_owned()),
                                 )
-                                .child(panel_icon_button("✕", "取消创建", move || {
-                                    pending.set(None);
-                                    draft.set(String::new());
-                                })),
-                        )
-                },
-            )).child(when(
-                move || pending.get().is_none(),
-                move || {
-                    input_field(
-                        "筛选目录",
-                        move || filter.get(),
-                        move |text: &str| filter.set(text.to_owned()),
-                    )
-                    .test_id("catalog-filter")
-                },
-            )),
+                                .test_id("catalog-filter"),
+                            )
+                            .child(
+                                menu()
+                                    .offset(px(4.0))
+                                    .popup_style(|s| {
+                                        s.p_1()
+                                            .rounded(tokens::radius_card())
+                                            .bg(theme().popover)
+                                            .shadow_md()
+                                            .w(px(200.0))
+                                    })
+                                    .trigger(
+                                        panel_icon_button("＋", "新建", move || {})
+                                            .test_id("catalog-new"),
+                                    )
+                                    .child(
+                                        menu_item()
+                                            .on_select(move || {
+                                                pending.set(Some(PendingCreate::Document {
+                                                    parent: None,
+                                                }));
+                                            })
+                                            .px_3()
+                                            .py_2()
+                                            .rounded(tokens::radius_row())
+                                            .hover(|s| s.bg(tokens::control_hover()))
+                                            .child(
+                                                text("在顶部新建文档")
+                                                    .text_size(px(13.0))
+                                                    .text_color(tokens::fg_primary()),
+                                            ),
+                                    )
+                                    .child(
+                                        menu_item()
+                                            .on_select(move || {
+                                                pending.set(Some(PendingCreate::Group {
+                                                    parent: None,
+                                                }));
+                                            })
+                                            .px_3()
+                                            .py_2()
+                                            .rounded(tokens::radius_row())
+                                            .hover(|s| s.bg(tokens::control_hover()))
+                                            .child(
+                                                text("在顶部新建分组")
+                                                    .text_size(px(13.0))
+                                                    .text_color(tokens::fg_primary()),
+                                            ),
+                                    ),
+                            )
+                    },
+                )),
         )
         .child(
             view()
                 .flex_col()
                 .gap(px(2.0))
                 .px_2()
+                .child(home_row(store, book_id, focus, nav, dismiss_overlay))
                 .child(
+                    // The 目录 header row (docs/ui-design.md §3.3): the
+                    // section title — the linked grouping node's name in a
+                    // Project's sub-view — with 定位当前文档 and the
+                    // expand/collapse-all pair on the right.
                     view()
                         .flex_row()
                         .items_center()
                         .gap_1()
-                        .child(home_row(store, book_id, focus, nav).flex_1().min_w(px(0.0)))
+                        .child(
+                            text(move || match nav {
+                                CatalogNav::Project {
+                                    linked_node: Some(node),
+                                } => store
+                                    .catalog_node(node)
+                                    .map(|node| node.title)
+                                    .unwrap_or_default(),
+                                _ => "目录".to_owned(),
+                            })
+                            .text_size(px(11.0))
+                            .text_color(tokens::fg_muted())
+                            .flex_1()
+                            .min_w(px(0.0)),
+                        )
                         .child(
                             when(
                                 move || focus != CatalogFocus::Home,
                                 move || {
-                                    view().child(panel_icon_button("◎", "定位当前文档", move || {
-                                        if let CatalogFocus::Document(doc_id) = focus {
-                                            filter.set(String::new());
-                                            if let Some(node) = store.catalog_node_of_document(doc_id)
-                                            {
-                                                located.set(Some(node.id));
-                                                for ancestor in ancestor_ids(&outline(), node.id) {
-                                                    store.set_node_expanded(ancestor, true);
+                                    view().child(panel_icon_button(
+                                        "◎",
+                                        "定位当前文档",
+                                        move || {
+                                            if let CatalogFocus::Document(doc_id) = focus {
+                                                filter.set(String::new());
+                                                if let Some(node) =
+                                                    store.catalog_node_of_document(doc_id)
+                                                {
+                                                    for ancestor in
+                                                        ancestor_ids(&outline(), node.id)
+                                                    {
+                                                        store.set_node_expanded(ancestor, true);
+                                                    }
+                                                    store.set_node_expanded(node.id, true);
+                                                    // The chain is open: the
+                                                    // row itself scrolls into
+                                                    // view once it renders
+                                                    // (docs/kanon.html's
+                                                    // locate ends in a
+                                                    // scrollIntoView).
+                                                    reveal.set(Some(node.id));
                                                 }
-                                                store.set_node_expanded(node.id, true);
                                             }
-                                        }
-                                    }))
+                                        },
+                                    ))
                                 },
                             )
                             .otherwise(|| view().w(px(26.0))),
@@ -640,73 +967,11 @@ pub fn catalog_sidebar(
                                 })
                             },
                         ))
-                        .child(when(
-                            all_expanded,
-                            move || {
-                                panel_icon_button("⤡", "全部收起", move || {
-                                    store.set_catalog_expanded_all(book_id, false)
-                                })
-                            },
-                        )),
-                )
-                .child(
-                    menu()
-                        .offset(px(4.0))
-                        .popup_style(|s| {
-                            s.p_1()
-                                .rounded(tokens::radius_card())
-                                .bg(theme().popover)
-                                .shadow_md()
-                                .w(px(200.0))
-                        })
-                        .trigger(
-                            nsh_base::button()
-                                .accessibility_label("新建")
-                                .test_id("catalog-new")
-                                .h(px(28.0))
-                                .w_full()
-                                .items_center()
-                                .justify_center()
-                                .gap_1()
-                                .rounded(tokens::radius_row())
-                                .border_1()
-                                .border_color(tokens::border_subtle())
-                                .bg(move || theme().background.opacity(0.0))
-                                .text_color(tokens::fg_muted())
-                                .hover(|s| s.bg(tokens::control_hover()).text_color(tokens::fg_primary()))
-                                .child(text("＋").text_size(px(13.0)))
-                                .child(text("新建").text_size(px(12.0))),
-                        )
-                        .child(
-                            menu_item()
-                                .on_select(move || {
-                                    pending.set(Some(PendingCreate::Document { parent: None }));
-                                })
-                                .px_3()
-                                .py_2()
-                                .rounded(tokens::radius_row())
-                                .hover(|s| s.bg(tokens::control_hover()))
-                                .child(
-                                    text("在顶部新建文档")
-                                        .text_size(px(13.0))
-                                        .text_color(tokens::fg_primary()),
-                                ),
-                        )
-                        .child(
-                            menu_item()
-                                .on_select(move || {
-                                    pending.set(Some(PendingCreate::Group { parent: None }));
-                                })
-                                .px_3()
-                                .py_2()
-                                .rounded(tokens::radius_row())
-                                .hover(|s| s.bg(tokens::control_hover()))
-                                .child(
-                                    text("在顶部新建分组")
-                                        .text_size(px(13.0))
-                                        .text_color(tokens::fg_primary()),
-                                ),
-                        ),
+                        .child(when(all_expanded, move || {
+                            panel_icon_button("⤡", "全部收起", move || {
+                                store.set_catalog_expanded_all(book_id, false)
+                            })
+                        })),
                 ),
         )
         .child(
@@ -732,9 +997,20 @@ pub fn catalog_sidebar(
                             |entry: &CatalogEntry| entry.node.id,
                             move |entry, _index| {
                                 catalog_row(
-                                    CatalogCtx { store, focus, nav, filter, pending, located },
+                                    CatalogCtx {
+                                        store,
+                                        focus,
+                                        nav,
+                                        filter,
+                                        pending,
+                                        renaming,
+                                        rename_draft,
+                                        reveal,
+                                        drag,
+                                    },
                                     entry,
                                     outline,
+                                    dismiss_overlay,
                                 )
                             },
                         )),
@@ -752,7 +1028,9 @@ pub fn catalog_sidebar(
                     .border_color(tokens::border_subtle())
                     .child(section_heading("最近删除"))
                     .child(
-                        text("恢复会带回它的整个子树").text_size(px(11.0)).text_color(tokens::fg_muted()),
+                        text("恢复会带回它的整个子树")
+                            .text_size(px(11.0))
+                            .text_color(tokens::fg_muted()),
                     )
                     .child(each(
                         move || store.trashed_catalog_nodes(book_id),
@@ -788,9 +1066,17 @@ pub fn catalog_sidebar(
                                             store.restore_catalog_node(id);
                                         })
                                         .accessibility_label(move || {
-                                            Some(format!("恢复 {}", node.with(|node| node.title.clone())).into())
+                                            Some(
+                                                format!(
+                                                    "恢复 {}",
+                                                    node.with(|node| node.title.clone())
+                                                )
+                                                .into(),
+                                            )
                                         })
-                                        .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
+                                        .focus_visible(|s| {
+                                            s.outline(px(2.0)).outline_color(tokens::accent())
+                                        })
                                         .px_2()
                                         .py_1()
                                         .rounded(tokens::radius_row())
@@ -823,7 +1109,7 @@ fn commit_create(
             }
             return;
         }
-        PendingCreate::Group { parent } => parent,
+        PendingCreate::Group { parent } => parent.or(root_parent),
     };
     if let Some(parent) = parent {
         store.set_node_expanded(parent, true);
@@ -833,11 +1119,15 @@ fn commit_create(
     }
 }
 
-fn node_title(outline: &[CatalogEntry], id: i64) -> String {
+/// The title of `id` for inline placeholders: the visible outline
+/// first, then the store (a Project's linked grouping node sits above
+/// the scoped outline and never appears in it).
+fn node_title(store: Store, outline: &[CatalogEntry], id: i64) -> String {
     outline
         .iter()
         .find(|entry| entry.node.id == id)
         .map(|entry| entry.node.title.clone())
+        .or_else(|| store.catalog_node(id).map(|node| node.title))
         .unwrap_or_default()
 }
 
@@ -872,28 +1162,197 @@ fn move_catalog_node_to_top(store: Store, id: i64) {
     store.move_catalog_node(id, None, 0);
 }
 
+/// The drop target under `at` (root coordinates): the first measured row
+/// the point falls in, other than the dragged node and its descendants
+/// (a drop there would cycle). The zone follows docs/kanon.html's
+/// catalog drop — the top quarter inserts before the row, the center
+/// half nests into it, the bottom quarter inserts after.
+fn catalog_drop_target(
+    rects: &[(i64, Bounds<Points>)],
+    outline: &[CatalogEntry],
+    dragged: i64,
+    at: Point<Points>,
+) -> Option<DropTarget> {
+    rects
+        .iter()
+        .find(|(node, bounds)| {
+            *node != dragged
+                && bounds.contains(&at)
+                && !ancestor_ids(outline, *node).contains(&dragged)
+        })
+        .map(|(node, bounds)| {
+            let span = bounds.size.height.0.max(1.0);
+            let pos = (at.y - bounds.origin.y).0 / span;
+            let zone = if pos <= 0.25 {
+                DropZone::Before
+            } else if pos >= 0.75 {
+                DropZone::After
+            } else {
+                DropZone::Child
+            };
+            DropTarget { node: *node, zone }
+        })
+}
+
+/// Commits a catalog drop through `Store::move_catalog_node`: the child
+/// zone appends under the target (expanding it, so the moved node stays
+/// visible); the outer zones insert before/after the target among its
+/// siblings. Returns false when the store refuses the move (a cycle, a
+/// cross-book target), leaving the tree untouched.
+fn catalog_commit_drop(
+    store: Store,
+    outline: &[CatalogEntry],
+    dragged: i64,
+    target: DropTarget,
+) -> bool {
+    match target.zone {
+        DropZone::Child => {
+            let at = outline
+                .iter()
+                .filter(|entry| entry.node.parent_id == Some(target.node))
+                .filter(|entry| entry.node.id != dragged)
+                .count();
+            let moved = store.move_catalog_node(dragged, Some(target.node), at);
+            if moved {
+                store.set_node_expanded(target.node, true);
+            }
+            moved
+        }
+        DropZone::Before | DropZone::After => {
+            let Some(entry) = outline.iter().find(|entry| entry.node.id == target.node) else {
+                return false;
+            };
+            let parent = entry.node.parent_id;
+            let siblings = outline
+                .iter()
+                .filter(|entry| entry.node.parent_id == parent)
+                .filter(|entry| entry.node.id != dragged)
+                .map(|entry| entry.node.id)
+                .collect::<Vec<_>>();
+            let Some(at) = siblings.iter().position(|id| *id == target.node) else {
+                return false;
+            };
+            let at = if target.zone == DropZone::Before {
+                at
+            } else {
+                at + 1
+            };
+            store.move_catalog_node(dragged, parent, at)
+        }
+    }
+}
+
+/// The catalog row's actions, shared by the ⋯ overflow menu and the
+/// right-click context menu (docs/kanon.html's `nodeMenu`): a child
+/// group, rename, the reorder triple, and trash.
+fn catalog_node_menu_items(
+    store: Store,
+    node_id: impl Fn() -> i64 + Copy + 'static,
+    title: impl Fn() -> String + Copy + 'static,
+    pending: Signal<Option<PendingCreate>>,
+    renaming: Signal<Option<i64>>,
+    rename_draft: Signal<String>,
+    rename_locked: impl Fn() -> bool + Copy + 'static,
+) -> Vec<AnyElement> {
+    fn item(
+        label: &'static str,
+        color: fn() -> AdaptiveColor,
+        on_select: impl Fn() + 'static,
+    ) -> AnyElement {
+        menu_item()
+            .on_select(on_select)
+            .px_3()
+            .py_2()
+            .rounded(tokens::radius_row())
+            .hover(|s| s.bg(tokens::control_hover()))
+            .child(text(label).text_size(px(13.0)).text_color(color()))
+            .into_element()
+    }
+    let separator = || {
+        menu_separator()
+            .h(px(1.0))
+            .my_1()
+            .bg(tokens::border_subtle())
+            .into_element()
+    };
+    vec![
+        item("新建子分组", tokens::fg_primary, move || {
+            let parent = Some(node_id());
+            pending.set(Some(PendingCreate::Group { parent }));
+        }),
+        separator(),
+        menu_item()
+            .disabled(rename_locked)
+            .on_select(move || {
+                rename_draft.set(title());
+                renaming.set(Some(node_id()));
+            })
+            .px_3()
+            .py_2()
+            .rounded(tokens::radius_row())
+            .hover(|s| s.bg(tokens::control_hover()))
+            .child(
+                text("重命名")
+                    .text_size(px(13.0))
+                    .text_color(tokens::fg_primary()),
+            )
+            .into_element(),
+        item("上移", tokens::fg_primary, move || {
+            move_catalog_node_rel(store, node_id(), -1)
+        }),
+        item("下移", tokens::fg_primary, move || {
+            move_catalog_node_rel(store, node_id(), 1)
+        }),
+        item("移到目录顶层", tokens::fg_primary, move || {
+            move_catalog_node_to_top(store, node_id())
+        }),
+        separator(),
+        item("移入回收站", tokens::danger, move || {
+            store.trash_catalog_node(node_id())
+        }),
+    ]
+}
+
 fn home_row(
     store: Store,
     book_id: i64,
     focus: CatalogFocus,
     nav: CatalogNav,
+    dismiss_overlay: impl Fn() + 'static,
 ) -> nsh_base::ButtonElement {
     let active = focus == CatalogFocus::Home;
     nsh_base::button()
-        .on_press(move || match nav {
-            CatalogNav::Book => store.open_book(book_id),
-            CatalogNav::Project { .. } => store.set_project_document(None),
+        .on_press(move || {
+            dismiss_overlay();
+            match nav {
+                CatalogNav::Book => store.open_book(book_id),
+                CatalogNav::Project { .. } => store.set_project_document(None),
+            }
         })
         .accessibility_label("首页")
         .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
         .h(px(30.0))
         .w_full()
+        .flex_row()
+        .justify_start()
         .items_center()
         .gap_2()
         .px_2()
         .rounded(tokens::radius_row())
-        .bg(move || if active { tokens::accent_soft() } else { theme().background.opacity(0.0) })
-        .text_color(move || if active { tokens::accent() } else { tokens::fg_muted() })
+        .bg(move || {
+            if active {
+                tokens::accent_soft()
+            } else {
+                theme().background.opacity(0.0)
+            }
+        })
+        .text_color(move || {
+            if active {
+                tokens::accent()
+            } else {
+                tokens::fg_muted()
+            }
+        })
         .hover(|s| s.bg(tokens::control_hover()))
         .child(text("🏠").text_size(px(13.0)))
         .child(text("首页").text_size(px(13.0)))
@@ -916,6 +1375,9 @@ fn book_switcher(store: Store, book_id: i64) -> nsh_base::MenuElement {
                 .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
                 .h(px(30.0))
                 .w_full()
+                .flex_row()
+                .justify_start()
+                .min_w(px(0.0))
                 .items_center()
                 .gap_2()
                 .px_2()
@@ -942,6 +1404,7 @@ fn book_switcher(store: Store, book_id: i64) -> nsh_base::MenuElement {
                     .text_size(px(13.0))
                     .font_weight(FontWeight::SEMIBOLD)
                     .number_of_lines(1)
+                    .min_w(px(0.0))
                     .flex_1(),
                 )
                 .child(text("▾").text_size(px(11.0)).text_color(tokens::fg_muted())),
@@ -966,14 +1429,23 @@ fn book_switcher(store: Store, book_id: i64) -> nsh_base::MenuElement {
                     .hover(|s| s.bg(tokens::control_hover()))
                     .child(
                         text(move || {
-                            format!("{} {}", kb.with(|kb| kb.icon.clone()), kb.with(|kb| kb.name.clone()))
+                            format!(
+                                "{} {}",
+                                kb.with(|kb| kb.icon.clone()),
+                                kb.with(|kb| kb.name.clone())
+                            )
                         })
                         .text_size(px(13.0))
                         .text_color(tokens::fg_primary()),
                     )
             },
         ))
-        .child(menu_separator().h(px(1.0)).my_1().bg(tokens::border_subtle()))
+        .child(
+            menu_separator()
+                .h(px(1.0))
+                .my_1()
+                .bg(tokens::border_subtle()),
+        )
         .child(
             menu_item()
                 .on_select(move || store.open_or_focus(Route::KnowledgeBases))
@@ -981,7 +1453,11 @@ fn book_switcher(store: Store, book_id: i64) -> nsh_base::MenuElement {
                 .py_2()
                 .rounded(tokens::radius_row())
                 .hover(|s| s.bg(tokens::control_hover()))
-                .child(text("＋ 新建知识库").text_size(px(13.0)).text_color(tokens::accent())),
+                .child(
+                    text("＋ 新建知识库")
+                        .text_size(px(13.0))
+                        .text_color(tokens::accent()),
+                ),
         )
 }
 
@@ -992,8 +1468,19 @@ fn catalog_row(
     ctx: CatalogCtx,
     entry: ReadSignal<CatalogEntry>,
     outline: impl Fn() -> Vec<CatalogEntry> + Copy + 'static,
+    dismiss_overlay: impl Fn() + Copy + 'static,
 ) -> impl IntoElement {
-    let CatalogCtx { store, focus, nav, filter, pending, located } = ctx;
+    let CatalogCtx {
+        store,
+        focus,
+        nav,
+        filter,
+        pending,
+        renaming,
+        rename_draft,
+        reveal,
+        drag,
+    } = ctx;
     let node_id = move || entry.with(|entry| entry.node.id);
     let is_document = move || entry.with(|entry| entry.node.document_id.is_some());
     let depth = move || entry.with(|entry| entry.depth);
@@ -1002,7 +1489,9 @@ fn catalog_row(
     // collapses — and then it can never re-expand.
     let has_children = move || {
         let id = node_id();
-        outline().iter().any(|entry| entry.node.parent_id == Some(id))
+        outline()
+            .iter()
+            .any(|entry| entry.node.parent_id == Some(id))
     };
     let filtering = move || !filter.get().is_empty();
     let expanded = move || entry.with(|entry| entry.node.expanded);
@@ -1013,313 +1502,578 @@ fn catalog_row(
         })
     };
     let title = move || entry.with(|entry| entry.node.title.clone());
+    let renaming_this = move || renaming.get() == Some(node_id());
+    // Renaming a Document whose edit session is live would fight the
+    // editor's auto-save (the store refuses it); the menu item stays
+    // disabled meanwhile, so the gesture never dead-ends.
+    let rename_locked = move || {
+        entry
+            .with(|entry| entry.node.document_id)
+            .is_some_and(|doc_id| store.editing_locked(doc_id))
+    };
+    // Locate-current scrolls the open document's row into sight. The
+    // target row does the reveal itself: it mounts only once the
+    // expanded chain renders, so a signal drives it instead of the
+    // header button reaching into the tree.
+    let row_ref = element_ref();
+    effect(move || {
+        if reveal.get() == Some(node_id()) {
+            reveal.set(None);
+            row_ref.reveal(RevealOptions::default().vertical(ScrollAlignment::Nearest));
+        }
+    });
+    // The drag (docs/kanon.html's catalog drop): the row pans with the
+    // pointer (its values move it), the rows measured at pan start
+    // hit-test the release — top quarter before, center half child,
+    // bottom quarter after — and a release nowhere, a cancel, or an
+    // invalid target springs back and changes nothing. Only the desktop
+    // arms the pan, so touch drags keep scrolling the tree.
+    let row_id = node_id();
+    drag.rows.with(|rows| rows.push((row_id, row_ref)));
+    cleanup(move || {
+        drag.rows
+            .try_with(|rows| rows.retain(|(_, reference)| *reference != row_ref));
+    });
+    let drag_x = animated_value(0.0);
+    let drag_y = animated_value(0.0);
+    let down = signal(None::<Point<Points>>);
+    let dragging_this = move || drag.active.get() == Some(node_id());
+    let zone = move || {
+        drag.target
+            .get()
+            .and_then(|target| (target.node == node_id()).then_some(target.zone))
+    };
 
-    view()
+    // One item set for both menus (the row's ⋯ overflow and the
+    // right-click context menu): a pointer user and a keyboard user
+    // see identical node actions.
+    let menu_items = move || {
+        catalog_node_menu_items(
+            store,
+            node_id,
+            title,
+            pending,
+            renaming,
+            rename_draft,
+            rename_locked,
+        )
+    };
+    let pan_armed = move || is_desktop() && !renaming_this();
+    let row = view()
+        .element_ref(&row_ref)
+        .test_id("catalog-row")
         .flex_row()
         .items_center()
         .gap_1()
-        .pl(move || px(depth() as f32 * 14.0))
+        .pl(move || px(depth() as f32 * 12.0))
         .pr_1()
         .h(px(30.0))
         .rounded(tokens::radius_row())
+        .bind_translate_x(&drag_x)
+        .bind_translate_y(&drag_y)
+        .pan_values(Some(&drag_x), Some(&drag_y))
+        .pan_enabled(pan_armed)
+        .on_touch(move |touch: &TouchEvent| match touch.phase {
+            TouchPhase::Start => down.set(touch.points.first().map(|p| p.page)),
+            TouchPhase::Move | TouchPhase::End => {
+                if drag.active.get_untracked() == Some(row_id)
+                    && let Some(at) = touch.points.first().map(|p| p.page)
+                {
+                    drag.target.set(drag.rects.with_untracked(|rects| {
+                        catalog_drop_target(rects, &outline(), row_id, at)
+                    }));
+                }
+            }
+            TouchPhase::Cancel => drag.target.set(None),
+        })
+        .on_pan_start(move |_: &PanEvent| {
+            drag.active.set(Some(node_id()));
+            drag.measure_rows();
+        })
+        .on_pan_end(move |event: &PanEvent| {
+            let released = down
+                .get()
+                .map(|origin| origin + event.translation)
+                .filter(|_| !event.cancelled);
+            let target = released
+                .and_then(|at| catalog_drop_target(&drag.rects.get(), &outline(), node_id(), at));
+            let committed = target
+                .is_some_and(|target| catalog_commit_drop(store, &outline(), node_id(), target));
+            drag.active.set(None);
+            drag.target.set(None);
+            if committed || reduce_motion() {
+                drag_x.set(0.0);
+                drag_y.set(0.0);
+            } else {
+                drag_x.spring(0.0, Spring::default());
+                drag_y.spring(0.0, Spring::default());
+            }
+        })
+        // The dragged row lifts above its neighbors; the drop target
+        // answers the zone — a child nest tints the row, the outer
+        // quarters draw the accent edge (the prototype's `.over`).
+        .z_index(move || if dragging_this() { 10 } else { 0 })
+        // The current document's row highlights; locate-current expands
+        // the chain to it, so no separate marker is needed (a stale one
+        // would keep the old row lit after switching documents).
         .bg(move || {
-            if located.get() == Some(node_id()) || is_current() {
+            if zone() == Some(DropZone::Child) || is_current() {
                 tokens::accent_soft()
+            } else if dragging_this() {
+                tokens::panel_raised()
             } else {
                 theme().background.opacity(0.0)
             }
         })
+        .border_t(move || {
+            if zone() == Some(DropZone::Before) {
+                px(2.0)
+            } else {
+                px(0.0)
+            }
+        })
+        .border_b(move || {
+            if zone() == Some(DropZone::After) {
+                px(2.0)
+            } else {
+                px(0.0)
+            }
+        })
+        .border_color(move || match zone() {
+            Some(DropZone::Before) | Some(DropZone::After) => tokens::accent(),
+            _ => tokens::border_subtle(),
+        })
         .hover(|s| s.bg(tokens::control_hover()))
-        .child(
-            view().w(px(26.0)).child(when(
-                move || has_children() && !filtering(),
-                move || {
-                    view()
-                        .child(
-                            panel_icon_button(
-                                move || if expanded() { "▾" } else { "▸" },
-                                "切换展开",
-                                move || store.set_node_expanded(node_id(), !expanded()),
-                            )
-                            .accessibility_label(move || {
-                                Some(
-                                    format!("{} {}", if expanded() { "收起" } else { "展开" }, title())
-                                        .into(),
-                                )
-                            }),
+        .child(view().w(px(26.0)).child(when(
+            move || has_children() && !filtering(),
+            move || {
+                view()
+                    .child(
+                        panel_icon_button(
+                            move || if expanded() { "▾" } else { "▸" },
+                            "切换展开",
+                            move || store.set_node_expanded(node_id(), !expanded()),
                         )
-                        .accessibility_state(move || {
-                            nsh_core::AccessibilityState {
-                                expanded: Some(expanded()),
-                                ..Default::default()
+                        .accessibility_label(move || {
+                            Some(
+                                format!("{} {}", if expanded() { "收起" } else { "展开" }, title())
+                                    .into(),
+                            )
+                        }),
+                    )
+                    .accessibility_state(move || nsh_core::AccessibilityState {
+                        expanded: Some(expanded()),
+                        ..Default::default()
+                    })
+            },
+        )))
+        // The rename field takes the title's place while its row
+        // renames (docs/kanon.html's node menu leads with 重命名);
+        // Enter commits, ✕ cancels, and a refused or unchanged rename
+        // just closes again.
+        .child(
+            when(renaming_this, move || {
+                view()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .child(
+                        input_field(
+                            "重命名，回车确认",
+                            move || rename_draft.get(),
+                            move |text: &str| rename_draft.set(text.to_owned()),
+                        )
+                        .label("重命名，回车确认")
+                        .auto_focus(true)
+                        .on_submit(move |text: &str| {
+                            if !text.trim().is_empty() {
+                                store.rename_catalog_node(node_id(), text);
+                                renaming.set(None);
                             }
-                        })
-                },
-            )),
-        )
-        .child(
-            nsh_base::button()
-                .on_press(move || {
-                    let (doc, id, was_expanded) =
-                        entry.with(|entry| (entry.node.document_id, entry.node.id, entry.node.expanded));
-                    if let Some(doc_id) = doc {
-                        match nav {
-                            CatalogNav::Book => store.open_document(doc_id),
-                            CatalogNav::Project { .. } => store.set_project_document(Some(doc_id)),
+                        }),
+                    )
+                    .child(panel_icon_button("✕", "取消重命名", move || {
+                        renaming.set(None)
+                    }))
+            })
+            .otherwise(move || {
+                nsh_base::button()
+                    .on_press(move || {
+                        let (doc, id, was_expanded) = entry.with(|entry| {
+                            (entry.node.document_id, entry.node.id, entry.node.expanded)
+                        });
+                        if let Some(doc_id) = doc {
+                            dismiss_overlay();
+                            match nav {
+                                CatalogNav::Book => store.open_document(doc_id),
+                                CatalogNav::Project { .. } => {
+                                    store.set_project_document(Some(doc_id))
+                                }
+                            }
+                        } else {
+                            store.set_node_expanded(id, !was_expanded);
                         }
-                    } else {
-                        store.set_node_expanded(id, !was_expanded);
-                    }
-                })
-                .accessibility_label(move || Some(title().into()))
-                .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
-                .flex_1()
-                .min_w(px(0.0))
-                .items_center()
-                .gap_2()
-                .child(text(move || if is_document() { "📄" } else { "📁" }).text_size(px(13.0)))
-                .child(
-                    text(title)
-                        .text_size(px(13.0))
-                        .number_of_lines(1)
-                        .text_color(tokens::fg_primary()),
-                ),
+                    })
+                    .accessibility_label(move || Some(title().into()))
+                    .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex_row()
+                    .justify_start()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        text(move || if is_document() { "📄" } else { "📁" }).text_size(px(13.0)),
+                    )
+                    .child(
+                        text(title)
+                            .text_size(px(13.0))
+                            .number_of_lines(1)
+                            .text_color(tokens::fg_primary()),
+                    )
+            }),
         )
-        .child(
-            nsh_base::button()
-                .on_press(move || {
-                    let parent = Some(node_id());
-                    pending.set(Some(PendingCreate::Document { parent }));
-                })
-                .accessibility_label("新建子文档")
-                .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
-                .size(px(22.0))
-                .items_center()
-                .justify_center()
-                .rounded_full()
-                .text_color(tokens::fg_muted())
-                .hover(|s| s.bg(tokens::control_hover()).text_color(tokens::accent()))
-                .child(text("＋").text_size(px(12.0))),
-        )
-        .child(
-            menu()
-                .offset(px(4.0))
-                .popup_style(|s| {
-                    s.p_1()
-                        .rounded(tokens::radius_card())
-                        .bg(theme().popover)
-                        .shadow_md()
-                        .w(px(180.0))
-                })
-                .trigger(panel_icon_button("⋯", "节点菜单", || {}))
-                .child(
-                    menu_item()
-                        .on_select(move || {
-                            let parent = Some(node_id());
-                            pending.set(Some(PendingCreate::Group { parent }));
-                        })
-                        .px_3()
-                        .py_2()
-                        .rounded(tokens::radius_row())
-                        .hover(|s| s.bg(tokens::control_hover()))
-                        .child(
-                            text("新建子分组").text_size(px(13.0)).text_color(tokens::fg_primary()),
-                        ),
-                )
-                .child(menu_separator().h(px(1.0)).my_1().bg(tokens::border_subtle()))
-                .child(
-                    menu_item()
-                        .on_select(move || move_catalog_node_rel(store, node_id(), -1))
-                        .px_3()
-                        .py_2()
-                        .rounded(tokens::radius_row())
-                        .hover(|s| s.bg(tokens::control_hover()))
-                        .child(text("上移").text_size(px(13.0)).text_color(tokens::fg_primary())),
-                )
-                .child(
-                    menu_item()
-                        .on_select(move || move_catalog_node_rel(store, node_id(), 1))
-                        .px_3()
-                        .py_2()
-                        .rounded(tokens::radius_row())
-                        .hover(|s| s.bg(tokens::control_hover()))
-                        .child(text("下移").text_size(px(13.0)).text_color(tokens::fg_primary())),
-                )
-                .child(
-                    menu_item()
-                        .on_select(move || move_catalog_node_to_top(store, node_id()))
-                        .px_3()
-                        .py_2()
-                        .rounded(tokens::radius_row())
-                        .hover(|s| s.bg(tokens::control_hover()))
-                        .child(
-                            text("移到目录顶层").text_size(px(13.0)).text_color(tokens::fg_primary()),
-                        ),
-                )
-                .child(menu_separator().h(px(1.0)).my_1().bg(tokens::border_subtle()))
-                .child(
-                    menu_item()
-                        .on_select(move || store.trash_catalog_node(node_id()))
-                        .px_3()
-                        .py_2()
-                        .rounded(tokens::radius_row())
-                        .hover(|s| s.bg(tokens::control_hover()))
-                        .child(
-                            text("移入回收站").text_size(px(13.0)).text_color(tokens::danger()),
-                        ),
-                ),
-        )
+        .child(when(
+            move || !renaming_this(),
+            move || {
+                nsh_base::button()
+                    .on_press(move || {
+                        let parent = Some(node_id());
+                        pending.set(Some(PendingCreate::Document { parent }));
+                    })
+                    .accessibility_label("新建子文档")
+                    .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
+                    .size(px(22.0))
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .text_color(tokens::fg_muted())
+                    .hover(|s| s.bg(tokens::control_hover()).text_color(tokens::accent()))
+                    .child(text("＋").text_size(px(12.0)))
+            },
+        ))
+        .child(when(
+            move || !renaming_this(),
+            move || {
+                menu()
+                    .offset(px(4.0))
+                    .popup_style(|s| {
+                        s.p_1()
+                            .rounded(tokens::radius_card())
+                            .bg(theme().popover)
+                            .shadow_md()
+                            .w(px(180.0))
+                    })
+                    .trigger(panel_icon_button("⋯", "节点菜单", || {}))
+                    .children(menu_items())
+            },
+        ));
+
+    // The right-click menu (docs/kanon.html's `nodeMenu`): the same
+    // actions at the pointer, the row its trigger; the ⋯ menu above
+    // stays as the explicit overflow path.
+    context_menu()
+        .offset(px(4.0))
+        .popup_style(|s| {
+            s.p_1()
+                .rounded(tokens::radius_card())
+                .bg(theme().popover)
+                .shadow_md()
+                .w(px(180.0))
+        })
+        .trigger(row)
+        .children(menu_items())
 }
 
 // ---------------------------------------------------------------------
 // The book-style home page
 // ---------------------------------------------------------------------
 
-/// The book-style home (docs/ui-design.md §4.4.2): a centered paper
-/// card with the big book icon, live stats, favorite and create
-/// actions, the description, and the collapsible dot-leader catalog.
-pub fn book_home(store: Store, book_id: i64) -> impl IntoElement {
+/// The book-style home (docs/ui-design.md §4.4.2, docs/kanon.html
+/// `bookHome`): a centered paper card on the subtle canvas — the big
+/// book icon, live (subtree-scoped) stats, the favorite action, the
+/// description, and the collapsible dot-leader catalog. `scope` narrows
+/// the page to a grouping node's subtree (a Project's Linked Documents
+/// sub-view); `nav` decides where documents open.
+pub fn book_home(
+    store: Store,
+    book_id: i64,
+    scope: Option<i64>,
+    nav: CatalogNav,
+) -> impl IntoElement {
     let editing = signal(None::<i64>);
+    let outline = move || {
+        let entries = store.catalog_outline(book_id);
+        match scope {
+            Some(root) => scope_to_subtree(&entries, root),
+            None => entries,
+        }
+    };
+    // Scoped stats over the same subtree the dot-leader catalog lists.
+    let stats = move || {
+        let mut documents = 0_usize;
+        let mut words = 0_usize;
+        for entry in outline() {
+            if let Some(doc_id) = entry.node.document_id
+                && let Some(doc) = store.document(doc_id)
+            {
+                documents += 1;
+                words += doc.word_count as usize;
+            }
+        }
+        (documents, words)
+    };
+    let title = move || match scope {
+        Some(root) => store
+            .catalog_node(root)
+            .map(|node| node.title)
+            .unwrap_or_default(),
+        None => store
+            .knowledge_base(book_id)
+            .map(|kb| kb.name)
+            .unwrap_or_else(|| "知识库".to_owned()),
+    };
     view().flex_1().min_h(px(0.0)).child(
-        scroll().flex_1().child(
+        // The book-page canvas (docs/kanon.html `.book-page`).
+        scroll().flex_1().bg(tokens::panel_subtle()).child(
             view()
                 .flex_col()
                 .gap_4()
                 .p_5()
-                .max_w(px(1000.0))
                 .w_full()
+                .max_w(px(1000.0))
                 .self_center()
                 .child(
+                    // The paper itself (docs/kanon.html `.book-paper`).
                     view()
-                        .flex_row()
-                        .items_center()
+                        .flex_col()
                         .gap_4()
-                        .child(
-                            text(move || {
-                                store
-                                    .knowledge_base(book_id)
-                                    .map(|kb| kb.icon)
-                                    .unwrap_or_else(|| "📕".to_owned())
-                            })
-                            .text_size(px(44.0)),
-                        )
+                        .w_full()
+                        .rounded(tokens::radius_card())
+                        .border_1()
+                        .border_color(tokens::border_subtle())
+                        .bg(move || theme().card)
+                        .p_6()
                         .child(
                             view()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .gap_1()
+                                .flex_row()
+                                .items_center()
+                                .gap_4()
                                 .child(
                                     text(move || {
                                         store
                                             .knowledge_base(book_id)
-                                            .map(|kb| kb.name)
-                                            .unwrap_or_else(|| "知识库".to_owned())
+                                            .map(|kb| kb.icon)
+                                            .unwrap_or_else(|| "📕".to_owned())
                                     })
-                                    .text_size(px(28.0))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(tokens::fg_primary()),
+                                    .text_size(px(44.0)),
                                 )
                                 .child(
-                                    text(move || {
-                                        let stats: BookStats = store.book_stats(book_id);
-                                        format!("{} 篇文档 · {} 字", stats.documents, stats.words)
-                                    })
-                                    .text_size(px(13.0))
-                                    .text_color(tokens::fg_muted()),
-                                ),
-                        )
-                        .child(
-                            nsh_base::button()
-                                .on_press(move || {
-                                    let favorited =
-                                        store.knowledge_base(book_id).is_some_and(|kb| kb.favorited);
-                                    store.set_kb_favorite(book_id, !favorited);
-                                })
-                                .accessibility_label("收藏本书")
-                                .h(px(32.0))
-                                .px_3()
-                                .items_center()
-                                .gap_1()
-                                .rounded_full()
-                                .border_1()
-                                .border_color(tokens::border_subtle())
-                                .text_color(move || {
-                                    if store.knowledge_base(book_id).is_some_and(|kb| kb.favorited) {
-                                        tokens::warning()
-                                    } else {
-                                        tokens::fg_muted()
-                                    }
-                                })
-                                .hover(|s| s.bg(tokens::control_hover()))
+                                    view()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .gap_1()
+                                        .child(
+                                            text(title)
+                                                .text_size(px(28.0))
+                                                .font_weight(FontWeight::BOLD)
+                                                .text_color(tokens::fg_primary()),
+                                        )
+                                        .child(
+                                            text(move || {
+                                                let (documents, words) = stats();
+                                                format!("{} 篇文档 · {} 字", documents, words)
+                                            })
+                                            .text_size(px(13.0))
+                                            .text_color(tokens::fg_muted()),
+                                        ),
+                                )
                                 .child(
-                                    text(move || {
-                                        if store.knowledge_base(book_id).is_some_and(|kb| kb.favorited)
-                                        {
-                                            "★ 已收藏"
-                                        } else {
-                                            "☆ 收藏"
-                                        }
-                                    })
-                                    .text_size(px(13.0)),
+                                    nsh_base::button()
+                                        .on_press(move || {
+                                            let favorited = store
+                                                .knowledge_base(book_id)
+                                                .is_some_and(|kb| kb.favorited);
+                                            store.set_kb_favorite(book_id, !favorited);
+                                        })
+                                        .accessibility_label("收藏本书")
+                                        .h(px(32.0))
+                                        .px_3()
+                                        .items_center()
+                                        .gap_1()
+                                        .rounded_full()
+                                        .border_1()
+                                        .border_color(tokens::border_subtle())
+                                        .text_color(move || {
+                                            if store
+                                                .knowledge_base(book_id)
+                                                .is_some_and(|kb| kb.favorited)
+                                            {
+                                                tokens::warning()
+                                            } else {
+                                                tokens::fg_muted()
+                                            }
+                                        })
+                                        .hover(|s| s.bg(tokens::control_hover()))
+                                        .child(
+                                            text(move || {
+                                                if store
+                                                    .knowledge_base(book_id)
+                                                    .is_some_and(|kb| kb.favorited)
+                                                {
+                                                    "★ 已收藏"
+                                                } else {
+                                                    "☆ 收藏"
+                                                }
+                                            })
+                                            .text_size(px(13.0)),
+                                        ),
                                 ),
                         )
-                        .child(
-                            app_button(ButtonKind::Positive, "＋ 新建文档", move || {
-                                if let Some(id) = store.create_document_in(book_id, None, "未命名文档") {
-                                    store.open_document(id);
-                                }
-                            }),
-                        ),
-                )
-                .child(when(
-                    move || editing.get().is_none(),
-                    move || {
-                        let has_description = store
-                            .knowledge_base(book_id)
-                            .is_some_and(|kb| !kb.description.is_empty());
-                        view()
-                            .flex_col()
-                            .gap_2()
-                            .items_start()
-                            .child(
-                                text(move || {
-                                    store
-                                        .knowledge_base(book_id)
-                                        .map(|kb| kb.description)
-                                        .filter(|desc| !desc.is_empty())
-                                        .unwrap_or_else(|| "这本知识库还没有简介。".to_owned())
-                                })
-                                .text_size(px(14.0))
-                                .text_color(move || {
-                                    if has_description {
-                                        tokens::fg_body()
-                                    } else {
-                                        tokens::fg_muted()
-                                    }
-                                }),
-                            )
-                            .child(app_button(ButtonKind::Ghost, "编辑信息", move || {
-                                editing.set(Some(book_id));
-                            }))
-                    },
-                ))
-                .child(when(move || editing.get().is_some(), move || {
-                    book_edit_form(store, book_id, editing)
-                }))
-                .child(home_catalog(store, book_id)),
+                        .child(when(
+                            move || editing.get().is_none(),
+                            move || {
+                                let has_description = store
+                                    .knowledge_base(book_id)
+                                    .is_some_and(|kb| !kb.description.is_empty());
+                                view()
+                                    .flex_col()
+                                    .gap_2()
+                                    .items_start()
+                                    .child(
+                                        text(move || {
+                                            store
+                                                .knowledge_base(book_id)
+                                                .map(|kb| kb.description)
+                                                .filter(|desc| !desc.is_empty())
+                                                .unwrap_or_else(|| {
+                                                    "这本知识库还没有简介。".to_owned()
+                                                })
+                                        })
+                                        .text_size(px(14.0))
+                                        .text_color(
+                                            move || {
+                                                if has_description {
+                                                    tokens::fg_body()
+                                                } else {
+                                                    tokens::fg_muted()
+                                                }
+                                            },
+                                        ),
+                                    )
+                                    .child(app_button(
+                                        ButtonKind::Ghost,
+                                        "编辑信息",
+                                        move || {
+                                            editing.set(Some(book_id));
+                                        },
+                                    ))
+                            },
+                        ))
+                        .child(when(
+                            move || editing.get().is_some(),
+                            move || book_edit_form(store, book_id, editing),
+                        ))
+                        .child(home_catalog(store, book_id, scope, nav)),
+                ),
         ),
     )
 }
 
-/// The dot-leader catalog preview of the book home: one row per visible
-/// node, title on the left, its update date on the right, a dotted
-/// leader running between.
-fn home_catalog(store: Store, book_id: i64) -> impl IntoElement {
-    let visible = move || visible_entries(&store.catalog_outline(book_id), "");
+/// The dot-leader catalog of the book home (docs/kanon.html
+/// `.book-line`): one row per visible node of the (scoped) subtree, the
+/// title on the left, its update date — or `分组` for a pure grouping
+/// node — on the right, a dotted leader running between. The 目录
+/// header carries the create action, like the prototype.
+fn home_catalog(
+    store: Store,
+    book_id: i64,
+    scope: Option<i64>,
+    nav: CatalogNav,
+) -> impl IntoElement {
+    let outline = move || {
+        let entries = store.catalog_outline(book_id);
+        match scope {
+            Some(root) => scope_to_subtree(&entries, root),
+            None => entries,
+        }
+    };
+    let visible = move || visible_entries(&outline(), "");
+    // A Project's Linked Documents sub-view names where its new
+    // documents land (ADR-0001); the book shell doesn't need the note.
+    let scope_hint = move || match nav {
+        CatalogNav::Project { linked_node } => {
+            store.bump.get();
+            match linked_node {
+                Some(node) => {
+                    let title = store
+                        .catalog_node(node)
+                        .map(|node| node.title)
+                        .unwrap_or_default();
+                    format!("新建文档将落在关联目录「{}」下", title)
+                }
+                None => {
+                    let book = store
+                        .knowledge_base(book_id)
+                        .map(|kb| kb.name)
+                        .unwrap_or_else(|| "知识库".to_owned());
+                    format!("新建文档将落在知识库「{}」的目录顶部", book)
+                }
+            }
+        }
+        CatalogNav::Book => String::new(),
+    };
+    let create_document = move || {
+        if let Some(id) = store.create_document_in(book_id, scope, "未命名文档") {
+            match nav {
+                CatalogNav::Book => store.open_document(id),
+                CatalogNav::Project { .. } => store.set_project_document(Some(id)),
+            }
+            let tab_id = store
+                .strip
+                .with_untracked(|strip| strip.tabs[strip.active].id);
+            store.request_edit(tab_id, id);
+        }
+    };
     view()
         .flex_col()
         .gap_1()
-        .child(section_heading("目录"))
+        .test_id("home-catalog")
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .pb_2()
+                .border_b_1()
+                .border_color(tokens::border_subtle())
+                .child(section_heading("目录"))
+                .child(match nav {
+                    // The Project sub-view keeps its own selector (the
+                    // Linked Documents creation path is covered by the
+                    // behavior tests).
+                    CatalogNav::Project { .. } => {
+                        app_button(ButtonKind::Positive, "＋ 新建文档", create_document)
+                            .test_id("project-doc-create")
+                            .into_element()
+                    }
+                    CatalogNav::Book => {
+                        app_button(ButtonKind::Positive, "＋ 新建文档", create_document)
+                            .into_element()
+                    }
+                }),
+        )
+        .child(when(
+            move || !scope_hint().is_empty(),
+            move || {
+                text(scope_hint)
+                    .text_size(px(11.0))
+                    .text_color(tokens::fg_muted())
+                    .px_1()
+            },
+        ))
         .child(when(
             move || visible().is_empty(),
             move || empty_state("这本书还没有目录", "点击上方「＋ 新建文档」开始"),
@@ -1332,14 +2086,25 @@ fn home_catalog(store: Store, book_id: i64) -> impl IntoElement {
                 let depth = move || entry.with(|entry| entry.depth);
                 let is_document = move || entry.with(|entry| entry.node.document_id.is_some());
                 let updated = move || {
-                    entry
-                        .with(|entry| entry.node.updated_at.split(' ').next().unwrap_or("").to_owned())
+                    entry.with(|entry| {
+                        if entry.node.document_id.is_some() {
+                            entry
+                                .node
+                                .updated_at
+                                .split(' ')
+                                .next()
+                                .unwrap_or("")
+                                .to_owned()
+                        } else {
+                            "分组".to_owned()
+                        }
+                    })
                 };
                 view()
                     .flex_row()
                     .items_end()
                     .gap_2()
-                    .pl(move || px(depth() as f32 * 16.0))
+                    .pl(move || px(depth() as f32 * 15.0))
                     .py(px(4.0))
                     .child(
                         nsh_base::button()
@@ -1348,25 +2113,39 @@ fn home_catalog(store: Store, book_id: i64) -> impl IntoElement {
                                     (entry.node.document_id, entry.node.id, entry.node.expanded)
                                 });
                                 if let Some(doc_id) = doc {
-                                    store.open_document(doc_id);
+                                    match nav {
+                                        CatalogNav::Book => store.open_document(doc_id),
+                                        CatalogNav::Project { .. } => {
+                                            store.set_project_document(Some(doc_id))
+                                        }
+                                    }
                                 } else {
                                     store.set_node_expanded(id, !was_expanded);
                                 }
                             })
                             .accessibility_label(move || Some(title().into()))
                             .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
-                            .items_end()
+                            .flex_row()
+                            .items_center()
+                            .justify_start()
                             .gap_2()
                             .flex_1()
                             .min_w(px(0.0))
                             .child(
-                                text(move || if is_document() { "📄".to_owned() } else { "📁".to_owned() })
-                                    .text_size(px(13.0)),
+                                text(move || {
+                                    if is_document() {
+                                        "📄".to_owned()
+                                    } else {
+                                        "📁".to_owned()
+                                    }
+                                })
+                                .text_size(px(13.0)),
                             )
                             .child(
                                 text(title)
                                     .text_size(px(14.0))
                                     .text_color(tokens::fg_primary())
+                                    .min_w(px(0.0))
                                     .number_of_lines(1),
                             )
                             .child(
@@ -1375,18 +2154,26 @@ fn home_catalog(store: Store, book_id: i64) -> impl IntoElement {
                                     .min_w(px(12.0))
                                     .border_b_1()
                                     .border_dotted()
-                                    .border_color(tokens::border_default())
-                                    .mb(px(4.0)),
+                                    .border_color(tokens::border_default()),
                             )
                             .child(
-                                text(updated).text_size(px(11.0)).text_color(tokens::fg_muted()),
+                                text(updated)
+                                    .text_size(px(11.0))
+                                    .flex_none()
+                                    .text_color(tokens::fg_muted()),
                             ),
                     )
                     .child(when(
                         move || !is_document(),
                         move || {
                             panel_icon_button(
-                                move || if entry.with(|entry| entry.node.expanded) { "▾" } else { "▸" },
+                                move || {
+                                    if entry.with(|entry| entry.node.expanded) {
+                                        "▾"
+                                    } else {
+                                        "▸"
+                                    }
+                                },
                                 "切换展开",
                                 move || {
                                     let (id, was_expanded) =
@@ -1410,6 +2197,44 @@ pub fn document_view(store: Store, tab_id: u64, doc_id: i64) -> impl IntoElement
     crate::document::document_view(store, tab_id, doc_id)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrashPurge {
+    Book(i64),
+    Project(i64),
+    Task(i64),
+    Note(i64),
+    Node(i64),
+}
+
+impl TrashPurge {
+    fn warning(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Book(_) => ("彻底删除知识库？", "知识库及其中的目录和文档将无法恢复。"),
+            Self::Project(_) => (
+                "彻底删除项目？",
+                "项目无法恢复。任务将解除归属，知识库和文档不受影响。",
+            ),
+            Self::Task(_) => (
+                "彻底删除任务？",
+                "任务无法恢复；文档中的关联任务卡片将失效。",
+            ),
+            Self::Note(_) => ("彻底删除小记？", "删除后无法恢复。"),
+            Self::Node(_) => ("彻底删除目录？", "该目录、下级目录及其文档将无法恢复。"),
+        }
+    }
+
+    fn confirm(self, store: Store) -> bool {
+        match self {
+            Self::Book(id) => store.delete_knowledge_base_permanent(id),
+            Self::Project(id) => store.delete_project_permanent(id),
+            Self::Task(id) => store.delete_task_permanent(id),
+            Self::Note(id) => return store.delete_quick_note_permanent(id),
+            Self::Node(id) => store.delete_catalog_node_permanent(id),
+        }
+        true
+    }
+}
+
 /// The Trash screen: trashed Knowledge Bases, Projects and catalog node
 /// subtrees, each with restore and permanent-delete actions. Permanent
 /// deletion applies the ADR-0001 scope rules: a Project's Tasks are
@@ -1420,8 +2245,14 @@ pub fn trash_view(store: Store) -> impl IntoElement {
     let projects = move || store.trashed_projects();
     let nodes = move || store.trashed_catalog_nodes_all();
     let task_rows = move || store.trashed_tasks();
+    let notes = computed(move || store.trashed_quick_notes());
+    let purge = signal(None::<TrashPurge>);
     let empty = move || {
-        books().is_empty() && projects().is_empty() && nodes().is_empty() && task_rows().is_empty()
+        books().is_empty()
+            && projects().is_empty()
+            && nodes().is_empty()
+            && task_rows().is_empty()
+            && notes.with(Vec::is_empty)
     };
     view().flex_1().min_h(px(0.0)).child(
         scroll().flex_1().child(
@@ -1434,14 +2265,16 @@ pub fn trash_view(store: Store) -> impl IntoElement {
                 .self_center()
                 .child(
                     text("回收站")
-                        .text_size(px(24.0))
+                        .text_size(px(28.0))
                         .font_weight(FontWeight::BOLD)
                         .text_color(tokens::fg_primary()),
                 )
-                .child(when(
-                    empty,
-                    move || empty_state("回收站是空的", "移入回收站的知识库、项目、目录和任务会在这里出现"),
-                ))
+                .child(when(empty, move || {
+                    empty_state(
+                        "回收站是空的",
+                        "移入回收站的知识库、项目、目录、任务和小记会在这里出现",
+                    )
+                }))
                 .child(when(
                     move || !books().is_empty(),
                     move || {
@@ -1474,15 +2307,23 @@ pub fn trash_view(store: Store) -> impl IntoElement {
                                                         .number_of_lines(1),
                                                 )
                                                 .child(
-                                                    app_button(ButtonKind::Soft, "恢复", move || {
-                                                        store.restore_knowledge_base(id);
-                                                    })
+                                                    app_button(
+                                                        ButtonKind::Soft,
+                                                        "恢复",
+                                                        move || {
+                                                            store.restore_knowledge_base(id);
+                                                        },
+                                                    )
                                                     .test_id(&format!("kb-restore-{id}")),
                                                 )
                                                 .child(
-                                                    app_button(ButtonKind::Danger, "彻底删除", move || {
-                                                        store.delete_knowledge_base_permanent(id);
-                                                    })
+                                                    app_button(
+                                                        ButtonKind::Danger,
+                                                        "彻底删除",
+                                                        move || {
+                                                            purge.set(Some(TrashPurge::Book(id)))
+                                                        },
+                                                    )
                                                     .test_id(&format!("kb-delete-{id}")),
                                                 )
                                                 .into_element()
@@ -1530,15 +2371,23 @@ pub fn trash_view(store: Store) -> impl IntoElement {
                                                         .number_of_lines(1),
                                                 )
                                                 .child(
-                                                    app_button(ButtonKind::Soft, "恢复", move || {
-                                                        store.restore_project(id);
-                                                    })
+                                                    app_button(
+                                                        ButtonKind::Soft,
+                                                        "恢复",
+                                                        move || {
+                                                            store.restore_project(id);
+                                                        },
+                                                    )
                                                     .test_id(&format!("project-restore-{id}")),
                                                 )
                                                 .child(
-                                                    app_button(ButtonKind::Danger, "彻底删除", move || {
-                                                        store.delete_project_permanent(id);
-                                                    })
+                                                    app_button(
+                                                        ButtonKind::Danger,
+                                                        "彻底删除",
+                                                        move || {
+                                                            purge.set(Some(TrashPurge::Project(id)))
+                                                        },
+                                                    )
                                                     .test_id(&format!("project-delete-{id}")),
                                                 )
                                                 .into_element()
@@ -1584,15 +2433,23 @@ pub fn trash_view(store: Store) -> impl IntoElement {
                                                         .number_of_lines(1),
                                                 )
                                                 .child(
-                                                    app_button(ButtonKind::Soft, "恢复", move || {
-                                                        store.restore_task(id);
-                                                    })
+                                                    app_button(
+                                                        ButtonKind::Soft,
+                                                        "恢复",
+                                                        move || {
+                                                            store.restore_task(id);
+                                                        },
+                                                    )
                                                     .test_id(&format!("task-restore-{id}")),
                                                 )
                                                 .child(
-                                                    app_button(ButtonKind::Danger, "彻底删除", move || {
-                                                        store.delete_task_permanent(id);
-                                                    })
+                                                    app_button(
+                                                        ButtonKind::Danger,
+                                                        "彻底删除",
+                                                        move || {
+                                                            purge.set(Some(TrashPurge::Task(id)))
+                                                        },
+                                                    )
                                                     .test_id(&format!("task-delete-{id}")),
                                                 )
                                                 .into_element()
@@ -1603,6 +2460,61 @@ pub fn trash_view(store: Store) -> impl IntoElement {
                     },
                 ))
                 .child(when(
+                    move || !notes.with(Vec::is_empty),
+                    move || {
+                        view()
+                            .flex_col()
+                            .gap_2()
+                            .child(section_heading("小记"))
+                            .child(each(
+                                notes,
+                                |note| note.id,
+                                move |note, _| {
+                                    let id = note.with(|note| note.id);
+                                    view()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_3()
+                                        .px_3()
+                                        .py_2()
+                                        .rounded(tokens::radius_row())
+                                        .border_1()
+                                        .border_color(tokens::border_subtle)
+                                        .child(
+                                            text(move || {
+                                                note.with(|note| {
+                                                    note.content
+                                                        .lines()
+                                                        .next()
+                                                        .unwrap_or_default()
+                                                        .to_owned()
+                                                })
+                                            })
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .number_of_lines(1)
+                                            .text_sm()
+                                            .text_color(tokens::fg_primary),
+                                        )
+                                        .child(
+                                            app_button(ButtonKind::Soft, "恢复", move || {
+                                                store.restore_quick_note(id)
+                                            })
+                                            .test_id(&format!("note-restore-{id}")),
+                                        )
+                                        .child(
+                                            app_button(
+                                                ButtonKind::Danger,
+                                                "彻底删除",
+                                                move || purge.set(Some(TrashPurge::Note(id))),
+                                            )
+                                            .test_id(&format!("note-delete-{id}")),
+                                        )
+                                },
+                            ))
+                    },
+                ))
+                .child(when(
                     move || !nodes().is_empty(),
                     move || {
                         view()
@@ -1610,9 +2522,11 @@ pub fn trash_view(store: Store) -> impl IntoElement {
                             .gap_2()
                             .child(section_heading("目录"))
                             .child(
-                                text("彻底删除目录会同时删除其子树与文档；绑定它的项目将解除绑定。")
-                                    .text_size(px(11.0))
-                                    .text_color(tokens::fg_muted()),
+                                text(
+                                    "彻底删除目录会同时删除其子树与文档；绑定它的项目将解除绑定。",
+                                )
+                                .text_size(px(11.0))
+                                .text_color(tokens::fg_muted()),
                             )
                             .child(dynamic(move || {
                                 view().flex_col().gap_2().children(
@@ -1630,8 +2544,12 @@ pub fn trash_view(store: Store) -> impl IntoElement {
                                                 .border_1()
                                                 .border_color(tokens::border_subtle())
                                                 .child(
-                                                    text(if node.document_id.is_some() { "📄" } else { "📁" })
-                                                        .text_size(px(18.0)),
+                                                    text(if node.document_id.is_some() {
+                                                        "📄"
+                                                    } else {
+                                                        "📁"
+                                                    })
+                                                    .text_size(px(18.0)),
                                                 )
                                                 .child(
                                                     text(node.title.clone())
@@ -1641,15 +2559,23 @@ pub fn trash_view(store: Store) -> impl IntoElement {
                                                         .number_of_lines(1),
                                                 )
                                                 .child(
-                                                    app_button(ButtonKind::Soft, "恢复", move || {
-                                                        store.restore_catalog_node(id);
-                                                    })
+                                                    app_button(
+                                                        ButtonKind::Soft,
+                                                        "恢复",
+                                                        move || {
+                                                            store.restore_catalog_node(id);
+                                                        },
+                                                    )
                                                     .test_id(&format!("node-restore-{id}")),
                                                 )
                                                 .child(
-                                                    app_button(ButtonKind::Danger, "彻底删除", move || {
-                                                        store.delete_catalog_node_permanent(id);
-                                                    })
+                                                    app_button(
+                                                        ButtonKind::Danger,
+                                                        "彻底删除",
+                                                        move || {
+                                                            purge.set(Some(TrashPurge::Node(id)))
+                                                        },
+                                                    )
                                                     .test_id(&format!("node-delete-{id}")),
                                                 )
                                                 .into_element()
@@ -1658,7 +2584,51 @@ pub fn trash_view(store: Store) -> impl IntoElement {
                                 )
                             }))
                     },
-                )),
+                ))
+                .child(dynamic(move || {
+                    purge.get().map(|target| {
+                        let (title, warning) = target.warning();
+                        nsh_base::dialog()
+                            .label(title)
+                            .on_cancel(move || purge.set(None))
+                            .flex_1()
+                            .p_4()
+                            .items_center()
+                            .justify_center()
+                            .bg(tokens::overlay)
+                            .child(
+                                view()
+                                    .w_full()
+                                    .max_w(px(420.0))
+                                    .gap_3()
+                                    .p_5()
+                                    .rounded(tokens::radius_card())
+                                    .bg(tokens::panel_raised)
+                                    .child(section_heading(title))
+                                    .child(text(warning).text_sm().text_color(tokens::fg_muted))
+                                    .child(
+                                        view()
+                                            .flex_row()
+                                            .justify_end()
+                                            .gap_2()
+                                            .child(app_button(
+                                                ButtonKind::Ghost,
+                                                "取消",
+                                                move || purge.set(None),
+                                            ))
+                                            .child(app_button(
+                                                ButtonKind::Danger,
+                                                "确认删除",
+                                                move || {
+                                                    if target.confirm(store) {
+                                                        purge.set(None);
+                                                    }
+                                                },
+                                            )),
+                                    ),
+                            )
+                    })
+                })),
         ),
     )
 }
@@ -1707,4 +2677,25 @@ fn ancestor_ids(entries: &[CatalogEntry], target: i64) -> Vec<i64> {
         }
     }
     ancestors
+}
+
+/// The subtree under `root` with depths re-based to the root's
+/// children: a Project's Linked Documents sub-view and the scoped book
+/// home list from the root's children downward, like the prototype's
+/// `tree(book, root)` (docs/kanon.html).
+fn scope_to_subtree(entries: &[CatalogEntry], root: i64) -> Vec<CatalogEntry> {
+    let Some(pos) = entries.iter().position(|entry| entry.node.id == root) else {
+        return Vec::new();
+    };
+    let base = entries[pos].depth;
+    let mut scoped = Vec::new();
+    for entry in &entries[pos + 1..] {
+        if entry.depth <= base {
+            break;
+        }
+        let mut entry = entry.clone();
+        entry.depth -= base + 1;
+        scoped.push(entry);
+    }
+    scoped
 }

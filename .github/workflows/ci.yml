@@ -11,7 +11,7 @@ permissions:
 
 env:
   # Pinned to the `nsh-*` crate versions in Cargo.toml; keep in sync on upgrades.
-  NSH_VERSION: v0.6.0
+  NSH_VERSION: v0.6.1
 
 jobs:
   macos:
@@ -34,7 +34,7 @@ jobs:
       - name: Install NSH CLI (${{ env.NSH_VERSION }})
         run: |
           set -o pipefail
-          curl -fsSL https://nsh.dev/install.sh | sh
+          curl -fsSL "https://github.com/longbridge/nsh/releases/download/$NSH_VERSION/install.sh" | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Verify tool versions
@@ -42,6 +42,10 @@ jobs:
           rustc --version
           cargo --version
           nsh --version
+          case "$(nsh --version)" in
+            "nsh ${NSH_VERSION#v} "*) ;;
+            *) echo "Expected NSH $NSH_VERSION" >&2; exit 1 ;;
+          esac
 
       - name: cargo check --all-targets
         run: cargo check --all-targets
@@ -77,7 +81,7 @@ jobs:
       - name: Install NSH CLI (${{ env.NSH_VERSION }})
         shell: pwsh
         run: |
-          irm https://nsh.dev/install.ps1 | iex
+          irm "https://github.com/longbridge/nsh/releases/download/$env:NSH_VERSION/install.ps1" | iex
           Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $env:LOCALAPPDATA 'nsh\bin')
 
       - name: Verify tool versions
@@ -86,6 +90,9 @@ jobs:
           rustc --version
           cargo --version
           nsh --version
+          if ((nsh --version) -notlike "nsh $($env:NSH_VERSION.TrimStart('v')) *") {
+            throw "Expected NSH $env:NSH_VERSION"
+          }
 
       - name: cargo check --all-targets
         run: cargo check --all-targets

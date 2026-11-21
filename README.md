@@ -1,6 +1,6 @@
 # kanon
 
-Kanon is a pure-Rust Native Shell 0.6.0 app for Windows and macOS. `nsh.json` points to the Rust root, `App` in `src/lib.rs`.
+Kanon is a pure-Rust [Native Shell 0.6.1](https://github.com/longbridge/nsh/releases/tag/v0.6.1) app for Windows and macOS. `nsh.json` points to the Rust root, `App` in `src/lib.rs`.
 
 ```sh
 nsh run                      # native backend on Windows or macOS
@@ -20,6 +20,12 @@ This starts the root directly on Win32 or AppKit.
 
 The `nsh` commands build the app's runners from the NSH crates `Cargo.toml` depends on: crates.io's at the version of
 the `nsh` you run (keep the `nsh-*` dependencies at that version when you upgrade `nsh`), or an NSH checkout's by path.
+
+The native backends opt in to `svg` for the window and navigation icons; their strokes use `currentColor` from the app theme. Keep the system caption controls and use the NSH title-bar insets instead of drawing replacement controls.
+
+The application icon source is `assets/kanon.svg`. NSH packages `assets/kanon.png` for both desktops; the direct Windows launcher uses the multi-resolution `assets/kanon.ico`.
+
+Use **设置 → 数据与备份 → 导出备份** to save a complete SQLite snapshot to a new file. **恢复到新副本** opens a separate Kanon window backed by a new file; it never replaces the active workspace or modifies the snapshot. For command-line recovery, launch with `KANON_WORKSPACE_PATH` set to a copy of the snapshot. Keep the original backup separately.
 
 NSH-generated files stay in `.nsh/`: runner sources in `.nsh/rust/` and default packages in `.nsh/out/`.
 Cargo keeps its normal `target/` directory and respects your existing `CARGO_TARGET_DIR`.

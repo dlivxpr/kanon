@@ -89,7 +89,7 @@ impl NodeView for KanonMentionView {
             })
             .child(
                 text(chip_label)
-                    .text_size(px(13.0))
+                    .text_size(tokens::text_px(13.0))
                     .text_color(move || if fg_live() { tokens::info() } else { tokens::fg_muted() }),
             )
             .into_element()

@@ -9,20 +9,23 @@ use std::sync::Arc;
 use nsh_base::{
     rich_editor::{
         model::Node,
-        view::{rich_editor, EditorSession, NodeView, NodeViewCx, NodeViews},
+        view::{EditorSession, NodeView, NodeViewCx, NodeViews},
     },
     theme,
 };
 use nsh_core::prelude::*;
 use serde_json::Value;
 
-use crate::shell::store::EditOutcome;
 use crate::shell::Store;
+use crate::shell::store::{EditOutcome, PREF_OUTLINE, PREF_WORD_COUNT};
+use crate::ui::chrome::{Icon, chrome_button};
 use crate::ui::controls::{
-    app_button, app_button_with, empty_state, panel_icon_button, ButtonKind,
+    ButtonKind, app_button, app_button_with, empty_state, panel_icon_button,
 };
+use crate::ui::editor as editor_ui;
 use crate::ui::theme as tokens;
 
+use super::export::{document_overflow_menu, reading_dialog};
 use super::task_card::TaskCardView;
 use super::{CARD_NODE, build_session, doc_markdown, reveal_heading};
 
@@ -43,6 +46,12 @@ pub fn reading_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
     );
     let epoch = signal(0_u64);
     let history_open = signal(false);
+    // Failed document actions report under the reading header. Cancel is silent.
+    let export_notice = signal(None::<String>);
+    let dialog = signal(None);
+    // The export task binds to the reading view's owner, not the menu
+    // popup's, so the dialog outlives the popup (export.rs).
+    let export_owner = Owner::current();
     // The session the dynamic below last built, for outline jumps and
     // checklist toggles.
     let current: Signal<Option<EditorSession>> = signal(None);
@@ -74,7 +83,16 @@ pub fn reading_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
         .min_h(px(0.0))
         .flex_col()
         .child(lock_banner(store, tab_id, document_id))
-        .child(reading_header(store, tab_id, document_id, history_open))
+        .child(export_notice_banner(export_notice))
+        .child(reading_header(
+            store,
+            tab_id,
+            document_id,
+            history_open,
+            export_notice,
+            dialog,
+            export_owner,
+        ))
         .child(
             view()
                 .flex_1()
@@ -90,11 +108,58 @@ pub fn reading_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
                         .justify_center()
                         .child(
                             view()
-                                .w(px(780.0))
-                                .max_w(px(780.0))
+                                .test_id("document-paper")
+                                .w_full()
+                                .max_w(px(860.0))
+                                .style_when(
+                                    move || super::wide_paper(store),
+                                    |s| s.max_w(px(1120.0)),
+                                )
                                 .flex_1()
                                 .min_h(px(0.0))
                                 .py_6()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    // The paper's title (docs/kanon.html
+                                    // `.paper > h1`).
+                                    text(move || {
+                                        store.bump.get();
+                                        store
+                                            .document(document_id)
+                                            .map(|doc| doc.title)
+                                            .unwrap_or_default()
+                                    })
+                                    .text_size(tokens::text_px(editor_ui::PAPER_TITLE_SIZE))
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(tokens::fg_primary()),
+                                )
+                                .child(
+                                    // Its meta line: owning book and the
+                                    // last-update date (`.doc-meta`).
+                                    text(move || {
+                                        store.bump.get();
+                                        let book = store
+                                            .document(document_id)
+                                            .and_then(|doc| store.knowledge_base(doc.book_id))
+                                            .map(|book| book.name)
+                                            .unwrap_or_else(|| "知识库".to_owned());
+                                        let updated = store
+                                            .document(document_id)
+                                            .map(|doc| {
+                                                doc.updated_at
+                                                    .split(' ')
+                                                    .next()
+                                                    .unwrap_or("")
+                                                    .to_owned()
+                                            })
+                                            .unwrap_or_default();
+                                        format!("{} · {} 更新", book, updated)
+                                    })
+                                    .text_size(tokens::text_px(11.0))
+                                    .text_color(tokens::fg_muted())
+                                    .mb_3(),
+                                )
                                 .child(dynamic(move || {
                                     epoch.get();
                                     // `shown_body` is the committed body
@@ -106,16 +171,21 @@ pub fn reading_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
                                     let session = build_session(
                                         &body,
                                         NodeViews::new()
-                                            .with("taskItem", Arc::new(ReadingTaskItem { store, document_id }))
+                                            .with(
+                                                "taskItem",
+                                                Arc::new(ReadingTaskItem { store, document_id }),
+                                            )
                                             .with(CARD_NODE, Arc::new(TaskCardView { store }))
                                             .with(
                                                 super::kanon::MENTION_NODE,
-                                                Arc::new(super::mention::KanonMentionView { store }),
+                                                Arc::new(super::mention::KanonMentionView {
+                                                    store,
+                                                }),
                                             ),
                                     );
                                     current.set(Some(session.clone()));
                                     let change_session = session.clone();
-                                    rich_editor()
+                                    editor_ui::paper_body()
                                         .key(format!("reading-{document_id}-{}", epoch.get()))
                                         .editor(session)
                                         .editable(false)
@@ -129,11 +199,26 @@ pub fn reading_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
                                             shown_body.set(body.clone());
                                             store.toggle_reading_checklist(document_id, &body);
                                         })
-                                        .text_color(tokens::fg_body())
                                         .into_element()
-                                })),
+                                }))
+                                .child(when(
+                                    move || store.preference_enabled(PREF_WORD_COUNT),
+                                    move || {
+                                        text(move || {
+                                            store.bump.get();
+                                            store
+                                                .document(document_id)
+                                                .map(|doc| format!("{} 字", doc.word_count))
+                                                .unwrap_or_default()
+                                        })
+                                        .text_size(tokens::text_px(11.0))
+                                        .text_color(tokens::fg_muted())
+                                        .pt_2()
+                                    },
+                                )),
                         ),
                 )
+                .child(outline_rail(store, tab_id, current))
                 .child(super::history::history_panel(
                     store,
                     document_id,
@@ -141,7 +226,13 @@ pub fn reading_view(store: Store, tab_id: u64, document_id: i64) -> impl IntoEle
                     history_open,
                 )),
         )
-        .child(word_count_bar(store, document_id))
+        .child(reading_dialog(
+            store,
+            document_id,
+            export_notice,
+            dialog,
+            export_owner,
+        ))
         .into_element()
 }
 
@@ -167,7 +258,7 @@ fn lock_banner(store: Store, tab_id: u64, document_id: i64) -> impl IntoElement 
             .bg(tokens::info_soft())
             .child(
                 text("此文档正在其他标签页编辑 · 清单项已锁定")
-                    .text_size(px(12.0))
+                    .text_size(tokens::text_px(12.0))
                     .text_color(tokens::info()),
             )
             .child(
@@ -186,11 +277,37 @@ fn lock_banner(store: Store, tab_id: u64, document_id: i64) -> impl IntoElement 
     })
 }
 
+/// The transient 导出 Markdown outcome: a save dialog that could not
+/// show, or a write that failed, explains itself here for a few seconds
+/// (export.rs sets and clears it); Cancel never reaches it.
+fn export_notice_banner(notice: Signal<Option<String>>) -> impl IntoElement {
+    when(
+        move || notice.get().is_some(),
+        move || {
+            view()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .px_4()
+                .py_2()
+                .bg(tokens::warning_soft())
+                .child(
+                    text(move || notice.get().unwrap_or_default())
+                        .text_size(tokens::text_px(12.0))
+                        .text_color(tokens::danger()),
+                )
+        },
+    )
+}
+
 fn reading_header(
     store: Store,
     tab_id: u64,
     document_id: i64,
     history_open: Signal<bool>,
+    export_notice: Signal<Option<String>>,
+    dialog: Signal<Option<super::export::ReadingDialog>>,
+    export_owner: Owner,
 ) -> impl IntoElement {
     let crumb = move || {
         store.bump.get();
@@ -208,6 +325,7 @@ fn reading_header(
             .map(|doc| doc.title)
             .unwrap_or_default()
     };
+    let favorite = move || store.document_is_favorite(document_id);
     view()
         .flex_row()
         .items_center()
@@ -218,12 +336,12 @@ fn reading_header(
         .border_color(tokens::border_subtle())
         .child(
             text(crumb)
-                .text_size(px(12.0))
+                .text_size(tokens::text_px(12.0))
                 .text_color(tokens::fg_muted()),
         )
         .child(
             text(title)
-                .text_size(px(14.0))
+                .text_size(tokens::text_px(14.0))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(tokens::fg_primary())
                 .flex_1()
@@ -237,6 +355,27 @@ fn reading_header(
             },
         ))
         .child(super::history::history_button(history_open))
+        .child(
+            chrome_button(
+                || Icon::Star,
+                move || {
+                    if favorite() {
+                        "取消收藏文档"
+                    } else {
+                        "收藏文档"
+                    }
+                    .into()
+                },
+                true,
+            )
+            .selected(favorite)
+            .selected_style(|s| s.text_color(tokens::warning))
+            .on_press(move || store.set_document_favorite(document_id, !favorite())),
+        )
+        .child(
+            // Templates, Markdown export and Trash share this overflow menu.
+            document_overflow_menu(store, document_id, export_notice, dialog, export_owner),
+        )
         .child(
             app_button_with(
                 ButtonKind::Primary,
@@ -256,26 +395,122 @@ fn request_edit(store: Store, tab_id: u64, document_id: i64) {
     }
 }
 
-fn word_count_bar(store: Store, document_id: i64) -> impl IntoElement {
-    let counter = move || {
-        store.bump.get();
-        store
-            .document(document_id)
-            .map(|doc| format!("{} 字", doc.word_count))
-            .unwrap_or_default()
+/// The floating outline rail of the reading canvas (docs/kanon.html
+/// `.outline-wrap`, docs/ui-design.md §4.4.3): while the right context
+/// panel is closed, a slim handle on the paper's right edge expands the
+/// heading outline; a click jumps to the heading through the same
+/// single-editor outline channel the context panel uses.
+fn outline_rail(
+    store: Store,
+    tab_id: u64,
+    current: Signal<Option<EditorSession>>,
+) -> impl IntoElement {
+    let open = signal(false);
+    let headings = move || {
+        // The session the reading tab last built: tracked, so the list
+        // refreshes whenever the committed body rebuilds it.
+        let Some(session) = current.get() else {
+            return Vec::new();
+        };
+        let state = session.state();
+        let doc = state.doc();
+        let mut items = Vec::new();
+        let mut ordinal = 0_usize;
+        for child in doc.content().iter() {
+            if child.ty().name() == "heading" {
+                let level = child
+                    .attrs()
+                    .get("level")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1);
+                let text = child.text_content();
+                if !text.trim().is_empty() {
+                    items.push((ordinal, level, text));
+                }
+                ordinal += 1;
+            }
+        }
+        items
     };
-    view()
-        .flex_row()
-        .items_center()
-        .px_4()
-        .py_2()
-        .border_t_1()
-        .border_color(tokens::border_subtle())
-        .child(
-            text(counter)
-                .text_size(px(11.0))
-                .text_color(tokens::fg_muted()),
-        )
+    let headings_empty = headings;
+    when(
+        move || !store.panel_visible() && store.preference_enabled(PREF_OUTLINE),
+        move || {
+            view()
+                .w(px(24.0))
+                .flex_none()
+                .relative()
+                .flex_col()
+                .items_center()
+                .gap_2()
+                .pt_6()
+                .child(panel_icon_button("☰", "文档大纲", move || {
+                    open.update(|value| *value = !*value)
+                }))
+                .child(when(
+                    move || open.get(),
+                    move || {
+                        view()
+                            .absolute()
+                            .top(px(34.0))
+                            .right(px(28.0))
+                            .w(px(220.0))
+                            .flex_col()
+                            .gap_1()
+                            .rounded(tokens::radius_card())
+                            .border_1()
+                            .border_color(tokens::border_subtle())
+                            .bg(move || theme().card)
+                            .shadow_md()
+                            .p_2()
+                            .child(each(
+                                headings,
+                                |item: &(usize, u64, String)| item.0,
+                                move |item, _index| {
+                                    let jump = store;
+                                    nsh_base::button()
+                                        .on_press(move || {
+                                            open.set(false);
+                                            jump.request_outline_jump(
+                                                tab_id,
+                                                item.with(|item| item.0),
+                                            );
+                                        })
+                                        .accessibility_label(move || {
+                                            Some(item.with(|item| item.2.clone()).into())
+                                        })
+                                        .w_full()
+                                        .items_center()
+                                        .px_2()
+                                        .py(px(3.0))
+                                        .rounded(tokens::radius_row())
+                                        .hover(|s| s.bg(tokens::control_hover()))
+                                        .child(
+                                            text(move || item.with(|item| item.2.clone()))
+                                                .text_size(tokens::text_px(12.0))
+                                                .text_color(tokens::fg_body())
+                                                .number_of_lines(1)
+                                                .pl(move || {
+                                                    px(item.with(|item| item.1) as f32 * 8.0)
+                                                }),
+                                        )
+                                        .into_element()
+                                },
+                            ))
+                            .child(when(
+                                move || headings_empty().is_empty(),
+                                || {
+                                    text("添加标题后会显示大纲。")
+                                        .text_size(tokens::text_px(12.0))
+                                        .text_color(tokens::fg_muted())
+                                        .px_2()
+                                        .py_1()
+                                },
+                            ))
+                    },
+                ))
+        },
+    )
 }
 
 // ---------------------------------------------------------------------
@@ -345,7 +580,7 @@ impl NodeView for ReadingTaskItem {
                     .indicator_style(|s| s.size(px(12.0)).items_center().justify_center())
                     .indicator(
                         text(move || if checked() { "✓" } else { "" })
-                            .text_size(px(10.0))
+                            .text_size(tokens::text_px(10.0))
                             .text_color(move || theme().primary_foreground),
                     )
                     .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent())),

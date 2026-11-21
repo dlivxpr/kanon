@@ -9,17 +9,16 @@
 
 use nsh_base::{menu, menu_item, menu_separator, theme};
 use nsh_core::prelude::*;
+use nsh_core::{TouchEvent, TouchPhase};
 
-use crate::domain::{
-    LocalDate, Priority, ProjectBinding, ProjectPatch, TaskAggregate, TaskStatus,
-};
+use crate::domain::{LocalDate, Priority, ProjectBinding, ProjectPatch, TaskAggregate, TaskStatus};
 use crate::kb::{self, CatalogFocus, CatalogNav};
 use crate::shell::store::Store;
 use crate::shell::tabs::ProjectSection;
 use crate::shell::task_row::task_row;
 use crate::ui::controls::{
-    app_button, app_button_with, empty_state, input_field, panel_icon_button, section_heading,
-    submit_field, ButtonKind,
+    ButtonKind, app_button, app_button_with, empty_state, input_field, panel_icon_button,
+    section_heading, submit_field,
 };
 use crate::ui::theme as tokens;
 
@@ -29,7 +28,14 @@ const NARROW_BREAKPOINT: f32 = 960.0;
 
 /// The preset Project colors (user-selected data colors, like the book
 /// color).
-const COLORS: &[&str] = &["#547093", "#80ad8d", "#c9a168", "#d9977f", "#9a8fb8", "#c17070"];
+const COLORS: &[(&str, &str)] = &[
+    ("#547093", "岩蓝"),
+    ("#80ad8d", "苔绿"),
+    ("#c9a168", "砂金"),
+    ("#d9977f", "陶粉"),
+    ("#9a8fb8", "雾紫"),
+    ("#c17070", "砖红"),
+];
 /// The preset Project emojis.
 const EMOJIS: &[&str] = &["📌", "🚀", "🎯", "🛠", "🌱", "📦"];
 
@@ -48,9 +54,14 @@ pub fn project_view(store: Store, tab_id: u64, project_id: i64) -> impl IntoElem
         .child(when(
             move || store.project(project_id).is_none(),
             move || {
-                view().flex_1().items_center().justify_center().child(
-                    empty_state("项目不存在", "它可能已被彻底删除；任务与知识库内容不受项目删除影响。"),
-                )
+                view()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .child(empty_state(
+                        "项目不存在",
+                        "它可能已被彻底删除；任务与知识库内容不受项目删除影响。",
+                    ))
             },
         ))
         .child(when(
@@ -62,19 +73,16 @@ pub fn project_view(store: Store, tab_id: u64, project_id: i64) -> impl IntoElem
                     .flex_col()
                     .child(project_header(store, project_id))
                     .child(sub_view_switch(store, move || section.get()))
-                    .child(
-                        view()
-                            .flex_1()
-                            .min_h(px(0.0))
-                            .child(dynamic(move || match section.get() {
-                                ProjectSection::Overview => overview(store, project_id).into_element(),
-                                ProjectSection::Tasks => task_list(store, project_id).into_element(),
-                                ProjectSection::Board => board(store, project_id).into_element(),
-                                ProjectSection::Documents => {
-                                    documents(store, tab_id, project_id).into_element()
-                                }
-                            })),
-                    )
+                    .child(view().flex_1().min_h(px(0.0)).child(dynamic(
+                        move || match section.get() {
+                            ProjectSection::Overview => overview(store, project_id).into_element(),
+                            ProjectSection::Tasks => task_list(store, project_id).into_element(),
+                            ProjectSection::Board => board(store, project_id).into_element(),
+                            ProjectSection::Documents => {
+                                documents(store, tab_id, project_id).into_element()
+                            }
+                        },
+                    )))
             },
         ))
 }
@@ -82,10 +90,14 @@ pub fn project_view(store: Store, tab_id: u64, project_id: i64) -> impl IntoElem
 /// The header: emoji, name, description, the live progress bar, the
 /// linked scope chip, and the project menu (edit / rebind / trash).
 fn project_header(store: Store, project_id: i64) -> impl IntoElement {
+    let favorite = computed(move || store.project_is_favorite(project_id));
     let tasks = move || store.project_tasks(project_id);
     let progress = move || {
         let tasks = tasks();
-        let done = tasks.iter().filter(|a| a.task.status == TaskStatus::Done).count();
+        let done = tasks
+            .iter()
+            .filter(|a| a.task.status == TaskStatus::Done)
+            .count();
         (done, tasks.len())
     };
     view()
@@ -102,8 +114,13 @@ fn project_header(store: Store, project_id: i64) -> impl IntoElement {
                 .items_center()
                 .gap_3()
                 .child(
-                    text(move || store.project(project_id).map(|p| p.emoji).unwrap_or_else(|| "📌".into()))
-                        .text_size(px(30.0)),
+                    text(move || {
+                        store
+                            .project(project_id)
+                            .map(|p| p.emoji)
+                            .unwrap_or_else(|| "📌".into())
+                    })
+                    .text_size(px(30.0)),
                 )
                 .child(
                     view()
@@ -112,7 +129,10 @@ fn project_header(store: Store, project_id: i64) -> impl IntoElement {
                         .gap_1()
                         .child(
                             text(move || {
-                                store.project(project_id).map(|p| p.name).unwrap_or_default()
+                                store
+                                    .project(project_id)
+                                    .map(|p| p.name)
+                                    .unwrap_or_default()
                             })
                             .text_size(px(22.0))
                             .font_weight(FontWeight::BOLD)
@@ -131,6 +151,15 @@ fn project_header(store: Store, project_id: i64) -> impl IntoElement {
                             .number_of_lines(2),
                         ),
                 )
+                .child(
+                    panel_icon_button(
+                        move || SharedString::from(if favorite.get() { "★" } else { "☆" }),
+                        "收藏项目",
+                        move || store.set_project_favorite(project_id, !favorite.get_untracked()),
+                    )
+                    .selected(favorite)
+                    .selected_style(|s| s.text_color(tokens::warning)),
+                )
                 .child(project_menu(store, project_id)),
         )
         .child(
@@ -146,7 +175,7 @@ fn project_header(store: Store, project_id: i64) -> impl IntoElement {
                     view()
                         .flex_1()
                         .min_w(px(0.0))
-                        .h(px(6.0))
+                        .h(px(5.0))
                         .flex_row()
                         .overflow_hidden()
                         .rounded_full()
@@ -159,9 +188,13 @@ fn project_header(store: Store, project_id: i64) -> impl IntoElement {
                                     .rounded_full()
                                     .bg(tokens::positive())
                                     .flex_grow(done as f32)
-                                    .child(view().flex_grow((total - done) as f32))
                             },
                         ))
+                        // The unfilled remainder is the fill's SIBLING: the
+                        // two flex-grow weights split the track. Nesting it
+                        // inside the fill made one child take the whole row
+                        // (the bar read 100% whenever done > 0).
+                        .child(view().flex_grow((total - done) as f32))
                 }))
                 .child(
                     text(move || {
@@ -180,45 +213,47 @@ fn project_header(store: Store, project_id: i64) -> impl IntoElement {
 /// the linked grouping node inside it); unbound projects invite binding.
 fn scope_chip(store: Store, project_id: i64) -> impl IntoElement {
     let target = move || store.project_document_target(project_id);
-    view().child(when(
-        move || target().is_none(),
-        move || {
-            app_button(ButtonKind::Soft, "未关联知识库", move || {
-                store.open_project_editor(Some(project_id));
-            })
-        },
-    )).child(when(
-        move || target().is_some(),
-        move || {
-            let label = move || -> SharedString {
-                match target() {
-                    Some(target) => {
-                        let book = store
-                            .knowledge_base(target.book_id)
-                            .map(|kb| kb.name)
-                            .unwrap_or_else(|| "知识库".to_owned());
-                        match target.group_node_id {
-                            Some(node_id) => {
-                                let node = store
-                                    .catalog_node(node_id)
-                                    .map(|node| node.title)
-                                    .unwrap_or_default();
-                                format!("📚 {} / {}", book, node)
+    view()
+        .child(when(
+            move || target().is_none(),
+            move || {
+                app_button(ButtonKind::Soft, "未关联知识库", move || {
+                    store.open_project_editor(Some(project_id));
+                })
+            },
+        ))
+        .child(when(
+            move || target().is_some(),
+            move || {
+                let label = move || -> SharedString {
+                    match target() {
+                        Some(target) => {
+                            let book = store
+                                .knowledge_base(target.book_id)
+                                .map(|kb| kb.name)
+                                .unwrap_or_else(|| "知识库".to_owned());
+                            match target.group_node_id {
+                                Some(node_id) => {
+                                    let node = store
+                                        .catalog_node(node_id)
+                                        .map(|node| node.title)
+                                        .unwrap_or_default();
+                                    format!("📚 {} / {}", book, node)
+                                }
+                                None => format!("📚 {}", book),
                             }
-                            None => format!("📚 {}", book),
                         }
+                        None => String::new(),
                     }
-                    None => String::new(),
-                }
-                .into()
-            };
-            app_button_with(ButtonKind::Ghost, label, move || {
-                if let Some(target) = target() {
-                    store.open_book(target.book_id);
-                }
-            })
-        },
-    ))
+                    .into()
+                };
+                app_button_with(ButtonKind::Ghost, label, move || {
+                    if let Some(target) = target() {
+                        store.open_book(target.book_id);
+                    }
+                })
+            },
+        ))
 }
 
 fn project_menu(store: Store, project_id: i64) -> impl IntoElement {
@@ -239,9 +274,18 @@ fn project_menu(store: Store, project_id: i64) -> impl IntoElement {
                 .py_2()
                 .rounded(tokens::radius_row())
                 .hover(|s| s.bg(tokens::control_hover()))
-                .child(text("编辑与关联").text_size(px(13.0)).text_color(tokens::fg_primary())),
+                .child(
+                    text("编辑与关联")
+                        .text_size(px(13.0))
+                        .text_color(tokens::fg_primary()),
+                ),
         )
-        .child(menu_separator().h(px(1.0)).my_1().bg(tokens::border_subtle()))
+        .child(
+            menu_separator()
+                .h(px(1.0))
+                .my_1()
+                .bg(tokens::border_subtle()),
+        )
         .child(
             menu_item()
                 .on_select(move || store.trash_project(project_id))
@@ -249,7 +293,11 @@ fn project_menu(store: Store, project_id: i64) -> impl IntoElement {
                 .py_2()
                 .rounded(tokens::radius_row())
                 .hover(|s| s.bg(tokens::control_hover()))
-                .child(text("移入回收站").text_size(px(13.0)).text_color(tokens::danger())),
+                .child(
+                    text("移入回收站")
+                        .text_size(px(13.0))
+                        .text_color(tokens::danger()),
+                ),
         )
 }
 
@@ -283,26 +331,40 @@ fn sub_view_switch(
                             .on_press(move || store.set_project_section(candidate))
                             .accessibility_label(candidate.label())
                             .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
-                            .h(px(28.0))
+                            .h(px(32.0))
                             .px_3()
                             .items_center()
                             .justify_center()
-                            .rounded_full()
-                            .border_1()
+                            .border_b_1()
                             .border_color(move || {
-                                if active() { tokens::accent() } else { tokens::border_subtle() }
-                            })
-                            .bg(move || {
-                                if active() { tokens::accent_soft() } else { theme().background.opacity(0.0) }
+                                if active() {
+                                    tokens::accent()
+                                } else {
+                                    theme().background.opacity(0.0)
+                                }
                             })
                             .text_color(move || {
-                                if active() { tokens::accent() } else { tokens::fg_body() }
+                                if active() {
+                                    tokens::fg_primary()
+                                } else {
+                                    tokens::fg_muted()
+                                }
                             })
                             .hover(|s| s.bg(tokens::control_hover()))
-                            .child(text(candidate.label()).text_size(px(12.0))),
+                            .child(dynamic(move || {
+                                if active() {
+                                    text(candidate.label())
+                                        .text_size(px(13.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .into_element()
+                                } else {
+                                    text(candidate.label()).text_size(px(13.0)).into_element()
+                                }
+                            })),
                     )
-                    .accessibility_state(move || {
-                        nsh_core::AccessibilityState { selected: active(), ..Default::default() }
+                    .accessibility_state(move || nsh_core::AccessibilityState {
+                        selected: active(),
+                        ..Default::default()
                     })
                     .into_element()
             })
@@ -330,46 +392,62 @@ fn overview(store: Store, project_id: i64) -> impl IntoElement {
     )
 }
 
-/// One key metric card of the Overview.
-fn metric_card(
+/// One key metric of the Overview (docs/kanon.html `.metrics`): a big
+/// number over its label, separated from the next stat by a hairline.
+fn metric(
     label: &'static str,
     value: impl Fn() -> usize + Copy + 'static,
+    last: bool,
 ) -> impl IntoElement {
-    view()
-        .flex_1()
-        .flex_col()
-        .gap_1()
-        .px_3()
-        .py_3()
-        .rounded(tokens::radius_card())
-        .border_1()
-        .border_color(tokens::border_subtle())
-        .bg(move || theme().card)
-        .child(
-            text(move || format!("{}", value()))
-                .text_size(px(20.0))
-                .font_weight(FontWeight::BOLD)
-                .text_color(tokens::fg_primary()),
-        )
-        .child(text(label).text_size(px(11.0)).text_color(tokens::fg_muted()))
+    let mut stat = view().flex_col().gap_1().pr(px(20.0));
+    if !last {
+        stat = stat.border_r_1().border_color(tokens::border_subtle());
+    }
+    stat.child(
+        text(move || format!("{}", value()))
+            .text_size(px(23.0))
+            .font_weight(FontWeight::BOLD)
+            .text_color(tokens::fg_primary()),
+    )
+    .child(
+        text(label)
+            .text_size(px(11.0))
+            .text_color(tokens::fg_muted()),
+    )
 }
 
-/// The key metric cards: 总任务 / 进行中 / 已完成 / 关联文档.
+/// The key metrics: 总任务 / 进行中 / 已完成 / 关联文档.
 fn metrics(store: Store, project_id: i64) -> impl IntoElement {
     let tasks = move || store.project_tasks(project_id);
     view()
         .flex_row()
-        .gap_2()
-        .child(metric_card("总任务", move || tasks().len()))
-        .child(metric_card("进行中", move || {
-            tasks().iter().filter(|a| a.task.status == TaskStatus::Doing).count()
-        }))
-        .child(metric_card("已完成", move || {
-            tasks().iter().filter(|a| a.task.status == TaskStatus::Done).count()
-        }))
-        .child(metric_card("关联文档", move || {
-            store.project_document_count(project_id)
-        }))
+        .items_center()
+        .child(metric("总任务", move || tasks().len(), false))
+        .child(metric(
+            "进行中",
+            move || {
+                tasks()
+                    .iter()
+                    .filter(|a| a.task.status == TaskStatus::Doing)
+                    .count()
+            },
+            false,
+        ))
+        .child(metric(
+            "已完成",
+            move || {
+                tasks()
+                    .iter()
+                    .filter(|a| a.task.status == TaskStatus::Done)
+                    .count()
+            },
+            false,
+        ))
+        .child(metric(
+            "关联文档",
+            move || store.project_document_count(project_id),
+            true,
+        ))
 }
 
 /// The milestone list: one row per milestone with its target date, live
@@ -431,34 +509,55 @@ fn milestone_row(
             .count();
         (done, assigned.len())
     };
+    // The assigned-task list folds away behind the summary, like the
+    // prototype's `<details class="mile">` (docs/kanon.html).
+    let open = signal(false);
     view()
         .flex_col()
         .gap_1()
-        .px_3()
         .py_2()
-        .rounded(tokens::radius_card())
-        .border_1()
+        .border_b_1()
         .border_color(tokens::border_subtle())
-        .bg(move || theme().card)
         .child(
             view()
                 .flex_row()
                 .items_center()
                 .gap_2()
                 .child(
-                    text(move || {
-                        store
-                            .milestones(project_id)
-                            .into_iter()
-                            .find(|m| m.id == milestone_id)
-                            .map(|m| m.title)
-                            .unwrap_or_default()
-                    })
-                    .text_size(px(14.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(tokens::fg_primary())
-                    .flex_1()
-                    .number_of_lines(1),
+                    nsh_base::button()
+                        .on_press(move || open.update(|value| *value = !*value))
+                        .accessibility_label("切换里程碑任务清单")
+                        .size(px(22.0))
+                        .items_center()
+                        .justify_center()
+                        .rounded(tokens::radius_row())
+                        .text_color(tokens::fg_muted())
+                        .hover(|s| s.bg(tokens::control_hover()))
+                        .child(
+                            text(move || if open.get() { "▾" } else { "▸" }).text_size(px(12.0)),
+                        ),
+                )
+                .child(
+                    nsh_base::button()
+                        .on_press(move || open.update(|value| *value = !*value))
+                        .accessibility_label("里程碑任务")
+                        .items_center()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .child(
+                            text(move || {
+                                store
+                                    .milestones(project_id)
+                                    .into_iter()
+                                    .find(|m| m.id == milestone_id)
+                                    .map(|m| m.title)
+                                    .unwrap_or_default()
+                            })
+                            .text_size(px(14.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(tokens::fg_primary())
+                            .number_of_lines(1),
+                        ),
                 )
                 .child(
                     text(move || {
@@ -473,6 +572,30 @@ fn milestone_row(
                     .text_size(px(11.0))
                     .text_color(tokens::fg_muted()),
                 )
+                .child(dynamic(move || {
+                    let (done, total) = progress();
+                    view()
+                        .w(px(96.0))
+                        .h(px(4.0))
+                        .flex_row()
+                        .overflow_hidden()
+                        .rounded_full()
+                        .bg(tokens::control_bg())
+                        .child(when(
+                            move || done > 0,
+                            move || {
+                                view()
+                                    .h_full()
+                                    .rounded_full()
+                                    .bg(tokens::positive())
+                                    .flex_grow(done as f32)
+                            },
+                        ))
+                        // Sibling remainder, like the header bar: the two
+                        // flex-grow weights split the track (nested, the
+                        // fill took the whole row and read 100%).
+                        .child(view().flex_grow((total - done) as f32))
+                }))
                 .child(
                     text(move || {
                         let (done, total) = progress();
@@ -495,21 +618,26 @@ fn milestone_row(
                 ),
         )
         .child(when(
-            move || assigned().is_empty(),
+            move || open.get() && assigned().is_empty(),
             move || {
                 text("在任务详情中为任务选择此里程碑。")
                     .text_size(px(11.0))
                     .text_color(tokens::fg_muted())
             },
         ))
-        .child(dynamic(move || {
-            view().flex_col().gap(px(2.0)).children(
-                assigned()
-                    .into_iter()
-                    .map(|aggregate| task_row(store, aggregate).into_element())
-                    .collect::<Vec<_>>(),
-            )
-        }))
+        .child(when(
+            move || open.get(),
+            move || {
+                dynamic(move || {
+                    view().flex_col().gap(px(2.0)).children(
+                        assigned()
+                            .into_iter()
+                            .map(|aggregate| task_row(store, aggregate.task.id).into_element())
+                            .collect::<Vec<_>>(),
+                    )
+                })
+            },
+        ))
 }
 
 fn milestone_add_form(store: Store, project_id: i64) -> impl IntoElement {
@@ -541,81 +669,151 @@ fn milestone_add_form(store: Store, project_id: i64) -> impl IntoElement {
             move || date.get(),
             move |text: &str| date.set(text.to_owned()),
         ))
-        .child(
-            app_button(ButtonKind::Positive, "添加里程碑", submit)
-                .test_id("milestone-add"),
-        )
+        .child(app_button(ButtonKind::Positive, "添加里程碑", submit).test_id("milestone-add"))
 }
 
 // ---------------------------------------------------------------------
 // 任务列表
 // ---------------------------------------------------------------------
 
-/// The Task List sub-view: inline quick-add plus the tasks grouped by
-/// status.
+/// The project task list, with a status filter independent of grouping.
 fn task_list(store: Store, project_id: i64) -> impl IntoElement {
     let draft = signal(String::new());
-    let tasks = move || store.project_tasks(project_id);
-    let group = move |status: TaskStatus| {
-        tasks()
-            .into_iter()
-            .filter(|a| a.task.status == status)
-            .collect::<Vec<_>>()
+    let filter = signal(None::<TaskStatus>);
+    let by_milestone = signal(false);
+    let tasks = computed(move || store.project_tasks(project_id));
+    let states = [
+        TaskStatus::Todo,
+        TaskStatus::Doing,
+        TaskStatus::Done,
+        TaskStatus::Cancelled,
+    ];
+    let filtered_group = move |belongs: &dyn Fn(&TaskAggregate) -> bool| {
+        let status = filter.get();
+        tasks.with(|items| {
+            items
+                .iter()
+                .filter(|item| {
+                    status.is_none_or(|status| item.task.status == status) && belongs(item)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
     };
-    view()
-        .flex_1()
-        .min_h(px(0.0))
-        .child(
-            view()
-                .flex_col()
-                .gap_2()
-                .p_5()
-                .max_w(px(860.0))
-                .w_full()
-                .self_center()
-                .child(
-                    view()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .child(submit_field(
-                            "添加项目任务，回车创建",
-                            move || draft.get(),
-                            move |text: &str| draft.set(text.to_owned()),
-                            move |text: &str| {
-                                if store.create_project_task(project_id, text).is_some() {
-                                    draft.set(String::new());
-                                }
-                            },
-                        ))
-                        .child(
-                            app_button(ButtonKind::Positive, "添加任务", move || {
-                                if store.create_project_task(project_id, &draft.get()).is_some() {
-                                    draft.set(String::new());
-                                }
-                            })
-                            .test_id("project-quick-add"),
-                        ),
-                )
-                .child(when(
-                    move || tasks().is_empty(),
-                    move || empty_state("这个项目还没有任务", "在上方输入一条任务开始推进项目。"),
-                ))
-                .child(status_group(store, "待办", move || group(TaskStatus::Todo)))
-                .child(status_group(store, "进行中", move || group(TaskStatus::Doing)))
-                .child(status_group(store, "已完成", move || group(TaskStatus::Done)))
-                .child(status_group(store, "已取消", move || group(TaskStatus::Cancelled))),
-        )
+    scroll().flex_1().min_h(px(0.0)).child(
+        view()
+            .flex_col()
+            .gap_2()
+            .p_5()
+            .max_w(px(860.0))
+            .w_full()
+            .self_center()
+            .child(
+                view()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .child(submit_field(
+                        "添加项目任务，回车创建",
+                        move || draft.get(),
+                        move |text: &str| draft.set(text.to_owned()),
+                        move |text: &str| {
+                            if store.create_project_task(project_id, text).is_some() {
+                                draft.set(String::new());
+                            }
+                        },
+                    ))
+                    .child(
+                        app_button(ButtonKind::Positive, "添加任务", move || {
+                            if store
+                                .create_project_task(project_id, &draft.get())
+                                .is_some()
+                            {
+                                draft.set(String::new());
+                            }
+                        })
+                        .test_id("project-quick-add"),
+                    ),
+            )
+            .child(view().flex_row().flex_wrap().gap_1().children(
+                [None].into_iter().chain(states.map(Some)).map(|status| {
+                    let label = status.map_or("全部", TaskStatus::label);
+                    app_button(ButtonKind::Soft, label, move || filter.set(status))
+                        .accessibility_label(format!("筛选项目任务 {label}"))
+                        .selected(move || filter.get() == status)
+                        .selected_style(|s| {
+                            s.bg(tokens::accent_soft).text_color(tokens::accent_ink)
+                        })
+                }),
+            ))
+            .child(view().flex_row().flex_wrap().gap_1().children(
+                [(false, "按状态分组"), (true, "按里程碑分组")].map(|(choice, label)| {
+                    app_button(ButtonKind::Soft, label, move || by_milestone.set(choice))
+                        .selected(move || by_milestone.get() == choice)
+                        .selected_style(|s| {
+                            s.bg(tokens::accent_soft).text_color(tokens::accent_ink)
+                        })
+                }),
+            ))
+            .child(when(
+                move || tasks.with(Vec::is_empty),
+                move || empty_state("这个项目还没有任务", "在上方输入一条任务开始推进项目。"),
+            ))
+            .child(when(
+                move || {
+                    filter.get().is_some_and(|status| {
+                        tasks.with(|items| {
+                            !items.is_empty()
+                                && !items.iter().any(|item| item.task.status == status)
+                        })
+                    })
+                },
+                || empty_state("没有符合筛选的项目任务", "选择其他任务状态查看。"),
+            ))
+            .child(when(
+                move || !by_milestone.get(),
+                move || {
+                    view().gap_2().children(states.map(|status| {
+                        project_task_group(
+                            store,
+                            move || status.label(),
+                            move || filtered_group(&|item| item.task.status == status),
+                        )
+                    }))
+                },
+            ))
+            .child(when(by_milestone, move || {
+                view()
+                    .gap_2()
+                    .child(each(
+                        move || store.milestones(project_id),
+                        |milestone: &crate::domain::Milestone| milestone.id,
+                        move |milestone, _index| {
+                            let id = milestone.with(|milestone| milestone.id);
+                            project_task_group(
+                                store,
+                                move || milestone.with(|milestone| milestone.title.clone()),
+                                move || filtered_group(&|item| item.task.milestone_id == Some(id)),
+                            )
+                        },
+                    ))
+                    .child(project_task_group(
+                        store,
+                        || "未分配里程碑",
+                        move || filtered_group(&|item| item.task.milestone_id.is_none()),
+                    ))
+            })),
+    )
 }
 
-/// One status group of the Task List sub-view.
-fn status_group(
+fn project_task_group<T: Into<SharedString> + 'static>(
     store: Store,
-    title: &'static str,
-    items: impl Fn() -> Vec<TaskAggregate> + Copy + 'static,
+    title: impl Fn() -> T + Copy + 'static,
+    items: impl Fn() -> Vec<TaskAggregate> + 'static,
 ) -> impl IntoElement {
+    let items = computed(items);
     view().flex_col().gap_1().child(when(
-        move || !items().is_empty(),
+        move || !items.with(Vec::is_empty),
         move || {
             view()
                 .flex_col()
@@ -627,19 +825,18 @@ fn status_group(
                         .justify_between()
                         .child(section_heading(title))
                         .child(
-                            text(move || format!("{}", items().len()))
+                            text(move || items.with(|rows| rows.len().to_string()))
                                 .text_size(px(11.0))
                                 .text_color(tokens::fg_muted()),
                         ),
                 )
-                .child(dynamic(move || {
-                    view().flex_col().gap(px(2.0)).children(
-                        items()
-                            .into_iter()
-                            .map(|aggregate| task_row(store, aggregate).into_element())
-                            .collect::<Vec<_>>(),
-                    )
-                }))
+                .child(each(
+                    items,
+                    |aggregate: &TaskAggregate| aggregate.task.id,
+                    move |aggregate, _| {
+                        task_row(store, aggregate.with(|a| a.task.id)).into_element()
+                    },
+                ))
         },
     ))
 }
@@ -650,7 +847,9 @@ fn status_group(
 
 /// The kanban: one lane per status (`todo`/`doing`/`done`, plus `cancel`
 /// only while the project holds cancelled tasks — the optional column).
-/// Cards move across lanes through their 移动 menu.
+/// Cards move across lanes by dragging them onto another column (the
+/// release hit-tests the lanes' measured rectangles), or through their
+/// 移动 menu, which stays for the keyboard.
 fn board(store: Store, project_id: i64) -> impl IntoElement {
     let tasks = move || store.project_tasks(project_id);
     let lane = move |status: TaskStatus| {
@@ -659,35 +858,106 @@ fn board(store: Store, project_id: i64) -> impl IntoElement {
             .filter(|a| a.task.status == status)
             .collect::<Vec<_>>()
     };
+    let drag = BoardDrag {
+        rects: signal(Vec::new()),
+        lane_refs: [
+            (TaskStatus::Todo, element_ref()),
+            (TaskStatus::Doing, element_ref()),
+            (TaskStatus::Done, element_ref()),
+            (TaskStatus::Cancelled, element_ref()),
+        ]
+        .into_iter()
+        .collect(),
+    };
     view().flex_1().min_w(px(0.0)).min_h(px(0.0)).child(
-        scroll()
-            .flex_1()
-            .child(
-                view()
-                    .flex_row()
-                    .items_start()
-                    .gap_3()
-                    .p_5()
-                    .h_full()
-                    .child(lane_column(store, "待办", TaskStatus::Todo, move || {
-                        lane(TaskStatus::Todo)
-                    }))
-                    .child(lane_column(store, "进行中", TaskStatus::Doing, move || {
-                        lane(TaskStatus::Doing)
-                    }))
-                    .child(lane_column(store, "已完成", TaskStatus::Done, move || {
-                        lane(TaskStatus::Done)
-                    }))
-                    .child(when(
-                        move || !lane(TaskStatus::Cancelled).is_empty(),
-                        move || {
-                            lane_column(store, "已取消", TaskStatus::Cancelled, move || {
-                                lane(TaskStatus::Cancelled)
-                            })
-                        },
-                    )),
-            ),
+        scroll().flex_1().child(
+            view()
+                .flex_row()
+                .items_start()
+                .gap_3()
+                .p_5()
+                .h_full()
+                .child(lane_column(
+                    store,
+                    "待办",
+                    TaskStatus::Todo,
+                    move || lane(TaskStatus::Todo),
+                    drag.clone(),
+                    drag.lane_refs[0].1,
+                ))
+                .child(lane_column(
+                    store,
+                    "进行中",
+                    TaskStatus::Doing,
+                    move || lane(TaskStatus::Doing),
+                    drag.clone(),
+                    drag.lane_refs[1].1,
+                ))
+                .child(lane_column(
+                    store,
+                    "已完成",
+                    TaskStatus::Done,
+                    move || lane(TaskStatus::Done),
+                    drag.clone(),
+                    drag.lane_refs[2].1,
+                ))
+                .child(when(
+                    move || !lane(TaskStatus::Cancelled).is_empty(),
+                    move || {
+                        lane_column(
+                            store,
+                            "已取消",
+                            TaskStatus::Cancelled,
+                            move || lane(TaskStatus::Cancelled),
+                            drag.clone(),
+                            drag.lane_refs[3].1,
+                        )
+                    },
+                )),
+        ),
     )
+}
+
+/// The cross-column drag's shared state: the lane rectangles in surface
+/// coordinates (those of touches' `pageX`/`pageY`), measured when a drag
+/// starts, for the release hit-test.
+#[derive(Clone)]
+struct BoardDrag {
+    rects: Signal<Vec<(TaskStatus, Bounds<Points>)>>,
+    lane_refs: Vec<(TaskStatus, ElementRef)>,
+}
+
+impl BoardDrag {
+    /// Remeasures every mounted lane; unmounted lanes (the optional cancel
+    /// column while hidden) drop out of the hit-test.
+    fn measure_lanes(&self) {
+        let rects = self.rects;
+        let refs = self.lane_refs.clone();
+        spawn(async move {
+            let mut measured = Vec::with_capacity(refs.len());
+            for (status, reference) in refs {
+                if let Some(measurement) = reference.measure().await {
+                    measured.push((
+                        status,
+                        Bounds {
+                            origin: measurement.page,
+                            size: measurement.frame.size,
+                        },
+                    ));
+                }
+            }
+            rects.set(measured);
+        });
+    }
+}
+
+/// The lane under `at`, if any: the point falls inside the lane's
+/// rectangle in surface coordinates.
+fn lane_at(rects: &[(TaskStatus, Bounds<Points>)], at: Point<Points>) -> Option<TaskStatus> {
+    rects
+        .iter()
+        .find(|(_, bounds)| bounds.contains(&at))
+        .map(|(status, _)| *status)
 }
 
 fn lane_column(
@@ -695,9 +965,14 @@ fn lane_column(
     title: &'static str,
     status: TaskStatus,
     items: impl Fn() -> Vec<TaskAggregate> + Copy + 'static,
+    drag: BoardDrag,
+    lane_ref: ElementRef,
 ) -> impl IntoElement {
+    // The prototype's `.lane`: equal-width flexible columns sharing the
+    // board's width (docs/kanon.html).
     view()
-        .w(px(248.0))
+        .flex_1()
+        .min_w(px(180.0))
         .flex_col()
         .gap_2()
         .child(
@@ -722,10 +997,11 @@ fn lane_column(
             view()
                 .flex_col()
                 .gap_2()
-                .min_h(px(80.0))
+                .min_h(px(240.0))
                 .p_2()
                 .rounded(tokens::radius_card())
                 .bg(tokens::panel_subtle())
+                .element_ref(&lane_ref)
                 .test_id(&format!("kanban-{}", status.as_str()))
                 .child(when(
                     move || items().is_empty(),
@@ -741,7 +1017,7 @@ fn lane_column(
                         items()
                             .into_iter()
                             .map(|aggregate| {
-                                board_card(store, aggregate, status).into_element()
+                                board_card(store, aggregate, status, drag.clone()).into_element()
                             })
                             .collect::<Vec<_>>(),
                     )
@@ -749,18 +1025,28 @@ fn lane_column(
         )
 }
 
-/// One kanban card: title (opens the Task Detail), the meta line, and
-/// the move menu to change its status.
+/// One kanban card: title (opens the Task Detail), the meta line (Due
+/// indicator, priority, subtask progress, linked-document chip), the move
+/// menu to change its status, and a drag onto another lane to move it.
 fn board_card(
     store: Store,
     aggregate: TaskAggregate,
     current: TaskStatus,
+    drag: BoardDrag,
 ) -> impl IntoElement {
     let id = aggregate.task.id;
     let title = aggregate.task.title.clone();
     let due = aggregate.task.due_date;
-    let (done_subs, total_subs) =
-        crate::domain::Task::subtask_progress(&aggregate.subtasks);
+    let overdue = aggregate.task.is_overdue_at(store.now());
+    let (done_subs, total_subs) = crate::domain::Task::subtask_progress(&aggregate.subtasks);
+    // The drag: native pan values move the card with the finger (the spec's
+    // 1:1 follow), the touch-down position plus the pan's translation gives
+    // the release point, and a spring settles the card back when the release
+    // lands nowhere (or the system cancels the drag).
+    let drag_x = animated_value(0.0);
+    let drag_y = animated_value(0.0);
+    let down = signal(None::<Point<Points>>);
+    let document = computed(move || store.task_documents(id, Some(1)).into_iter().next());
     view()
         .flex_col()
         .gap_1()
@@ -769,6 +1055,33 @@ fn board_card(
         .border_1()
         .border_color(tokens::border_subtle())
         .bg(move || theme().card)
+        .bind_translate_x(&drag_x)
+        .bind_translate_y(&drag_y)
+        .pan_values(Some(&drag_x), Some(&drag_y))
+        .on_touch(move |touch: &TouchEvent| {
+            if matches!(touch.phase, TouchPhase::Start)
+                && let Some(point) = touch.points.first()
+            {
+                down.set(Some(point.page));
+            }
+        })
+        .on_pan_start({
+            let drag = drag.clone();
+            move |_: &PanEvent| drag.measure_lanes()
+        })
+        .on_pan_end(move |event: &PanEvent| {
+            let released = down
+                .get()
+                .map(|origin| origin + event.translation)
+                .filter(|_| !event.cancelled);
+            match released.and_then(|at| lane_at(&drag.rects.get(), at)) {
+                Some(status) if status != current => store.set_task_status(id, status),
+                _ => {
+                    drag_x.spring(0.0, Spring::default());
+                    drag_y.spring(0.0, Spring::default());
+                }
+            }
+        })
         .child(
             view()
                 .flex_row()
@@ -801,12 +1114,22 @@ fn board_card(
                     move || {
                         text(move || due.map(|d| d.to_string()).unwrap_or_default())
                             .text_size(px(11.0))
-                            .text_color(tokens::fg_muted())
+                            .text_color(move || {
+                                if overdue {
+                                    tokens::danger()
+                                } else {
+                                    tokens::fg_muted()
+                                }
+                            })
                     },
                 ))
                 .child(when(
                     move || aggregate.task.priority == Priority::High,
-                    || text("高优先级").text_size(px(11.0)).text_color(tokens::warning()),
+                    || {
+                        text("高优先级")
+                            .text_size(px(11.0))
+                            .text_color(tokens::warning())
+                    },
                 ))
                 .child(when(
                     move || total_subs > 0,
@@ -815,7 +1138,18 @@ fn board_card(
                             .text_size(px(11.0))
                             .text_color(tokens::fg_muted())
                     },
-                )),
+                ))
+                .child(dynamic(move || {
+                    document.get().map(|(document_id, document_title)| {
+                        let label = format!("关联文档 {document_title}");
+                        app_button(ButtonKind::Ghost, document_title, move || {
+                            store.open_document(document_id)
+                        })
+                        .accessibility_label(label)
+                        .h(px(22.0))
+                        .px_2()
+                    })
+                })),
         )
 }
 
@@ -853,7 +1187,10 @@ fn card_move_menu(
                 .rounded(move || theme().radius)
                 .bg(move || theme().background.opacity(0.0))
                 .text_color(tokens::fg_muted())
-                .hover(|s| s.bg(tokens::control_hover()).text_color(tokens::fg_primary()))
+                .hover(|s| {
+                    s.bg(tokens::control_hover())
+                        .text_color(tokens::fg_primary())
+                })
                 .active(|s| s.opacity(0.7))
                 .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent()))
                 .child(text("⋯").text_size(px(13.0))),
@@ -897,14 +1234,14 @@ fn documents(store: Store, tab_id: u64, project_id: i64) -> impl IntoElement {
         .child(when(
             move || {
                 store.project_document_target(project_id).is_some()
-                    && store.project_linked_node_trashed(project_id)
+                    && store.project_link_in_trash(project_id)
             },
             move || trashed_link_notice(store, project_id),
         ))
         .child(when(
             move || {
                 store.project_document_target(project_id).is_some()
-                    && !store.project_linked_node_trashed(project_id)
+                    && !store.project_link_in_trash(project_id)
             },
             move || linked_documents(store, tab_id, project_id),
         ))
@@ -913,7 +1250,12 @@ fn documents(store: Store, tab_id: u64, project_id: i64) -> impl IntoElement {
 /// The unbound state: offer binding an existing book/node or the
 /// one-click same-named book (ADR-0001).
 fn unbound_documents(store: Store, project_id: i64) -> impl IntoElement {
-    let name = move || store.project(project_id).map(|p| p.name).unwrap_or_default();
+    let name = move || {
+        store
+            .project(project_id)
+            .map(|p| p.name)
+            .unwrap_or_default()
+    };
     view().flex_1().items_center().justify_center().child(
         view()
             .flex_col()
@@ -956,16 +1298,10 @@ fn unbound_documents(store: Store, project_id: i64) -> impl IntoElement {
     )
 }
 
-/// The recoverable-binding notice: the linked grouping node sits in
-/// Trash; the binding is kept, and the user can restore it or rebind
-/// (ADR-0001).
+/// The recoverable binding: restore the book or grouping node, or rebind.
 fn trashed_link_notice(store: Store, project_id: i64) -> impl IntoElement {
-    let node = move || {
-        store
-            .project(project_id)
-            .and_then(|project| project.linked_group_node_id)
-            .and_then(|node_id| store.catalog_node(node_id))
-    };
+    let target = move || store.project_document_target(project_id);
+    let book_in_trash = move || target().is_some_and(|target| store.book_in_trash(target.book_id));
     view().flex_1().items_center().justify_center().child(
         view()
             .flex_col()
@@ -984,15 +1320,21 @@ fn trashed_link_notice(store: Store, project_id: i64) -> impl IntoElement {
             )
             .child(
                 text(move || {
-                    let title = node().map(|node| node.title).unwrap_or_default();
-                    format!("关联目录「{}」在回收站中", title)
+                    let Some(target) = target() else { return String::new() };
+                    if book_in_trash() {
+                        let name = store.knowledge_base(target.book_id).map(|book| book.name).unwrap_or_default();
+                        format!("关联知识库「{name}」在回收站中")
+                    } else {
+                        let title = target.group_node_id.and_then(|id| store.catalog_node(id)).map(|node| node.title).unwrap_or_default();
+                        format!("关联目录「{title}」在回收站中")
+                    }
                 })
                 .text_size(px(16.0))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(tokens::fg_primary()),
             )
             .child(
-                text("项目仍保持绑定。恢复目录即可继续在此新建项目文档；也可以改绑到其他知识库或目录分组。")
+                text("项目仍保持绑定。恢复关联位置后可继续新建文档，也可以改绑到其他知识库或目录分组。")
                     .text_size(px(12.0))
                     .text_color(tokens::fg_muted()),
             )
@@ -1001,12 +1343,19 @@ fn trashed_link_notice(store: Store, project_id: i64) -> impl IntoElement {
                     .flex_row()
                     .gap_2()
                     .child(
-                        app_button(ButtonKind::Positive, "恢复目录", move || {
-                            if let Some(node) = node() {
-                                store.restore_catalog_node(node.id);
-                            }
-                        })
-                        .test_id("project-restore-node"),
+                        crate::ui::controls::app_button_with(
+                            ButtonKind::Positive,
+                            move || (if book_in_trash() { "恢复知识库" } else { "恢复目录" }).into(),
+                            move || {
+                                if let Some(target) = target() {
+                                    if book_in_trash() {
+                                        store.restore_knowledge_base(target.book_id);
+                                    } else if let Some(id) = target.group_node_id {
+                                        store.restore_catalog_node(id);
+                                    }
+                                }
+                            },
+                        ).test_id("project-restore-node"),
                     )
                     .child(
                         app_button(ButtonKind::Soft, "改绑", move || {
@@ -1019,19 +1368,26 @@ fn trashed_link_notice(store: Store, project_id: i64) -> impl IntoElement {
 }
 
 /// The bound state: the catalog sidebar on the left, the document
-/// canvas (or the landing) on the right — the book shell's layout with
+/// canvas (or the scoped book home) on the right — the book shell's layout with
 /// the Project's navigation rules (docs/ui-design.md §3.4).
 fn linked_documents(store: Store, tab_id: u64, project_id: i64) -> impl IntoElement {
     let narrow = move || window().width.0 < NARROW_BREAKPOINT;
     let drawer = signal(false);
-    let on_close = move || drawer.set(false);
+    let hidden = move || store.catalog_hidden(tab_id);
+    let on_close = move || {
+        if narrow() {
+            drawer.set(false);
+        } else {
+            store.set_catalog_hidden(tab_id, true);
+        }
+    };
     view()
         .flex_1()
         .min_w(px(0.0))
         .min_h(px(0.0))
         .flex_row()
         .child(when(
-            move || !narrow(),
+            move || !narrow() && !hidden(),
             move || {
                 each(
                     move || vec![linked_catalog_key(store, tab_id, project_id)],
@@ -1047,7 +1403,9 @@ fn linked_documents(store: Store, tab_id: u64, project_id: i64) -> impl IntoElem
                             },
                             false,
                             on_close,
-                            CatalogNav::Project { linked_node: group_node },
+                            CatalogNav::Project {
+                                linked_node: group_node,
+                            },
                         )
                         .w(px(kb::CATALOG_W))
                         .test_id("catalog-inline")
@@ -1063,19 +1421,24 @@ fn linked_documents(store: Store, tab_id: u64, project_id: i64) -> impl IntoElem
                 .min_h(px(0.0))
                 .relative()
                 .flex_col()
-                .child(when(narrow, move || {
-                    view()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .py_2()
-                        .child(app_button(ButtonKind::Soft, "☰ 目录", move || {
-                            drawer.set(true);
-                        }))
-                }))
+                .child(when(
+                    move || narrow() || hidden(),
+                    move || {
+                        kb::catalog_reopen(move || {
+                            if narrow() {
+                                drawer.set(true);
+                            } else {
+                                store.set_catalog_hidden(tab_id, false);
+                            }
+                        })
+                    },
+                ))
                 .child(each(
-                    move || visible_document(store, tab_id).into_iter().collect::<Vec<_>>(),
+                    move || {
+                        visible_document(store, tab_id)
+                            .into_iter()
+                            .collect::<Vec<_>>()
+                    },
                     |doc_id: &i64| *doc_id,
                     move |doc_id, _index| {
                         kb::document_view(store, tab_id, doc_id.get()).into_element()
@@ -1083,7 +1446,21 @@ fn linked_documents(store: Store, tab_id: u64, project_id: i64) -> impl IntoElem
                 ))
                 .child(when(
                     move || visible_document(store, tab_id).is_none(),
-                    move || landing(store, project_id),
+                    move || {
+                        // The no-document-open state IS the book home of
+                        // the linked scope (docs/kanon.html `bookHome`
+                        // with the grouping-node root), not a separate
+                        // empty state.
+                        let target = store.project_document_target(project_id);
+                        let scope = target.and_then(|target| target.group_node_id);
+                        let book_id = target.map(|target| target.book_id).unwrap_or_default();
+                        kb::book_home(
+                            store,
+                            book_id,
+                            scope,
+                            CatalogNav::Project { linked_node: scope },
+                        )
+                    },
                 ))
                 .child(when(
                     move || narrow() && drawer.get(),
@@ -1099,30 +1476,30 @@ fn linked_documents(store: Store, tab_id: u64, project_id: i64) -> impl IntoElem
                                     .bg(theme().background.opacity(0.35))
                                     .accessibility_label("关闭目录"),
                             )
-                            .child(
-                                each(
-                                    move || vec![linked_catalog_key(store, tab_id, project_id)],
-                                    |key: &(i64, Option<i64>, Option<i64>)| *key,
-                                    move |key, _index| {
-                                        let (book_id, group_node, doc) = key.get();
-                                        kb::catalog_sidebar(
-                                            store,
-                                            book_id,
-                                            match doc {
-                                                Some(doc) => CatalogFocus::Document(doc),
-                                                None => CatalogFocus::Home,
-                                            },
-                                            true,
-                                            on_close,
-                                            CatalogNav::Project { linked_node: group_node },
-                                        )
-                                        .w(px(kb::CATALOG_W))
-                                        .shadow_lg()
-                                        .test_id("catalog-overlay")
-                                        .into_element()
-                                    },
-                                )
-                            )
+                            .child(each(
+                                move || vec![linked_catalog_key(store, tab_id, project_id)],
+                                |key: &(i64, Option<i64>, Option<i64>)| *key,
+                                move |key, _index| {
+                                    let (book_id, group_node, doc) = key.get();
+                                    kb::catalog_sidebar(
+                                        store,
+                                        book_id,
+                                        match doc {
+                                            Some(doc) => CatalogFocus::Document(doc),
+                                            None => CatalogFocus::Home,
+                                        },
+                                        true,
+                                        on_close,
+                                        CatalogNav::Project {
+                                            linked_node: group_node,
+                                        },
+                                    )
+                                    .w(px(kb::CATALOG_W))
+                                    .shadow_lg()
+                                    .test_id("catalog-overlay")
+                                    .into_element()
+                                },
+                            ))
                     },
                 )),
         )
@@ -1157,57 +1534,6 @@ fn visible_document(store: Store, tab_id: u64) -> Option<i64> {
     Some(doc_id)
 }
 
-/// The Linked Documents landing: where new documents land and a button
-/// that creates one in the linked scope (ADR-0001).
-fn landing(store: Store, project_id: i64) -> impl IntoElement {
-    let scope = move || match store.project_document_target(project_id) {
-        Some(target) => match target.group_node_id {
-            Some(node_id) => {
-                let node = store
-                    .catalog_node(node_id)
-                    .map(|node| node.title)
-                    .unwrap_or_default();
-                format!("新建文档将落在关联目录「{}」下", node)
-            }
-            None => {
-                let book = store
-                    .knowledge_base(target.book_id)
-                    .map(|kb| kb.name)
-                    .unwrap_or_else(|| "知识库".to_owned());
-                format!("新建文档将落在知识库「{}」的目录顶部", book)
-            }
-        },
-        None => String::new(),
-    };
-    view().flex_1().items_center().justify_center().child(
-        view()
-            .flex_col()
-            .gap_3()
-            .items_center()
-            .max_w(px(460.0))
-            .child(
-                text("关联文档")
-                    .text_size(px(18.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(tokens::fg_primary()),
-            )
-            .child(
-                text("从左侧目录打开文档，或在此为项目新建一篇文档。")
-                    .text_size(px(12.0))
-                    .text_color(tokens::fg_muted()),
-            )
-            .child(
-                app_button(ButtonKind::Primary, "＋ 新建文档", move || {
-                    if let Some(doc_id) = store.create_document_for_project(project_id, "未命名文档") {
-                        store.set_project_document(Some(doc_id));
-                    }
-                })
-                .test_id("project-doc-create"),
-            )
-            .child(text(scope).text_size(px(11.0)).text_color(tokens::fg_muted())),
-    )
-}
-
 // ---------------------------------------------------------------------
 // The Project editor (creation and rebinding)
 // ---------------------------------------------------------------------
@@ -1226,14 +1552,23 @@ enum BindMode {
 /// same-named book). `editing == None` creates; `Some(id)` rebinds.
 pub fn project_editor_view(store: Store, editing: Option<i64>) -> impl IntoElement {
     let existing = editing.and_then(|id| store.project(id));
-    let name = signal(existing.as_ref().map(|p| p.name.clone()).unwrap_or_default());
-    let description =
-        signal(existing.as_ref().map(|p| p.description.clone()).unwrap_or_default());
+    let name = signal(
+        existing
+            .as_ref()
+            .map(|p| p.name.clone())
+            .unwrap_or_default(),
+    );
+    let description = signal(
+        existing
+            .as_ref()
+            .map(|p| p.description.clone())
+            .unwrap_or_default(),
+    );
     let color = signal(
         existing
             .as_ref()
             .map(|p| p.color.clone())
-            .unwrap_or_else(|| COLORS[0].to_owned()),
+            .unwrap_or_else(|| COLORS[0].0.to_owned()),
     );
     let emoji = signal(
         existing
@@ -1241,16 +1576,22 @@ pub fn project_editor_view(store: Store, editing: Option<i64>) -> impl IntoEleme
             .map(|p| p.emoji.clone())
             .unwrap_or_else(|| EMOJIS[0].to_owned()),
     );
-    let mode = signal(match existing.as_ref().and_then(|p| p.linked_group_node_id) {
-        Some(_) => BindMode::Node,
-        None => match existing.as_ref().and_then(|p| p.linked_book_id) {
-            Some(_) => BindMode::WholeBook,
-            None => BindMode::None,
+    let mode = signal(
+        match existing.as_ref().and_then(|p| p.linked_group_node_id) {
+            Some(_) => BindMode::Node,
+            None => match existing.as_ref().and_then(|p| p.linked_book_id) {
+                Some(_) => BindMode::WholeBook,
+                None => BindMode::None,
+            },
         },
-    });
+    );
     let book_sel = signal(existing.as_ref().and_then(|p| p.linked_book_id));
     let node_sel = signal(existing.as_ref().and_then(|p| p.linked_group_node_id));
-    let title = if editing.is_some() { "编辑项目" } else { "新建项目" };
+    let title = if editing.is_some() {
+        "编辑项目"
+    } else {
+        "新建项目"
+    };
 
     view().flex_1().min_h(px(0.0)).child(
         scroll().flex_1().child(
@@ -1272,29 +1613,58 @@ pub fn project_editor_view(store: Store, editing: Option<i64>) -> impl IntoEleme
                         .flex_col()
                         .gap_1()
                         .child(section_heading("名称"))
-                        .child(input_field(
-                            "项目名称",
-                            move || name.get(),
-                            move |text: &str| name.set(text.to_owned()),
-                        )),
+                        .child(
+                            input_field(
+                                "项目名称",
+                                move || name.get(),
+                                move |text: &str| name.set(text.to_owned()),
+                            )
+                            .label("项目名称"),
+                        ),
                 )
                 .child(
                     view()
                         .flex_col()
                         .gap_1()
                         .child(section_heading("简介"))
-                        .child(input_field(
-                            "这个项目要达成什么？",
-                            move || description.get(),
-                            move |text: &str| description.set(text.to_owned()),
-                        )),
+                        .child(
+                            input_field(
+                                "这个项目要达成什么？",
+                                move || description.get(),
+                                move |text: &str| description.set(text.to_owned()),
+                            )
+                            .label("项目简介"),
+                        ),
                 )
                 .child(
                     view()
                         .flex_row()
                         .gap_4()
-                        .child(picker("颜色", COLORS, color, |c| c.to_owned()))
-                        .child(picker("图标", EMOJIS, emoji, |e| e.to_owned())),
+                        .flex_wrap()
+                        .child(picker(
+                            "颜色",
+                            COLORS.iter().copied().map(|(value, name)| {
+                                let color = nsh_core::Hsla::parse_hex(value)
+                                    .expect("valid project color preset");
+                                (
+                                    value,
+                                    name,
+                                    view()
+                                        .size(px(16.0))
+                                        .rounded_full()
+                                        .bg(color)
+                                        .into_element(),
+                                )
+                            }),
+                            color,
+                        ))
+                        .child(picker(
+                            "图标",
+                            EMOJIS.iter().copied().map(|emoji| {
+                                (emoji, emoji, text(emoji).text_size(px(13.0)).into_element())
+                            }),
+                            emoji,
+                        )),
                 )
                 .child(binding_section(store, mode, book_sel, node_sel))
                 .child(
@@ -1302,22 +1672,40 @@ pub fn project_editor_view(store: Store, editing: Option<i64>) -> impl IntoEleme
                         .flex_row()
                         .gap_2()
                         .child(
-                            app_button(ButtonKind::Primary, if editing.is_some() { "保存" } else { "创建项目" }, move || {
-                                submit_editor(
-                                    store,
-                                    &EditorDraft {
-                                        editing,
-                                        name: name.get(),
-                                        description: description.get(),
-                                        color: color.get(),
-                                        emoji: emoji.get(),
-                                        mode: mode.get(),
-                                        book_sel: book_sel.get(),
-                                        node_sel: node_sel.get(),
-                                    },
-                                );
-                            })
-                            .test_id("project-save"),
+                            app_button(
+                                ButtonKind::Primary,
+                                if editing.is_some() {
+                                    "保存"
+                                } else {
+                                    "创建项目"
+                                },
+                                move || {
+                                    submit_editor(
+                                        store,
+                                        &EditorDraft {
+                                            editing,
+                                            name: name.get(),
+                                            description: description.get(),
+                                            color: color.get(),
+                                            emoji: emoji.get(),
+                                            mode: mode.get(),
+                                            book_sel: book_sel.get(),
+                                            node_sel: node_sel.get(),
+                                        },
+                                    );
+                                },
+                            )
+                            .test_id("project-save")
+                            // An empty name or an unfinished binding choice
+                            // used to commit nothing (or an empty-named
+                            // Project) with no feedback: the submit stays
+                            // disabled until the form can commit.
+                            .disabled(move || {
+                                name.get().trim().is_empty()
+                                    || (mode.get() == BindMode::WholeBook
+                                        && book_sel.get().is_none())
+                                    || (mode.get() == BindMode::Node && node_sel.get().is_none())
+                            }),
                         )
                         .child(app_button(ButtonKind::Ghost, "取消", move || {
                             cancel_editor(store, editing);
@@ -1330,47 +1718,45 @@ pub fn project_editor_view(store: Store, editing: Option<i64>) -> impl IntoEleme
 /// A labeled row of preset choices (color dots / emoji tiles).
 fn picker(
     label: &'static str,
-    choices: &'static [&'static str],
+    choices: impl IntoIterator<Item = (&'static str, &'static str, AnyElement)>,
     selected: Signal<String>,
-    name: impl Fn(&'static str) -> String + Copy + 'static,
 ) -> impl IntoElement {
-    view().flex_col().gap_1().child(section_heading(label)).child(
-        view()
-            .flex_row()
-            .gap_2()
-            .children(
-                choices
-                    .iter()
-                    .map(|choice| {
-                        let choice = *choice;
-                        let is_selected = move || selected.get() == name(choice);
-                        nsh_base::button()
-                            .on_press(move || selected.set(name(choice)))
-                            .accessibility_label(name(choice))
-                            .size(px(26.0))
-                            .items_center()
-                            .justify_center()
-                            .rounded(tokens::radius_row())
-                            .border_1()
-                            .border_color(move || {
-                                if is_selected() {
-                                    tokens::accent()
-                                } else {
-                                    tokens::border_subtle()
-                                }
-                            })
-                            .bg(move || {
-                                if is_selected() {
-                                    tokens::accent_soft()
-                                } else {
-                                    theme().background.opacity(0.0)
-                                }
-                            })
-                            .child(text(choice).text_size(px(13.0)))
+    view()
+        .flex_col()
+        .gap_1()
+        .child(section_heading(label))
+        .child(view().flex_row().gap_2().children(choices.into_iter().map(
+            |(value, name, content)| {
+                let is_selected = move || selected.with(|current| current == value);
+                nsh_base::button()
+                    .on_press(move || selected.set(value.to_owned()))
+                    .accessibility_label(name)
+                    .selected(is_selected)
+                    .size(px(26.0))
+                    .items_center()
+                    .justify_center()
+                    .rounded(tokens::radius_row())
+                    .border_1()
+                    .border_color(move || {
+                        if is_selected() {
+                            tokens::accent()
+                        } else {
+                            tokens::border_subtle()
+                        }
                     })
-                    .collect::<Vec<_>>(),
-            ),
-    )
+                    .bg(move || {
+                        if is_selected() {
+                            tokens::accent_soft()
+                        } else {
+                            theme().background.opacity(0.0)
+                        }
+                    })
+                    .hover(|s| s.bg(tokens::control_hover))
+                    .active(|s| s.bg(tokens::control_bg))
+                    .focus_visible(|s| s.outline(px(2.0)).outline_color(tokens::accent_ink))
+                    .child(content)
+            },
+        )))
 }
 
 /// The binding choice: 暂不关联 / 整本知识库 / 目录分组 / 新建同名知识库,
@@ -1386,52 +1772,56 @@ fn binding_section(
         .gap_2()
         .child(section_heading("关联文档来源（ADR-0001）"))
         .child(
-            view()
-                .flex_row()
-                .gap_2()
-                .flex_wrap()
-                .children(
-                    [
-                        (BindMode::None, "暂不关联"),
-                        (BindMode::WholeBook, "关联整本知识库"),
-                        (BindMode::Node, "关联目录分组"),
-                        (BindMode::NewBook, "新建同名知识库"),
-                    ]
-                    .iter()
-                    .map(|(candidate, label)| {
-                        let candidate = *candidate;
-                        let active = move || mode.get() == candidate;
-                        nsh_base::button()
-                            .on_press(move || mode.set(candidate))
-                            .accessibility_label(Some((*label).into()))
-                            .h(px(28.0))
-                            .px_3()
-                            .items_center()
-                            .justify_center()
-                            .rounded_full()
-                            .border_1()
-                            .border_color(move || {
-                                if active() { tokens::accent() } else { tokens::border_subtle() }
-                            })
-                            .bg(move || {
-                                if active() {
-                                    tokens::accent_soft()
-                                } else {
-                                    theme().background.opacity(0.0)
-                                }
-                            })
-                            .text_color(move || {
-                                if active() { tokens::accent() } else { tokens::fg_body() }
-                            })
-                            .hover(|s| s.bg(tokens::control_hover()))
-                            .child(text(*label).text_size(px(12.0)))
-                    })
-                    .collect::<Vec<_>>(),
-                ),
+            view().flex_row().gap_2().flex_wrap().children(
+                [
+                    (BindMode::None, "暂不关联"),
+                    (BindMode::WholeBook, "关联整本知识库"),
+                    (BindMode::Node, "关联目录分组"),
+                    (BindMode::NewBook, "新建同名知识库"),
+                ]
+                .iter()
+                .map(|(candidate, label)| {
+                    let candidate = *candidate;
+                    let active = move || mode.get() == candidate;
+                    nsh_base::button()
+                        .on_press(move || mode.set(candidate))
+                        .accessibility_label(Some((*label).into()))
+                        .h(px(28.0))
+                        .px_3()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .border_1()
+                        .border_color(move || {
+                            if active() {
+                                tokens::accent()
+                            } else {
+                                tokens::border_subtle()
+                            }
+                        })
+                        .bg(move || {
+                            if active() {
+                                tokens::accent_soft()
+                            } else {
+                                theme().background.opacity(0.0)
+                            }
+                        })
+                        .text_color(move || {
+                            if active() {
+                                tokens::accent()
+                            } else {
+                                tokens::fg_body()
+                            }
+                        })
+                        .hover(|s| s.bg(tokens::control_hover()))
+                        .child(text(*label).text_size(px(12.0)))
+                })
+                .collect::<Vec<_>>(),
+            ),
         )
         .child(when(
             move || matches!(mode.get(), BindMode::WholeBook | BindMode::Node),
-            move || book_picker(store, book_sel),
+            move || book_picker(store, book_sel, node_sel),
         ))
         .child(when(
             move || mode.get() == BindMode::Node,
@@ -1448,7 +1838,11 @@ fn binding_section(
 }
 
 /// The book dropdown for the WholeBook/Node modes.
-fn book_picker(store: Store, book_sel: Signal<Option<i64>>) -> impl IntoElement {
+fn book_picker(
+    store: Store,
+    book_sel: Signal<Option<i64>>,
+    node_sel: Signal<Option<i64>>,
+) -> impl IntoElement {
     let label = move || {
         book_sel
             .get()
@@ -1488,7 +1882,14 @@ fn book_picker(store: Store, book_sel: Signal<Option<i64>>) -> impl IntoElement 
                 |kb: &crate::domain::KnowledgeBase| kb.id,
                 move |kb, _index| {
                     menu_item()
-                        .on_select(move || book_sel.set(Some(kb.with(|kb| kb.id))))
+                        .test_id(&format!("project-bind-book-{}", kb.with(|kb| kb.id)))
+                        .on_select(move || {
+                            let book = Some(kb.with(|kb| kb.id));
+                            if book_sel.get_untracked() != book {
+                                node_sel.set(None);
+                                book_sel.set(book);
+                            }
+                        })
                         .px_3()
                         .py_2()
                         .rounded(tokens::radius_row())
@@ -1572,6 +1973,10 @@ fn node_picker(
                 |entry: &crate::domain::CatalogEntry| entry.node.id,
                 move |entry, _index| {
                     menu_item()
+                        .test_id(&format!(
+                            "project-bind-node-{}",
+                            entry.with(|entry| entry.node.id)
+                        ))
                         .on_select(move || node_sel.set(Some(entry.with(|entry| entry.node.id))))
                         .px_3()
                         .py_2()
@@ -1658,12 +2063,9 @@ fn submit_editor(store: Store, draft: &EditorDraft) {
             }
         }
         None => {
-            if let Some(id) = store.create_project_with_binding(
-                &draft.name,
-                &draft.color,
-                &draft.emoji,
-                binding,
-            ) {
+            if let Some(id) =
+                store.create_project_with_binding(&draft.name, &draft.color, &draft.emoji, binding)
+            {
                 store.open_project(id);
             }
         }
@@ -1675,9 +2077,7 @@ fn binding_book(store: Store, binding: ProjectBinding) -> Option<i64> {
     match binding {
         ProjectBinding::None => None,
         ProjectBinding::Book(book_id) => Some(book_id),
-        ProjectBinding::Node(node_id) => store
-            .catalog_node(node_id)
-            .map(|node| node.book_id),
+        ProjectBinding::Node(node_id) => store.catalog_node(node_id).map(|node| node.book_id),
         ProjectBinding::NewBook => None,
     }
 }
