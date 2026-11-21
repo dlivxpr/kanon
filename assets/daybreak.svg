@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 270 142" fill="none" stroke="currentColor" stroke-width="1.2" preserveAspectRatio="xMaxYMax meet">
+  <circle cx="185" cy="55" r="20"/><circle cx="185" cy="55" r="25" stroke-dasharray="1 5"/>
+  <path id="ray" d="M185 20v-9"/>
+  <use href="#ray" transform="rotate(22.5 185 55)"/><use href="#ray" transform="rotate(45 185 55)"/><use href="#ray" transform="rotate(67.5 185 55)"/><use href="#ray" transform="rotate(90 185 55)"/><use href="#ray" transform="rotate(112.5 185 55)"/><use href="#ray" transform="rotate(135 185 55)"/><use href="#ray" transform="rotate(157.5 185 55)"/><use href="#ray" transform="rotate(180 185 55)"/><use href="#ray" transform="rotate(202.5 185 55)"/><use href="#ray" transform="rotate(225 185 55)"/><use href="#ray" transform="rotate(247.5 185 55)"/><use href="#ray" transform="rotate(270 185 55)"/><use href="#ray" transform="rotate(292.5 185 55)"/><use href="#ray" transform="rotate(315 185 55)"/><use href="#ray" transform="rotate(337.5 185 55)"/>
+  <path d="M-8 134Q54 92 105 109T199 89T280 85M20 141Q64 116 115 125T218 104T279 99M118 141Q160 118 202 120T278 108M205 141l73-22"/>
+  <path opacity=".28" d="M15 138l9-9m5 10 16-16m0 17 19-19m-3 20 22-22m-5 21 23-23m-6 24 28-28m-12 29 32-32m-13 31 40-40m-22 40 53-53m-34 52 52-52m-34 53 52-52m-33 51 53-53m-35 54 53-53m-34 52 47-47m-27 46 27-27m-11 27 11-11"/>
+</svg>

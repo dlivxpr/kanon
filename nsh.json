@@ -1,8 +1,27 @@
 {
-  "name": "kanon",
+  "name": "Kanon",
   "id": "com.example.kanon",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "build": 1,
+  "nsh": "=0.6.1",
+  "icon": "assets/kanon.png",
+  "features": ["svg", "rich-editor", "highlight", "math"],
+  "capabilities": {
+    "audio": true,
+    "notifications": true,
+    "application": true,
+    "clipboard": true,
+    "picker": true,
+    "openUrl": { "schemes": ["https"] }
+  },
   "rust": ".",
-  "root": "App"
+  "root": "App",
+  "theme": "theme.json",
+  "window": {
+    "title": "Kanon",
+    "defaultSize": { "width": 1200, "height": 800 },
+    "minSize": { "width": 640, "height": 480 },
+    "closeOnPress": false,
+    "titleBar": { "style": "hidden", "height": 56 }
+  }
 }

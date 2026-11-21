@@ -7,15 +7,20 @@ publish = false
 [workspace]
 
 [dependencies]
-nsh-core = "0.5.0"
-nsh-base = "0.5.0"
+nsh-core = { version = "=0.6.1", features = ["svg"] }
+nsh-base = "=0.6.1"
 env_logger = "0.11"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-nsh-platform-linux = { version = "0.5.0", default-features = false, features = ["shader", "editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term"] }
+log = "0.4"
+rusqlite = { version = "0.42", features = ["bundled"] }
+time = { version = "0.3", features = ["local-offset"] }
+serde_json = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-nsh-platform-macos = { version = "0.5.0", default-features = false, features = ["shader", "editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term"] }
+nsh-platform-macos = { version = "=0.6.1", default-features = false, features = ["shader", "editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term", "svg"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-nsh-platform-windows = { version = "0.5.0", default-features = false, features = ["shader", "editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term"] }
+nsh-platform-windows = { version = "=0.6.1", default-features = false, features = ["shader", "editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term", "svg", "media"] }
+
+[dev-dependencies]
+nsh-engine = { version = "=0.6.1", default-features = false }
+nsh-testing = { version = "=0.6.1", default-features = false }

@@ -1,49 +1,114 @@
-//! The app's Rust UI: its root component, which `nsh run`, `nsh package`
-//! and `cargo run` mount.
+//! Kanon: a local-first knowledge base, tasks and projects desktop app.
+//!
+//! `src/lib.rs` keeps only the module lines, the `#[native_module]` export
+//! and the root component (AGENTS.md); the domain lives in `domain/`, the
+//! styled control layer in `ui/`, and the workbench shell in `shell/`.
+
+mod desktop;
+mod document;
+pub mod domain;
+mod kb;
+mod projects;
+mod shell;
+mod tasks;
+mod today;
+mod ui;
+mod upcoming;
+
+use std::path::Path;
+use std::sync::Arc;
 
 use nsh_core::prelude::*;
-use nsh_base::theme;
 
-/// The app's UI set (`nsh.json` `"rust"`): what a TSX entry may import from
-/// `kanon/native` (`README.md`, "Adding a TSX entry").
+use domain::{Clock, FixedClock, LocalDateTime, SystemClock, Workspace};
+
+/// How the root learns where its workspace lives and what time it is.
+///
+/// Headless roots without a host data directory use an isolated workspace.
+/// Desktop runners keep their workspace on disk; tests may supply a path
+/// and a fixed local datetime explicitly.
+#[derive(Clone, PartialEq, Props)]
+pub struct AppProps {
+    /// The workspace SQLite file, or `None` for in-memory.
+    pub workspace_path: Prop<Option<String>>,
+    /// A fixed local datetime `YYYY-MM-DD HH:MM` (deterministic tests),
+    /// or `None` for the system clock.
+    pub fixed_now: Prop<Option<String>>,
+}
+
+impl AppProps {
+    /// The props the desktop binary launches with: a file in the user's
+    /// home (overridable with `KANON_WORKSPACE_PATH`), system clock.
+    pub fn desktop() -> Self {
+        Self {
+            workspace_path: std::env::var("KANON_WORKSPACE_PATH")
+                .ok()
+                .or_else(default_workspace_path)
+                .into(),
+            fixed_now: None.into(),
+        }
+    }
+}
+
+fn default_workspace_path() -> Option<String> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)?;
+    Some(
+        home.join(".kanon")
+            .join("workspace.sqlite3")
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// The NSH UI set that registers the application's Rust root.
 #[native_module("kanon/native")]
 fn native(registry: &mut Registry) {
     registry.register::<App>();
 }
 
-/// The application's root component.
+/// The application's root component: the multi-tab workbench shell.
 #[component]
-pub fn App() -> impl IntoElement {
-    let count = signal(0_u32);
+pub fn App(props: AppProps) -> impl IntoElement {
+    desktop::install_tray();
+    let clock: Arc<dyn Clock> = match props.fixed_now.get_untracked() {
+        Some(text) => match LocalDateTime::parse(&text) {
+            Some(fixed) => FixedClock::at(fixed),
+            None => {
+                return error_panel(&format!(
+                    "Kanon: invalid fixed_now {text:?}, want \"YYYY-MM-DD HH:MM\""
+                ));
+            }
+        },
+        None => Arc::new(SystemClock),
+    };
+    let path = props
+        .workspace_path
+        .get_untracked()
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("KANON_WORKSPACE_PATH").map(std::path::PathBuf::from))
+        .or_else(|| nsh_core::element::data_dir().map(|dir| dir.join("workspace.sqlite3")));
+    let workspace = match path {
+        Some(path) => Workspace::open(Path::new(&path), clock),
+        None => Workspace::open_in_memory_with_clock(clock),
+    };
+    match workspace {
+        Ok(workspace) => {
+            let store = shell::Store::new(workspace);
+            provide_context(store);
+            shell::workbench(store)
+        }
+        Err(err) => error_panel(&format!("Kanon: cannot open the workspace: {err}")),
+    }
+}
+
+fn error_panel(message: &str) -> View {
+    let message = message.to_owned();
     view()
         .flex_1()
-        .bg(move || theme().background)
-        .text_color(move || theme().foreground)
-        .child(
-            view()
-                .flex_1()
-                .p_safe_area()
-                .child(
-                    view()
-                        .flex_1()
-                        .items_center()
-                        .justify_center()
-                        .gap_4()
-                        .child(text(move || format!("Count: {}", count.get())).text_size(px(28.0)))
-                        .child(
-                            view()
-                                .px_5()
-                                .py_3()
-                                .rounded(px(10.0))
-                                .bg(move || theme().primary)
-                                .active(|s| s.opacity(0.6))
-                                .on_press(move || count.update(|value| *value += 1))
-                                .child(
-                                    text("Tap")
-                                        .text_size(px(17.0))
-                                        .text_color(move || theme().primary_foreground),
-                                ),
-                        ),
-                ),
-        )
+        .items_center()
+        .justify_center()
+        .bg(move || nsh_base::theme().background)
+        .child(text(message).text_color(move || nsh_base::theme().destructive))
 }

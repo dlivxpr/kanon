@@ -1,44 +1,31 @@
 # kanon
 
-An app written in Rust: its UI is `src/lib.rs`, and `nsh.json` names the root component (`"root": "App"`).
+Kanon is a pure-Rust [Native Shell 0.6.1](https://github.com/longbridge/nsh/releases/tag/v0.6.1) app for Windows and macOS. `nsh.json` points to the Rust root, `App` in `src/lib.rs`.
 
 ```sh
-nsh run                      # this machine's backend; --target ios, android, web, macos, linux or windows
+nsh run                      # native backend on Windows or macOS
 nsh check                    # cargo check of the crate, then type checks App.test.tsx
 nsh test                     # cargo test, then App.test.tsx: the root tested from TypeScript, headless; --target to run it on a platform
 nsh test nsh.json --trace    # headless: what the root mounts, and the time of each commit
-nsh package --target web     # or ios, android, macos, linux, windows
+nsh package --target windows # use --target macos on a Mac
 ```
 
-`nsh run` and `nsh package` mount the root on every platform, the browser included, without QuickJS: the app is Rust
-and native code from start to end (in the browser, with NSH's page script). Rust edits rebuild and restart the app.
+`nsh run` and `nsh package` mount the Rust root without bundling QuickJS. Rust edits rebuild and restart the app.
 
 ```sh
 cargo run
 ```
 
-This starts the root directly on the machine's native desktop backend: GTK 4 on Linux, AppKit on macOS, Win32 on
-Windows. Install the backend's development libraries before building.
+This starts the root directly on Win32 or AppKit.
 
 The `nsh` commands build the app's runners from the NSH crates `Cargo.toml` depends on: crates.io's at the version of
 the `nsh` you run (keep the `nsh-*` dependencies at that version when you upgrade `nsh`), or an NSH checkout's by path.
 
-## Adding a TSX entry
+The native backends opt in to `svg` for the window and navigation icons; their strokes use `currentColor` from the app theme. Keep the system caption controls and use the NSH title-bar insets instead of drawing replacement controls.
 
-TSX screens can use the Rust components and modules, with hot reloading for the TSX. The crate's set,
-`#[native_module("kanon/native")]` in `src/lib.rs`, already exports `App`. Add an `App.tsx`:
+The application icon source is `assets/kanon.svg`. NSH packages `assets/kanon.png` for both desktops; the direct Windows launcher uses the multi-resolution `assets/kanon.ico`.
 
-```tsx
-import { mount } from "nsh";
-import { App } from "kanon/native";
-
-mount(App);
-```
-
-then run it with `nsh run App.tsx` (`tsconfig.json` is there for it and the test): a named TSX entry
-runs on QuickJS, while `nsh run` alone keeps running the Rust root. The first `nsh build App.tsx` writes the TypeScript
-declarations of `kanon/native` into `.nsh/types`. Register more with `registry.register::<…>()` (components),
-`registry.module::<…>()` and `registry.class::<…>()`.
+Use **设置 → 数据与备份 → 导出备份** to save a complete SQLite snapshot to a new file. **恢复到新副本** opens a separate Kanon window backed by a new file; it never replaces the active workspace or modifies the snapshot. For command-line recovery, launch with `KANON_WORKSPACE_PATH` set to a copy of the snapshot. Keep the original backup separately.
 
 NSH-generated files stay in `.nsh/`: runner sources in `.nsh/rust/` and default packages in `.nsh/out/`.
 Cargo keeps its normal `target/` directory and respects your existing `CARGO_TARGET_DIR`.

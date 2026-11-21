@@ -1,0 +1,110 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  # Pinned to the `nsh-*` crate versions in Cargo.toml; keep in sync on upgrades.
+  NSH_VERSION: v0.6.1
+
+jobs:
+  macos:
+    name: macOS - check, clippy, nsh check, cargo test, nsh test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # The nsh CLI builds its generated runner crates (.nsh/rust) here.
+          cache-directories: .nsh/rust/target
+
+      - name: Install NSH CLI (${{ env.NSH_VERSION }})
+        run: |
+          set -o pipefail
+          curl -fsSL "https://github.com/longbridge/nsh/releases/download/$NSH_VERSION/install.sh" | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Verify tool versions
+        run: |
+          rustc --version
+          cargo --version
+          nsh --version
+          case "$(nsh --version)" in
+            "nsh ${NSH_VERSION#v} "*) ;;
+            *) echo "Expected NSH $NSH_VERSION" >&2; exit 1 ;;
+          esac
+
+      - name: cargo check --all-targets
+        run: cargo check --all-targets
+
+      - name: cargo clippy (zero warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: nsh check
+        run: nsh check
+
+      - name: cargo test
+        run: cargo test
+
+      - name: nsh test
+        run: nsh test
+
+  windows:
+    name: Windows - check, clippy, nsh check, cargo test, nsh test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-directories: .nsh/rust/target
+
+      - name: Install NSH CLI (${{ env.NSH_VERSION }})
+        shell: pwsh
+        run: |
+          irm "https://github.com/longbridge/nsh/releases/download/$env:NSH_VERSION/install.ps1" | iex
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $env:LOCALAPPDATA 'nsh\bin')
+
+      - name: Verify tool versions
+        shell: pwsh
+        run: |
+          rustc --version
+          cargo --version
+          nsh --version
+          if ((nsh --version) -notlike "nsh $($env:NSH_VERSION.TrimStart('v')) *") {
+            throw "Expected NSH $env:NSH_VERSION"
+          }
+
+      - name: cargo check --all-targets
+        run: cargo check --all-targets
+
+      - name: cargo clippy (zero warnings)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: nsh check
+        run: nsh check
+
+      - name: cargo test
+        run: cargo test
+
+      - name: nsh test
+        run: nsh test
