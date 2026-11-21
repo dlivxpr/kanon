@@ -27,7 +27,7 @@ jobs:
           (cd "$RUNNER_TEMP" && echo "ee1aed2a4d111fe90e6cceca4b9d5f834c9e11cfda525f8be984261a329c06de  $archive" | shasum -a 256 -c -)
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/nsh/bin" >> "$GITHUB_PATH"
-      - name: Build and verify the universal app
+      - name: Build and verify the universal disk image
         run: |
           test "$(nsh --version | cut -d ' ' -f2)" = "${NSH_VERSION#v}"
           version=$(jq -er .version nsh.json)
@@ -36,14 +36,19 @@ jobs:
           plist="$app/Contents/Info.plist"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = "$version"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")" = "$(jq -er .id nsh.json)"
-          lipo -verify_arch arm64 x86_64 "$app/Contents/MacOS/Kanon"
+          lipo "$app/Contents/MacOS/Kanon" -verify_arch arm64 x86_64
           codesign --verify --deep --strict "$app"
-          mkdir -p "$RUNNER_TEMP/release-assets"
-          ditto -c -k --sequesterRsrc --keepParent "$app" "$RUNNER_TEMP/release-assets/Kanon-$version-macos-universal.zip"
+          stage="$RUNNER_TEMP/dmg-stage"
+          mkdir -p "$stage" "$RUNNER_TEMP/release-assets"
+          ditto "$app" "$stage/Kanon.app"
+          ln -s /Applications "$stage/Applications"
+          dmg="$RUNNER_TEMP/release-assets/Kanon-$version-macos-universal.dmg"
+          hdiutil create -volname Kanon -srcfolder "$stage" -format UDZO "$dmg"
+          hdiutil verify "$dmg"
       - uses: actions/upload-artifact@v6
         with:
           name: kanon-macos
-          path: ${{ runner.temp }}/release-assets/*.zip
+          path: ${{ runner.temp }}/release-assets/*.dmg
           if-no-files-found: error
           compression-level: 0
 
