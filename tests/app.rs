@@ -34,16 +34,7 @@ fn temp_db(name: &str) -> PathBuf {
 }
 
 fn start(path: &std::path::Path, now: &str) -> Headless {
-    let path = path.to_string_lossy().into_owned();
-    let now = now.to_owned();
-    Headless::start(EngineConfig {
-        viewport: Size::new(Points(1280.0), Points(800.0)),
-        ..EngineConfig::new(Root::new::<nsh_app_kanon::App>(move || AppProps {
-            workspace_path: Some(path.clone()).into(),
-            fixed_now: Some(now.clone()).into(),
-        }))
-    })
-    .expect("start the app")
+    start_sized(path, now, 1280.0)
 }
 
 /// Whether the circle of `label` currently reads as checked.
@@ -167,6 +158,11 @@ fn start_sized(path: &std::path::Path, now: &str, width: f32) -> Headless {
     let now = now.to_owned();
     Headless::start(EngineConfig {
         viewport: Size::new(Points(width), Points(800.0)),
+        environment: nsh_engine::Environment {
+            // These tests assert the settled state, not intermediate animation frames.
+            reduce_motion: true,
+            ..Default::default()
+        },
         ..EngineConfig::new(Root::new::<nsh_app_kanon::App>(move || AppProps {
             workspace_path: Some(path.clone()).into(),
             fixed_now: Some(now.clone()).into(),
@@ -201,7 +197,8 @@ fn create_top_document(app: &mut Headless, title: &str) -> Result<(), String> {
     app.wait_for("在顶部新建文档")?;
     app.press("在顶部新建文档")?;
     app.type_text("text:在目录顶部新建文档，回车创建", title)?;
-    app.press("id:catalog-create")?;
+    app.press_key("enter")?;
+    app.wait_for(&format!("id:catalog-tree >> text:{title}"))?;
     Ok(())
 }
 
@@ -392,7 +389,6 @@ fn catalog_inserts_at_the_top_nests_children_and_filters() -> Result<(), String>
 
     // Top `+` inserts at the TOP of the level: newest first.
     create_top_document(&mut app, "甲")?;
-    app.wait_for("id:catalog-tree >> text:甲")?;
     create_top_document(&mut app, "乙")?;
     create_top_document(&mut app, "丙")?;
     let texts = visible_texts(&app);
@@ -407,15 +403,17 @@ fn catalog_inserts_at_the_top_nests_children_and_filters() -> Result<(), String>
     app.wait_for("在顶部新建分组")?;
     app.press("在顶部新建分组")?;
     app.type_text("text:在目录顶部新建分组，回车创建", "分组一")?;
-    app.press("id:catalog-create")?;
+    app.press_key("enter")?;
     app.wait_for("id:catalog-tree >> text:分组一")?;
 
     app.press("新建子文档 >> nth=0")?; // 分组一's row action
     app.type_text("text:在「分组一」下新建文档，回车创建", "子一")?;
-    app.press("id:catalog-create")?;
+    app.press_key("enter")?;
+    app.wait_for("id:catalog-tree >> text:子一")?;
     app.press("新建子文档 >> nth=0")?;
     app.type_text("text:在「分组一」下新建文档，回车创建", "子二")?;
-    app.press("id:catalog-create")?;
+    app.press_key("enter")?;
+    app.wait_for("id:catalog-tree >> text:子二")?;
     let texts = visible_texts(&app);
     let at = |needle: &str| texts.iter().position(|t| t == needle).expect("present");
     assert!(
@@ -619,10 +617,12 @@ fn catalog_locates_the_current_document() -> Result<(), String> {
     app.wait_for("在顶部新建分组")?;
     app.press("在顶部新建分组")?;
     app.type_text("text:在目录顶部新建分组，回车创建", "分组一")?;
-    app.press("id:catalog-create")?;
+    app.press_key("enter")?;
+    app.wait_for("id:catalog-tree >> text:分组一")?;
     app.press("新建子文档 >> nth=0")?;
     app.type_text("text:在「分组一」下新建文档，回车创建", "子文档")?;
-    app.press("id:catalog-create")?;
+    app.press_key("enter")?;
+    app.wait_for("id:catalog-tree >> text:子文档")?;
 
     // Open the child document; its row highlights in the catalog.
     app.press("id:catalog-tree >> text:子文档")?;
@@ -693,20 +693,19 @@ fn catalog_menu_reorders_and_reparents_without_cycles() -> Result<(), String> {
     app.press("节点菜单 >> nth=0")?;
     app.wait_for("移到目录顶层")?;
     app.press("下移")?;
-    let texts = visible_texts(&app);
-    let at = |needle: &str| texts.iter().position(|t| t == needle).expect("present");
-    assert!(at("甲") < at("乙"), "下移 moved 乙 below 甲: {texts:?}");
+    app.wait_until("甲 before 乙", Duration::from_secs(5), |screen| {
+        let texts = screen.texts();
+        matches!((texts.iter().position(|t| *t == "甲"), texts.iter().position(|t| *t == "乙")), (Some(a), Some(b)) if a < b)
+    })?;
 
     // 移到目录顶层 puts the first node at the root top.
     app.press("节点菜单 >> nth=1")?;
     app.wait_for("移到目录顶层")?;
     app.press("移到目录顶层")?;
-    let texts = visible_texts(&app);
-    let at = |needle: &str| texts.iter().position(|t| t == needle).expect("present");
-    assert!(
-        at("乙") < at("甲"),
-        "移到目录顶层 moved 乙 to the top: {texts:?}"
-    );
+    app.wait_until("乙 before 甲", Duration::from_secs(5), |screen| {
+        let texts = screen.texts();
+        matches!((texts.iter().position(|t| *t == "乙"), texts.iter().position(|t| *t == "甲")), (Some(a), Some(b)) if a < b)
+    })?;
 
     let _ = std::fs::remove_file(path);
     Ok(())
@@ -1177,7 +1176,7 @@ fn checklist_item_promotes_to_a_linked_task_card_and_undo_keeps_the_task() -> Re
     app.wait_for("转为任务")?;
     app.press("转为任务")?;
     app.wait_for("新任务存入")?;
-    app.press("收件箱")?;
+    app.press("role:button[收件箱]")?;
 
     // The Linked Task Card renders the created Task live; the Inbox
     // badge counts it.
